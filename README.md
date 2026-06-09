@@ -2,11 +2,29 @@
 
 [English](README.md) | [简体中文](README-zh.md) | [Русский](README-ru.md) | [فارسی](README-fa.md)
 
-<img width="804" height="867" alt="A-Box_github" src="https://github.com/user-attachments/assets/4f51a6a1-5d1b-49db-90df-98ffae63d1ca" />
+<p align="center">
+  <img width="804" height="867" alt="A-Box_github" src="https://github.com/user-attachments/assets/4f51a6a1-5d1b-49db-90df-98ffae63d1ca" />
+</p>
 
 A-Box is a standalone Bash automation toolkit for Linux network gateway deployment and maintenance. It integrates Xray-core, sing-box, official Hysteria 2, protocol configuration export, system tuning, traffic limits, access control, health checks, backup/restore, diagnostics, and SNI preference testing.
 
 > Use only in legal, authorized, and compliant environments. Users are responsible for all operational, legal, and security consequences.
+
+## Compliance and Disclaimer
+
+This project is provided only for **network architecture testing, cybersecurity research, system operations automation, and lawful privacy protection in fully authorized environments**.
+
+1. **Legal compliance:** Do not use this project for any activity that violates the laws, regulations, service terms, or network-use policies of your country or region.
+
+2. **Authorization boundary:** Deploy, test, or operate this project only on servers, networks, and systems that you own, manage, or have explicit authorization to use.
+
+3. **User responsibility:** Users are solely responsible for all legal, operational, security, and compliance consequences caused by misuse, prohibited use, configuration errors, or improper operation.
+
+4. **Technical intent:** The routing, encryption, proxy, traffic-control, and diagnostic functions in this project are intended to improve transmission security, availability, and operational efficiency in authorized environments. Do not use them for illegal attacks, unauthorized access, audit evasion, infrastructure disruption, or assistance with unlawful activity.
+
+5. **No warranty:** This project is provided "as is". It is not warranted to be fit for any particular purpose, nor guaranteed to be available, compliant, or risk-free in every network, system, or jurisdiction.
+
+6. **Acceptance:** By downloading, copying, deploying, or running this project, you confirm that you have read, understood, and accepted these terms.
 
 ## Safe Quick Start
 
@@ -178,6 +196,8 @@ For HTTP-01, make sure `80/TCP` is reachable and not occupied. For Cloudflare DN
 ### How should I choose SNI?
 Use Toolbox `3` or `4`, then review saved results with Toolbox `10`. Prefer TLS 1.3, SAN match, valid ALPN, and reasonable ASN/topology relationship with the VPS.
 
-## License
+## Feedback and License
 
-Apache License 2.0.
+- [GitHub Issues](https://github.com/alariclin/a-box/issues)
+- Pull Requests are welcome.
+- This project is released under the [Apache License 2.0](LICENSE).
