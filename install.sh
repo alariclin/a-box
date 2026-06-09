@@ -6741,7 +6741,7 @@ sni_probe_domain() {
 sni_openssl_check() {
     local domain="$1" timeout_s="${2:-5}" out cert sanext rest alpn='none' tls13=0 san=0
     command -v openssl >/dev/null 2>&1 || { printf 'tls13=unknown\talpn=unknown\tsan=unknown'; return 0; }
-    out=$(printf '' | timeout "$timeout_s" openssl s_client -connect "${domain}:443" -servername "$domain" -alpn 'h2,http/1.1' -tls1_3 -showcerts 2>/dev/null) || out=''
+    out=$(printf '' | timeout "$timeout_s" openssl s_client -connect "${domain}:443" -servername "$domain" -alpn 'h2,http/1.1' -tls1_3 -showcerts 2>/dev/null | tr -d '\000') || out=''
     if [[ -n "$out" ]]; then
         grep -qiE 'Protocol *: *TLSv1\.3|New, TLSv1\.3' <<< "$out" && tls13=1
         alpn=$(awk -F': ' '/ALPN protocol/{print $2; exit}' <<< "$out")
