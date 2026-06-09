@@ -2,6 +2,8 @@
 
 [English](README.md) | [简体中文](README-zh.md) | [Русский](README-ru.md) | [فارسی](README-fa.md)
 
+<img width="804" height="867" alt="A-Box_github" src="https://github.com/user-attachments/assets/4f51a6a1-5d1b-49db-90df-98ffae63d1ca" />
+
 A-Box is a standalone Bash automation toolkit for Linux network gateway deployment and maintenance. It integrates Xray-core, sing-box, official Hysteria 2, protocol configuration export, system tuning, traffic limits, access control, health checks, backup/restore, diagnostics, and SNI preference testing.
 
 > Use only in legal, authorized, and compliant environments. Users are responsible for all operational, legal, and security consequences.
