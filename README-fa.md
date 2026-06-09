@@ -1,44 +1,49 @@
-# A-Box | ابزار یک‌اسکریپتی Linux Network Gateway
+# A-Box | ابزار یک‌مرحله‌ای دروازه شبکه لینوکس
 
 [English](README.md) | [简体中文](README-zh.md) | [Русский](README-ru.md) | [فارسی](README-fa.md)
 
-A-Box یک Bash script مستقل برای نصب و نگهداری Linux network gateway است. این ابزار Xray-core، sing-box، Hysteria 2 رسمی، خروجی کانفیگ کلاینت، بهینه‌سازی سیستم، محدودیت ترافیک، کنترل دسترسی، health check، backup/restore، diagnostics و SNI preference radar داخلی را یکپارچه می‌کند.
+<p align="center">
+  <img src="https://raw.githubusercontent.com/alariclin/a-box/main/A-Box_github.png" alt="A-Box_github" width="720">
+</p>
 
-> فقط در محیط‌های قانونی، مجاز و compliant استفاده شود. مسئولیت تمام پیامدهای قانونی، عملیاتی و امنیتی بر عهده کاربر است.
+<p align="center">
+  <a href="https://github.com/alariclin/a-box/releases"><img src="https://img.shields.io/badge/Version-2026.05.07-success.svg?style=flat-square" alt="Version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=flat-square" alt="License"></a>
+  <a href="https://github.com/alariclin/a-box/stargazers"><img src="https://img.shields.io/github/stars/alariclin/a-box?style=flat-square&color=yellow" alt="GitHub Stars"></a>
+  <a href="https://github.com/alariclin/a-box/network/members"><img src="https://img.shields.io/github/forks/alariclin/a-box?style=flat-square&color=orange" alt="GitHub Forks"></a>
+</p>
 
-## Safe Quick Start
+**A-Box** یک ابزار Bash یکپارچه برای خودکارسازی سرورهای لینوکس و دروازه‌های شبکه است.
 
-روش پیشنهادی: ابتدا دانلود، بررسی و self-test، سپس اجرا:
+این ابزار استقرار سرویس‌های پروکسی، تنظیمات سیستم، مدیریت ترافیک، کنترل دسترسی، بررسی سلامت سرویس‌ها، خروجی گرفتن از پیکربندی کلاینت‌ها، آزمایش کیفیت شبکه، محافظت‌های نگه‌داری و رابط تعاملی ترمینال به زبان‌های چینی/انگلیسی را در یک اسکریپت مستقل جمع می‌کند.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/alariclin/a-box/main/install.sh -o A-Box.sh
-sha256sum A-Box.sh
-sudo bash A-Box.sh --self-test
-sudo bash A-Box.sh
-```
+**قدردانی:** از پروژه‌های Xray-core، sing-box، Hysteria و پروژه‌های متن‌باز مرتبط برای الهام فنی و پشتیبانی اکوسیستم سپاس‌گزاریم. A-Box یک ابزار مستقل برای خودکارسازی و هماهنگ‌سازی عملیات است.
 
-حالت سریع pipeline:
+---
+
+## انطباق و سلب مسئولیت
+
+این پروژه فقط برای **آزمایش معماری شبکه، پژوهش امنیت سایبری و حفاظت قانونی از حریم خصوصی در محیط‌های مجاز** طراحی شده است.
+
+1. **رعایت قانون:** از این پروژه برای فعالیت‌هایی که قوانین کشور یا منطقه شما را نقض می‌کنند استفاده نکنید.
+2. **مسئولیت کاربر:** مسئولیت کامل پیامدهای حقوقی، عملیاتی و امنیتی استفاده نادرست بر عهده کاربر است.
+3. **هدف فنی:** مسیریابی و رمزنگاری برای افزایش امنیت و حریم خصوصی انتقال داده استفاده می‌شوند. استفاده برای حمله غیرقانونی، دسترسی غیرمجاز یا آسیب به زیرساخت ممنوع است.
+4. **پذیرش شرایط:** دانلود، کپی یا اجرای اسکریپت به معنی پذیرش این شرایط است.
+
+---
+
+## شروع سریع
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/alariclin/a-box/main/install.sh | sudo bash
-```
 
-Mirror fallback فقط زمانی که GitHub raw در دسترس نیست:
-
-```bash
+# کانال آینه؛ فقط وقتی raw.githubusercontent.com در دسترس نیست استفاده شود
 curl -fsSL https://ghp.ci/https://raw.githubusercontent.com/alariclin/a-box/main/install.sh | sudo bash
-```
 
-Language selection:
-
-```bash
+# بررسی‌ها و گزینه‌های زبان
+curl -fsSL https://raw.githubusercontent.com/alariclin/a-box/main/install.sh > A-Box.sh
 sudo bash A-Box.sh --lang zh
 sudo bash A-Box.sh --lang en
-```
-
-Read-only checks:
-
-```bash
 sudo bash A-Box.sh --self-test
 sudo bash A-Box.sh --status
 sudo bash A-Box.sh --help
@@ -46,100 +51,131 @@ sudo bash A-Box.sh --preflight
 sudo bash A-Box.sh --dry-run
 ```
 
-After first installation:
+پس از اجرای اول، منو با این دستور باز می‌شود:
 
 ```bash
 sb
 ```
 
-## Core Features
+---
 
-| Module | Description |
-|---|---|
-| Deployment | Installs dependencies, initializes runtime, deploys and manages Xray-core, sing-box, and official Hysteria 2. |
-| Protocol stacks | VLESS-Vision-Reality, VLESS-XHTTP-Reality, Shadowsocks-2022, Hysteria 2. |
-| Default ports | Vision `443/TCP`, XHTTP `8443/TCP`, HY2 `443/UDP`, SS-2022 `2053/TCP+UDP`; custom ports are validated. |
-| SNI policy | Default REALITY SNI is `www.microsoft.com`. Apple/iCloud domains are never used as built-in defaults. Apple/iCloud-like SNI on non-443 ports triggers a warning. |
-| Built-in SNI radar | Local full/mini candidate library; no legacy remote SNI script. Scores HTTPS/TLS metrics, TLS 1.3, ALPN, SAN, ASN/topology, and saves records. |
-| XHTTP export | Exports XHTTP client parameters using `/xhttp`, `stream-one`, HTTP/2 host, and `smux: false` for compatible clients such as Mihomo. |
-| Hysteria 2 | Supports ACME HTTP-01, Cloudflare DNS-01, self-signed certificate pinning, masquerade, optional port hopping, and Salamander obfuscation. |
-| Operations | BBR/FQ tuning, TCP KeepAlive, Fail2Ban, logrotate, health probe, Geo data update, monthly traffic cutoff, SS-2022 whitelist, and status reporting. |
-| Safeguards | Preflight checks, deployment replacement confirmation, backup before risky actions, redacted diagnostics, and guarded OTA update. |
+## قابلیت‌های اصلی
 
-## Full Menu Reference
+| بخش | توضیح |
+| :--- | :--- |
+| استقرار یک‌مرحله‌ای | نصب وابستگی‌ها، آماده‌سازی محیط، ساخت سرویس‌ها و مدیریت Xray-core، sing-box و Hysteria 2 رسمی. |
+| مجموعه پروتکل‌ها | VLESS-Vision-Reality، VLESS-XHTTP-Reality، Shadowsocks-2022 و Hysteria 2. |
+| پورت‌های استاندارد | Vision `443/TCP`، XHTTP `8443/TCP`، HY2 `443/UDP`، SS-2022 `2053/TCP+UDP`؛ پورت‌های سفارشی پیش از استقرار بررسی می‌شوند. |
+| سیاست SNI | SNI پیش‌فرض REALITY برابر `www.microsoft.com` است. SNIهای شبیه Apple/iCloud روی پورت‌های غیر `443` هشدار و تأیید می‌گیرند. SNI تولیدی باید با ابزار داخلی انتخاب SNI انتخاب شود. |
+| رادار داخلی SNI | کتابخانه محلی کاندیداها با حالت full و mini-host؛ بدون وابستگی به اسکریپت SNI قدیمی و راه‌دور. امتیازدهی بر اساس HTTPS/TLS metrics، TLS 1.3، ALPN، SAN، ASN/topology و گزارش پیشرفت انجام می‌شود. |
+| خروجی XHTTP | خروجی پارامترهای XHTTP شامل `/xhttp`، `stream-one`، HTTP/2 host و `smux: false` برای کلاینت‌های سازگار مانند Mihomo. |
+| حالت‌های Hysteria 2 | ACME HTTP-01، Cloudflare DNS-01، pinning گواهی self-signed، masquerade اختیاری، port hopping و Salamander obfuscation. |
+| جعبه‌ابزار | Benchmark، بررسی IP/streaming/route، انتخاب کامل SNI، انتخاب mini-host SNI، WARP، Swap دو گیگابایتی، backup/restore، بسته تشخیصی، dry-run preflight. |
+| عملیات | BBR/FQ، TCP KeepAlive، Fail2Ban، logrotate، health probe، به‌روزرسانی زمان‌بندی‌شده Geo، قطع سرویس بر اساس سقف ماهانه ترافیک، whitelist برای SS-2022، `--status`. |
+| محافظت‌های نگه‌داری | preflight سبک پیش از استقرار پروتکل؛ backup خودکار پیش از ارتقای core؛ پرسش backup پیش از حذف یا بازنشانی محیط؛ backup/restore دستی؛ diagnostics بدون اطلاعات حساس. |
 
-| Menu | Function | Use case |
-|---:|---|---|
-| `1` | Xray VLESS-Vision-Reality | Primary TCP REALITY + Vision path. |
-| `2` | Xray VLESS-XHTTP-Reality | XHTTP over REALITY path. |
-| `3` | Xray Shadowsocks-2022 | TCP/UDP relay or landing inbound; whitelist is recommended. |
-| `4` | Official Hysteria 2 | UDP/QUIC/H3 path for mobile or lossy networks. |
+---
+
+## منوی کامل
+
+| منو | عملکرد | کاربرد |
+| :--- | :--- | :--- |
+| `1` | Xray VLESS-Vision-Reality | مسیر اصلی TCP با REALITY + Vision. |
+| `2` | Xray VLESS-XHTTP-Reality | مسیر پرظرفیت XHTTP over REALITY برای کلاینت‌های دسکتاپ سازگار. |
+| `3` | Xray Shadowsocks-2022 | ورودی TCP/UDP relay یا landing؛ استفاده از whitelist توصیه می‌شود. |
+| `4` | Official Hysteria 2 (Apernet) | مسیر UDP/QUIC/H3 برای موبایل یا شبکه‌های دارای packet loss. |
 | `5` | Xray + Official HY2 all-in-one | Vision + XHTTP + HY2 + SS-2022. |
-| `6` | sing-box VLESS-Vision-Reality | Low-memory Vision deployment. |
-| `7` | sing-box Shadowsocks-2022 | Low-memory SS-2022 deployment. |
-| `8` | sing-box VLESS + SS-2022 | Lightweight two-protocol deployment. |
-| `9` | sing-box Hysteria 2 | HY2 implemented by sing-box. |
-| `10` | sing-box all-in-one | Vision + HY2 + SS-2022; XHTTP excluded by design. |
-| `11` | Toolbox | Benchmark, IP quality, SNI radar, WARP, Swap, backup/restore, diagnostics, dry-run preflight, SNI records. |
-| `12` | VPS optimization | BBR/FQ, limits, KeepAlive, Fail2Ban, health probe. |
-| `13` | Display node parameters | Links, QR codes, YAML, JSON, outbound templates. |
-| `14` | Manual | Terminal manual. |
-| `15` | OTA, Geo & core upgrade | Update A-Box script, Xray Geo data, or installed cores without resetting node parameters. |
-| `16` | Clean uninstall | Remove managed services, configs, firewall rules, and optional `sb` shortcut. |
-| `17` | Delete nodes & reinitialize | Clean stale processes, rules, broken configs and services. |
-| `18` | Monthly traffic limit | vnStat-based monthly quota. |
-| `19` | SS-2022 whitelist manager | Add/remove frontend IP/CIDR and enforce DROP. Switching back to whitelist mode removes stale global ACCEPT rules first. |
-| `20` | Language settings | Switch Chinese/English UI and save to `/etc/ddr/.lang`. |
-| `0` | Exit | Exit the menu. |
+| `6` | sing-box VLESS-Vision-Reality | استقرار Vision برای سرورهای کم‌حافظه. |
+| `7` | sing-box Shadowsocks-2022 | استقرار SS-2022 برای سرورهای کم‌حافظه. |
+| `8` | sing-box VLESS + SS-2022 | استقرار سبک دوپروتکلی. |
+| `9` | sing-box Hysteria 2 | HY2 پیاده‌سازی‌شده با sing-box. |
+| `10` | sing-box all-in-one | Vision + HY2 + SS-2022؛ XHTTP عمداً حذف شده است. |
+| `11` | Toolbox | Benchmark، بررسی IP، انتخاب SNI، WARP، Swap، backup/restore، diagnostics، dry-run preflight. |
+| `12` | VPS one-click optimization | BBR/FQ، file limits، KeepAlive، Fail2Ban، health probe. |
+| `13` | Display all node parameters | نمایش links، QR codes، YAML، JSON و outbound templates. |
+| `14` | Manual | راهنمای کامل در ترمینال. |
+| `15` | OTA, Geo & core upgrade | به‌روزرسانی اسکریپت، داده‌های Geo برای Xray یا coreهای نصب‌شده بدون ریست کردن پارامترهای نود. |
+| `16` | Clean uninstall | حذف سرویس‌های مدیریت‌شده، configs، firewall rules و در صورت انتخاب shortcut `sb`. |
+| `17` | Delete nodes & reinitialize environment | حذف فرایندهای باقی‌مانده، قوانین قدیمی و configs/services خراب. |
+| `18` | Monthly traffic limit | سهمیه ماهانه بر پایه vnStat؛ پس از رسیدن به سقف، سرویس‌ها متوقف می‌شوند. |
+| `19` | SS-2022 whitelist manager | افزودن/حذف frontend IP/CIDR و اعمال DROP برای منابع خارج از whitelist. |
+| `20` | Language settings | تغییر UI چینی/انگلیسی و ذخیره در `/etc/ddr/.lang`. |
+| `0` | Exit | خروج از منوی تعاملی. |
 
-## Toolbox Details
+---
 
-| Submenu | Function | Description |
-|---:|---|---|
-| `1` | System benchmark | Runs `bench.sh`. |
-| `2` | IP quality and route test | Runs Check.Place. |
-| `3` | Local SNI preference | Full built-in SNI preference library with higher concurrency and deeper verification. |
-| `4` | Mini-host local SNI preference | Same candidate library as full mode, but lower concurrency and verification depth. |
-| `5` | Cloudflare WARP manager | Downloads a third-party WARP manager; displays SHA256 and requires strong confirmation. |
-| `6` | 2G Swap allocation | Creates `/swapfile`. |
-| `7` | Backup / Restore | Creates or restores A-Box backups. |
-| `8` | Redacted diagnostic bundle | Exports status, ports, versions, logs, firewall snippets, cron entries, and redacted environment data. |
-| `9` | Full dry-run preflight check | Non-destructive checks for environment, dependency, network, GitHub, ports, services, firewall, and storage. |
-| `10` | SNI preference records | Displays saved results from `/etc/ddr/A-Box-sni-full.tsv` and `/etc/ddr/A-Box-sni-mini.tsv`. |
+## Toolbox
 
-## Maintenance Safeguards
+| زیرمنو | عملکرد | توضیح |
+| :--- | :--- | :--- |
+| `1` | System benchmark | اجرای `bench.sh` برای آزمایش سخت‌افزار و سرعت دانلود. |
+| `2` | IP quality and route test | اجرای Check.Place برای بررسی کیفیت IP، streaming unlock و مسیر شبکه. |
+| `3` | Local SNI preference | اجرای انتخاب کامل SNI با موازی‌سازی بیشتر و بررسی عمیق‌تر. |
+| `4` | Mini-host local SNI preference | استفاده از همان کتابخانه کاندیداها با موازی‌سازی و عمق کمتر برای VPSهای ضعیف. |
+| `5` | Cloudflare WARP manager | اجرای WARP manager برای ماسک کردن IP خروجی و سناریوهای streaming unlock. |
+| `6` | 2G Swap allocation | ساخت `/swapfile` برای کاهش ریسک OOM روی سرورهای کم‌حافظه. |
+| `7` | Backup / Restore | ساخت یا بازیابی backup پیکربندی A-Box؛ backupهای تو در تو، diagnostics و preflight reports را حذف می‌کند تا archive به‌صورت بازگشتی بزرگ نشود. |
+| `8` | Redacted diagnostic bundle | خروجی گرفتن از وضعیت سرویس‌ها، پورت‌ها، نسخه‌ها، لاگ‌ها، firewall snippets، cron entries و environment file بدون اطلاعات حساس. Secrets پوشانده می‌شوند. |
+| `9` | Full dry-run preflight check | اجرای بررسی غیرمخرب محیط، وابستگی‌ها، شبکه، GitHub، پورت‌ها، سرویس‌ها، firewall و فضای ذخیره‌سازی. |
+| `10` | SNI preference records | نمایش نتایج ذخیره‌شده full/mini SNI از `/etc/ddr/A-Box-sni-full.tsv` و `/etc/ddr/A-Box-sni-mini.tsv`. |
 
-- Lightweight preflight runs automatically before deployment menus `1`-`10`.
-- Menu `15` creates an automatic backup before core upgrade actions.
-- Menus `16` and `17` ask whether to create a backup before uninstall or reset.
-- Toolbox `7` provides manual backup/restore.
-- Toolbox `8` exports redacted diagnostics.
-- Toolbox `9` saves full dry-run reports under `/etc/ddr/preflight/`.
-- Toolbox `10` displays saved full/mini SNI preference records.
-- Third-party toolbox scripts require SHA256 display and exact confirmation `YES-RUN-UNTRUSTED`, unless `ABOX_REMOTE_SHA256_ALLOWLIST` contains the hash.
-- OTA from `main` is guarded by syntax/fingerprint validation, SHA256 display, and `[Y/N]` confirmation. Non-interactive OTA must use `ABOX_OTA_SHA256_ALLOWLIST`.
-- GitHub core downloads require official release asset SHA256 digest validation. Stable `latest` releases are used by default; prerelease/alpha builds are not used.
+---
 
-## SNI Selection Notes
+## محافظت‌های عملیاتی
 
-- Run SNI preference on the VPS, not on a local laptop.
-- Prefer `tls13=1`, `san=1`, valid ALPN, and same/near ASN or country when available.
-- Avoid API-only, rate-limited, unstable, or abnormal response targets when normal `200` targets are available.
-- Do not use raw IP addresses as SNI.
-- Apple/iCloud-like SNI on non-443 ports is explicitly warned.
-- Fallback REALITY SNI is `www.microsoft.com`; Apple/iCloud domains are never used as built-in defaults.
-- Use Toolbox `10` to review saved results after Toolbox `3` or `4`.
+- پیش از منوهای `1` تا `10`، lightweight preflight به‌صورت خودکار اجرا می‌شود. root/TTY، OS/init، CPU architecture، required commands و دسترسی به GitHub API را بررسی می‌کند و اگر پورت‌ها توسط سرویس‌های مدیریت‌شده A-Box اشغال باشند، نصب مجدد را بی‌دلیل متوقف نمی‌کند.
+- منوی `15` پیش از core upgrade به‌صورت خودکار backup می‌گیرد و پارامترهای نود را ریست نمی‌کند.
+- منوی `15` برای OTA، SHA256 اسکریپت دانلودشده را نشان می‌دهد و از تأیید `[Y/N]` استفاده می‌کند.
+- منوهای `16` و `17` پیش از uninstall یا environment reset درباره backup سؤال می‌کنند.
+- Toolbox `7` قابلیت manual backup/restore دارد.
+- Toolbox `8` بسته تشخیصی بدون اطلاعات حساس تولید می‌کند؛ UUID، private keys، passwords، tokens و client links پوشانده می‌شوند.
+- Toolbox `9` گزارش کامل dry-run preflight را اجرا و در `/etc/ddr/preflight/` ذخیره می‌کند.
+- منوی `19` هنگام برگشت SS-2022 از حالت باز به whitelist، ابتدا ACCEPT ruleهای عمومی قدیمی را پاک می‌کند و سپس whitelist/DROP rules را اعمال می‌کند.
 
-## System Requirements
+---
 
-| Item | Requirement |
-|---|---|
-| OS | Debian 10+, Ubuntu 20.04+, CentOS/RHEL/Rocky/AlmaLinux 8+, Alpine Linux. |
-| Init system | systemd or OpenRC. |
-| CPU | amd64/x86_64, arm64/aarch64. |
-| Privilege | root or sudo. |
-| Network | Access to system repositories and GitHub Releases. |
+## نکات انتخاب SNI
 
-## License
+- انتخاب SNI را روی VPS اجرا کنید، نه روی لپ‌تاپ محلی؛ برای REALITY مسیر VPS -> target مهم است.
+- کاندیداهای دارای `tls13=1`، `san=1`، ALPN معتبر و ارتباط منطقی ASN/topology با VPS را ترجیح دهید.
+- از raw IP به عنوان SNI استفاده نکنید.
+- SNIهای شبیه Apple/iCloud روی پورت‌های غیر `443` توسط اسکریپت هشدار می‌گیرند.
+- fallback SNI پیش‌فرض REALITY برابر `www.microsoft.com` است؛ Apple/iCloud domains به‌عنوان default داخلی استفاده نمی‌شوند.
+- اسکریپت‌های شخص ثالث در Toolbox خارج از کنترل A-Box هستند. A-Box مقدار SHA256 دانلود را نشان می‌دهد و پیش از اجرا `YES-RUN-UNTRUSTED` می‌خواهد.
+- مقادیر `up`/`down` در Hysteria 2 پارامترهای پهنای‌باند و congestion control هستند؛ آنها را مطابق ظرفیت واقعی VPS تنظیم کنید.
 
-Apache License 2.0.
+---
+
+## نیازمندی‌های سیستم
+
+| مورد | نیازمندی |
+| :--- | :--- |
+| Operating system | Debian 10+، Ubuntu 20.04+، CentOS/RHEL/Rocky/AlmaLinux 8+، Alpine Linux. |
+| Init system | systemd یا OpenRC. |
+| CPU | amd64/x86_64، arm64/aarch64. |
+| Privilege | root یا sudo. |
+| Network | دسترسی به system package repositories و GitHub Releases. |
+
+---
+
+## FAQ
+
+### آیا preflight نصب مجدد stack نصب‌شده را متوقف می‌کند؟
+
+خیر. lightweight preflight فقط به دلیل پورت‌هایی که توسط سرویس‌های مدیریت‌شده A-Box اشغال شده‌اند شکست نمی‌خورد؛ deployment سرویس‌های قدیمی را متوقف می‌کند.
+
+### backup و diagnostic bundle شامل چه چیزهایی هستند؟
+
+Backup شامل پیکربندی A-Box، service files، scripts، وضعیت منتخب firewall/cron و metadata است. Diagnostic bundle بدون اطلاعات حساس تولید می‌شود و برای issue reporting یا troubleshooting کاربرد دارد.
+
+### چگونه بهترین SNI را انتخاب کنم؟
+
+از Toolbox menu `3` یا `4` استفاده کنید؛ TLS 1.3، SAN match، ALPN معتبر و ارتباط منطقی ASN/topology با VPS را ترجیح دهید.
+
+---
+
+## بازخورد و مجوز
+
+- [GitHub Issues](https://github.com/alariclin/a-box/issues)
+- Pull Request پذیرفته می‌شود.
+- این پروژه تحت مجوز [Apache License 2.0](LICENSE) منتشر شده است.
