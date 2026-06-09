@@ -1,6 +1,6 @@
 name: A-Box CI
 
-on:
+"on":
   push:
     branches: [ main ]
   pull_request:
@@ -33,13 +33,29 @@ jobs:
 
       - name: README synchronization checks
         run: |
+          test -f LICENSE
+          test -f README.md
+          test -f README-zh.md
+          test -f README-ru.md
+          test -f README-fa.md
+          grep -q 'user-attachments/assets/4f51a6a1-5d1b-49db-90df-98ffae63d1ca' README.md
+          grep -q 'user-attachments/assets/4f51a6a1-5d1b-49db-90df-98ffae63d1ca' README-zh.md
+          grep -q 'user-attachments/assets/4f51a6a1-5d1b-49db-90df-98ffae63d1ca' README-ru.md
+          grep -q 'user-attachments/assets/4f51a6a1-5d1b-49db-90df-98ffae63d1ca' README-fa.md
           grep -q 'SNI preference records' README.md
           grep -q 'SNI 优选记录' README-zh.md
-          grep -q 'SNI preference records' README-ru.md
-          grep -q 'SNI preference records' README-fa.md
+          grep -q 'Сохранённые результаты подбора SNI' README-ru.md
+          grep -q 'سوابق انتخاب SNI' README-fa.md
           grep -q '\[Y/N\]' README.md
           grep -q '\[Y/N\]' README-zh.md
+          grep -q '\[Y/N\]' README-ru.md
+          grep -q '\[Y/N\]' README-fa.md
+          grep -q 'Compliance and Disclaimer' README.md
+          grep -q '合规与免责声明' README-zh.md
+          grep -q 'Соответствие требованиям и отказ от ответственности' README-ru.md
+          grep -q 'رعایت قوانین و سلب مسئولیت' README-fa.md
           ! grep -R 'YES-UPDATE-MAIN' README*.md
+          ! grep -R 'raw.githubusercontent.com/alariclin/a-box/main/A-Box_github.png' README*.md
           ! grep -R '443.*www\.apple\.com\|www\.apple\.com.*443' README*.md
 
       - name: Optional ShellCheck report
