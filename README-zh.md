@@ -2,7 +2,8 @@
 
 [English](README.md) | [简体中文](README-zh.md) | [Русский](README-ru.md) | [فارسی](README-fa.md)
 
-<img width="1254" height="1254" alt="abox" src="https://github.com/user-attachments/assets/a10d7a05-cc41-46b3-9e7e-9fb97bc1c664" />
+<img width="1254" height="1254" alt="A-Box_github" src="https://github.com/user-attachments/assets/6c436ad1-43cd-4f59-992d-8e2f1e22bce4" />
+
 
 
 **A-Box** 是一款面向 Linux 服务器的一体化网络网关自动化工具箱。它把代理服务部署、系统调优、流量管理、访问控制、服务健康检查、客户端配置导出、网络质量测试、运维保护和中英文交互式终端界面集中到一个独立 Bash 脚本中。
