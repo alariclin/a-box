@@ -1,0 +1,50 @@
+name: A-Box CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  script-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bash syntax check
+        run: bash -n install.sh
+
+      - name: Built-in self-test
+        run: bash install.sh --self-test
+
+      - name: Entry and fingerprint checks
+        run: |
+          grep -q '==============================A-Box===============================' install.sh
+          grep -q '^main "\$@"' install.sh
+          grep -q 'show_sni_preference_records' install.sh
+          grep -q 'remove_ss_open_accept_rules' install.sh
+          grep -q 'confirm_ota_script_hash' install.sh
+
+      - name: README synchronization checks
+        run: |
+          grep -q 'SNI preference records' README.md
+          grep -q 'SNI 优选记录' README-zh.md
+          grep -q 'SNI preference records' README-ru.md
+          grep -q 'SNI preference records' README-fa.md
+          grep -q '\[Y/N\]' README.md
+          grep -q '\[Y/N\]' README-zh.md
+          ! grep -R 'YES-UPDATE-MAIN' README*.md
+          ! grep -R '443.*www\.apple\.com\|www\.apple\.com.*443' README*.md
+
+      - name: Optional ShellCheck report
+        continue-on-error: true
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y shellcheck
+          shellcheck -x install.sh
