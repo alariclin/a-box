@@ -2,7 +2,8 @@
 
 [English](README.md) | [简体中文](README-zh.md) | [Русский](README-ru.md) | [فارسی](README-fa.md)
 
-<img width="1254" height="1254" alt="A-Box_github" src="https://github.com/user-attachments/assets/4892a7a0-d36b-4419-aead-e59b4391f017" />
+<img width="804" height="867" alt="屏幕快照 2026-06-10 的 02 44 49 上午" src="https://github.com/user-attachments/assets/dfffc937-02e5-4601-9e50-f90616f64cc4" />
+
 
 
 
