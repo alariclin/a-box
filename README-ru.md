@@ -2,7 +2,8 @@
 
 [English](README.md) | [简体中文](README-zh.md) | [Русский](README-ru.md) | [فارسی](README-fa.md)
 
-<img width="1254" height="1254" alt="A-Box_github" src="https://github.com/user-attachments/assets/469f3f77-836c-47c6-a0ed-e24c619c73a7" />
+<img width="804" height="867" alt="A-Box_github" src="https://github.com/user-attachments/assets/a141be3f-750b-4db9-841e-78ac2d4c9c1e" />
+
 
 
 
