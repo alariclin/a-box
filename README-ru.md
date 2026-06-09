@@ -2,7 +2,8 @@
 
 [English](README.md) | [简体中文](README-zh.md) | [Русский](README-ru.md) | [فارسی](README-fa.md)
 
-<img width="1254" height="1254" alt="abox" src="https://github.com/user-attachments/assets/0fbe87ec-3c02-450b-94a5-16cabcc0ea40" />
+<img width="1254" height="1254" alt="A-Box_github" src="https://github.com/user-attachments/assets/469f3f77-836c-47c6-a0ed-e24c619c73a7" />
+
 
 
 **A-Box** — единый автоматизированный инструментарий для Linux-серверов. Он объединяет развертывание proxy services, system tuning, traffic management, access control, health checks, client configuration export, network quality tests, maintenance safeguards и интерактивный Chinese/English terminal UI в одном Bash-скрипте.
