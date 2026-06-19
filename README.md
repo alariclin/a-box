@@ -193,7 +193,7 @@ Release the port manually or choose another port. A-Box checks for non-A-Box pro
 No. The lightweight preflight does not fail only because A-Box-managed services already hold ports. Deployment still stops A-Box-managed services before writing the new stack.
 
 ### What is included in backups?
-Backups include A-Box configs, service files, scripts, core binaries, Xray Geo data, native firewall state, A-Box cron blocks, iptables/ip6tables snapshots, and runtime metadata.
+Backups include A-Box configs, service files, scripts, core binaries, Xray Geo data, native firewall state, A-Box cron blocks, selected firewall state, and runtime metadata.
 
 ### Why does Hysteria 2 ask for upload and download bandwidth?
 Hysteria 2 uses these values for bandwidth and congestion control. Set them according to the VPS line capacity.
