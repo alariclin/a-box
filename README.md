@@ -1,4 +1,6 @@
-# A-Box | One-click Linux Network Gateway Toolkit
+# A-Box
+
+One-click Linux network gateway toolkit.
 
 [English](README.md) | [简体中文](README-zh.md) | [Русский](README-ru.md) | [فارسی](README-fa.md)
 
@@ -6,29 +8,25 @@
   <img width="804" height="867" alt="A-Box_github" src="https://github.com/user-attachments/assets/4f51a6a1-5d1b-49db-90df-98ffae63d1ca" />
 </p>
 
-A-Box is a standalone Bash automation toolkit for Linux network gateway deployment and maintenance. It integrates Xray-core, sing-box, official Hysteria 2, protocol configuration export, system tuning, traffic limits, access control, health checks, backup/restore, diagnostics, and SNI preference testing.
+A-Box is a standalone Bash script for deploying and maintaining Linux network gateway services.
 
-> Use only in legal, authorized, and compliant environments. Users are responsible for all operational, legal, and security consequences.
+It supports Xray-core, sing-box, official Hysteria 2, VLESS Vision REALITY, VLESS XHTTP REALITY, Shadowsocks-2022, Hysteria 2, node export, SNI preference testing, backup and restore, firewall handling, diagnostics, traffic limits, health checks, and core updates.
+
+> Use this project only in legal, authorized, and compliant environments. You are responsible for all legal, operational, and security consequences.
 
 ## Compliance and Disclaimer
 
-This project is provided only for **network architecture testing, cybersecurity research, system operations automation, and lawful privacy protection in fully authorized environments**.
+This project is provided only for network architecture testing, cybersecurity research, system operations automation, and lawful privacy protection in fully authorized environments.
 
-1. **Legal compliance:** Do not use this project for any activity that violates the laws, regulations, service terms, or network-use policies of your country or region.
+Do not use this project for illegal attacks, unauthorized access, audit evasion, network abuse, infrastructure disruption, or any unlawful activity.
 
-2. **Authorization boundary:** Deploy, test, or operate this project only on servers, networks, and systems that you own, manage, or have explicit authorization to use.
+Use it only on servers, networks, and systems that you own, manage, or have explicit permission to operate.
 
-3. **User responsibility:** Users are solely responsible for all legal, operational, security, and compliance consequences caused by misuse, prohibited use, configuration errors, or improper operation.
-
-4. **Technical intent:** The routing, encryption, proxy, traffic-control, and diagnostic functions in this project are intended to improve transmission security, availability, and operational efficiency in authorized environments. Do not use them for illegal attacks, unauthorized access, audit evasion, infrastructure disruption, or assistance with unlawful activity.
-
-5. **No warranty:** This project is provided "as is". It is not warranted to be fit for any particular purpose, nor guaranteed to be available, compliant, or risk-free in every network, system, or jurisdiction.
-
-6. **Acceptance:** By downloading, copying, deploying, or running this project, you confirm that you have read, understood, and accepted these terms.
+This project is provided "as is", without warranty. By downloading, copying, deploying, or running it, you accept these terms.
 
 ## Safe Quick Start
 
-Download first, inspect or checksum, then run:
+Recommended method:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/alariclin/a-box/main/install.sh -o A-Box.sh
@@ -37,7 +35,7 @@ sudo bash A-Box.sh --self-test
 sudo bash A-Box.sh
 ```
 
-Fast pipeline mode is still available:
+Fast pipeline method:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/alariclin/a-box/main/install.sh | sudo bash
@@ -47,6 +45,12 @@ Mirror fallback, only when GitHub raw is unreachable:
 
 ```bash
 curl -fsSL https://ghp.ci/https://raw.githubusercontent.com/alariclin/a-box/main/install.sh | sudo bash
+```
+
+After installation, open the menu with:
+
+```bash
+sb
 ```
 
 Language selection:
@@ -66,135 +70,139 @@ sudo bash A-Box.sh --preflight
 sudo bash A-Box.sh --dry-run
 ```
 
-After first installation, use:
+## Main Features
 
-```bash
-sb
-```
-
-## Core Features
-
-| Module | Description |
+| Area | What it does |
 |---|---|
-| Deployment | Installs dependencies, initializes the runtime environment, deploys and manages Xray-core, sing-box, and official Hysteria 2. |
-| Protocol stacks | VLESS-Vision-Reality, VLESS-XHTTP-Reality, Shadowsocks-2022, and Hysteria 2. |
-| Default ports | Vision `443/TCP`, XHTTP `8443/TCP`, HY2 `443/UDP`, SS-2022 `2053/TCP+UDP`; custom ports are validated. |
-| SNI policy | Default REALITY SNI is `www.microsoft.com`. Apple/iCloud domains are never used as built-in defaults. Apple/iCloud-like SNI on non-443 ports triggers a warning. |
-| Built-in SNI radar | Local full/mini candidate library; no legacy remote SNI script. Scores HTTPS/TLS metrics, TLS 1.3, ALPN, SAN, ASN/topology, and saves records. |
-| XHTTP export | Exports XHTTP client parameters using `/xhttp`, `stream-one`, HTTP/2 host, and `smux: false` for compatible clients such as Mihomo. |
-| Hysteria 2 | Supports ACME HTTP-01, Cloudflare DNS-01, self-signed certificate pinning, masquerade, optional port hopping, and Salamander obfuscation. |
-| Operations | BBR/FQ tuning, TCP KeepAlive, Fail2Ban, logrotate, health probe, Geo data update, monthly traffic cutoff, SS-2022 whitelist, and status reporting. |
-| Safeguards | Preflight checks, deployment replacement confirmation, backup before risky actions, redacted diagnostics, and guarded OTA update. |
-| Export formats | URI, terminal QR, Clash/Mihomo YAML, sing-box outbound templates, and v2rayN/v2rayNG JSON. |
+| Deployment | Installs dependencies and deploys Xray-core, sing-box, or official Hysteria 2. |
+| Protocols | VLESS Vision REALITY, VLESS XHTTP REALITY, Shadowsocks-2022, and Hysteria 2. |
+| Default ports | Vision `443/TCP`, XHTTP `8443/TCP`, HY2 `443/UDP`, SS-2022 `2053/TCP+UDP`. |
+| SNI radar | Built-in 4096-candidate SNI test library for REALITY/XHTTP target selection. |
+| Exports | URI, QR code, Clash/Mihomo YAML, sing-box outbound templates, and v2rayN/v2rayNG JSON. |
+| Firewall safety | Does not automatically disable UFW or firewalld. It tracks A-Box-created firewall rules for cleanup and rollback. |
+| Service safety | Avoids global `killall` and checks A-Box service ownership before stopping managed services. |
+| Recovery | Backs up and restores configs, service files, core binaries, Xray Geo data, firewall state, cron blocks, and runtime metadata. |
+| Maintenance | Supports preflight checks, diagnostics, traffic limits, Fail2Ban, logrotate, health probe, Geo updates, and guarded OTA. |
 
-## Full Menu Reference
+## Menu
 
-| Menu | Function | Use case |
-|---:|---|---|
-| `1` | Xray VLESS-Vision-Reality | Primary TCP REALITY + Vision path. |
-| `2` | Xray VLESS-XHTTP-Reality | High-throughput XHTTP over REALITY path. |
-| `3` | Xray Shadowsocks-2022 | TCP/UDP relay or landing inbound; whitelist is recommended. |
-| `4` | Official Hysteria 2 | UDP/QUIC/H3 path for mobile or lossy networks. |
-| `5` | Xray + Official HY2 all-in-one | Vision + XHTTP + HY2 + SS-2022. |
-| `6` | sing-box VLESS-Vision-Reality | Low-memory Vision deployment. |
-| `7` | sing-box Shadowsocks-2022 | Low-memory SS-2022 deployment. |
-| `8` | sing-box VLESS + SS-2022 | Lightweight two-protocol deployment. |
-| `9` | sing-box Hysteria 2 | HY2 implemented by sing-box. |
-| `10` | sing-box all-in-one | Vision + HY2 + SS-2022; XHTTP excluded by design. |
-| `11` | Toolbox | Benchmark, IP quality, SNI radar, WARP, Swap, backup/restore, diagnostics, dry-run preflight, SNI records. |
-| `12` | VPS optimization | BBR/FQ, limits, KeepAlive, Fail2Ban, health probe. |
-| `13` | Display node parameters | Links, QR codes, YAML, JSON, outbound templates. |
-| `14` | Manual | Full terminal manual. |
-| `15` | OTA, Geo & core upgrade | Update A-Box script, update Xray Geo data, or upgrade installed cores without resetting node parameters. |
-| `16` | Clean uninstall | Remove managed services, configs, firewall rules, and optional `sb` shortcut. |
-| `17` | Delete nodes & reinitialize | Kill orphan processes, clean stale rules, and remove broken configs/services. |
-| `18` | Monthly traffic limit | vnStat-based monthly quota; stops services after quota is reached. |
-| `19` | SS-2022 whitelist manager | Add/remove frontend IP/CIDR; enforce DROP for non-whitelisted sources. Switching back to whitelist mode removes stale global ACCEPT rules first. |
-| `20` | Language settings | Switch Chinese/English UI and save to `/etc/ddr/.lang`. |
-| `0` | Exit | Exit the menu. |
+| Menu | Function |
+|---:|---|
+| `1` | Xray VLESS Vision REALITY |
+| `2` | Xray VLESS XHTTP REALITY |
+| `3` | Xray Shadowsocks-2022 |
+| `4` | Official Hysteria 2 |
+| `5` | Xray + Official HY2 all-in-one |
+| `6` | sing-box VLESS Vision REALITY |
+| `7` | sing-box Shadowsocks-2022 |
+| `8` | sing-box VLESS + Shadowsocks-2022 |
+| `9` | sing-box Hysteria 2 |
+| `10` | sing-box all-in-one |
+| `11` | Toolbox |
+| `12` | VPS optimization |
+| `13` | Show node parameters |
+| `14` | Manual |
+| `15` | OTA, Geo data, and core upgrade |
+| `16` | Clean uninstall |
+| `17` | Delete nodes and reinitialize |
+| `18` | Monthly traffic limit |
+| `19` | SS-2022 whitelist manager |
+| `20` | Language settings |
+| `0` | Exit |
 
-## Toolbox Details
+## Toolbox
 
-| Submenu | Function | Description |
-|---:|---|---|
-| `1` | System benchmark | Runs `bench.sh` for hardware and download speed testing. |
-| `2` | IP quality and route test | Runs Check.Place for IP quality, streaming unlock, and route testing. |
-| `3` | Local SNI preference | Runs the full built-in SNI preference library with higher concurrency and deeper verification. |
-| `4` | Mini-host local SNI preference | Uses the same candidate library as full mode, but lowers concurrency and verification depth for low-spec hosts. |
-| `5` | Cloudflare WARP manager | Downloads and runs a third-party WARP manager. A-Box prints SHA256 and requires strong confirmation before execution. |
-| `6` | 2G Swap allocation | Creates `/swapfile` to reduce OOM risk on low-memory hosts. |
-| `7` | Backup / Restore | Creates or restores A-Box configuration backups. |
-| `8` | Redacted diagnostic bundle | Exports status, ports, versions, logs, firewall snippets, cron entries, and redacted environment data. |
-| `9` | Full dry-run preflight check | Runs a non-destructive environment, dependency, network, GitHub, port, service, firewall, and storage check. |
-| `10` | SNI preference records | Displays saved full/mini SNI preference results from `/etc/ddr/A-Box-sni-full.tsv` and `/etc/ddr/A-Box-sni-mini.tsv`. |
+| Submenu | Function |
+|---:|---|
+| `1` | System benchmark |
+| `2` | IP quality and route test |
+| `3` | Full local SNI preference test |
+| `4` | Mini-host local SNI preference test |
+| `5` | Cloudflare WARP manager |
+| `6` | 2G Swap allocation |
+| `7` | Backup and restore |
+| `8` | Redacted diagnostic bundle |
+| `9` | Full dry-run preflight check |
+| `10` | SNI preference records |
 
-## Maintenance Safeguards
-
-- Lightweight preflight runs automatically before protocol deployment menus `1`-`10`.
-- Menu `15` creates an automatic backup before core upgrade actions without resetting node parameters.
-- Menus `16` and `17` ask whether to create a backup before uninstall or environment reset.
-- Toolbox submenu `7` provides manual backup and restore.
-- Toolbox submenu `8` exports a redacted diagnostic bundle. UUIDs, private keys, passwords, tokens, and client links are masked.
-- Toolbox submenu `9` runs a full dry-run preflight report and saves it under `/etc/ddr/preflight/`.
-- Toolbox submenu `10` displays the latest saved full/mini SNI preference records.
-- Third-party toolbox scripts are not part of A-Box. Before execution, A-Box displays the downloaded script SHA256 and requires exact confirmation `YES-RUN-UNTRUSTED`, unless `ABOX_REMOTE_SHA256_ALLOWLIST` explicitly contains the hash.
-- OTA from the `main` branch is guarded by syntax/fingerprint validation plus SHA256 display and `[Y/N]` confirmation. Non-interactive OTA must use `ABOX_OTA_SHA256_ALLOWLIST`.
-- GitHub core asset downloads require official release asset SHA256 digest validation. Stable `latest` releases are used by default; prerelease/alpha builds are intentionally not used.
-
-## Recommended Deployment Schemes
+## Recommended Deployment
 
 | Scenario | Recommended option |
 |---|---|
-| Balanced production deployment | Menu `5`: Xray + Official HY2 all-in-one. |
-| Low-memory lightweight deployment | Menu `10`: sing-box all-in-one. |
-| Primary TCP path | Menu `1`: Xray VLESS-Vision-Reality (`443/TCP`). |
-| High-throughput desktop backup | Menu `2`: Xray VLESS-XHTTP-Reality (`8443/TCP`). |
-| Mobile or lossy network | Menu `4`: Official Hysteria 2 (`443/UDP`). |
-| Relay/landing node | Menu `3`: Xray SS-2022 (`2053/TCP+UDP`) + whitelist. |
+| Balanced production use | Menu `5`: Xray + Official HY2 all-in-one |
+| Low-memory VPS | Menu `10`: sing-box all-in-one |
+| Main TCP path | Menu `1`: Xray VLESS Vision REALITY |
+| High-throughput TCP backup | Menu `2`: Xray VLESS XHTTP REALITY |
+| Mobile or unstable network | Menu `4`: Official Hysteria 2 |
+| Relay or landing node | Menu `3`: Xray Shadowsocks-2022 + whitelist |
 
-## SNI Selection Notes
+## SNI Notes
 
-- Run SNI preference on the VPS, not on a local laptop, because REALITY target quality depends mainly on the VPS-to-target path.
-- Prefer candidates with `tls13=1`, `san=1`, valid ALPN, and same/near ASN or country when available.
-- Avoid API-only, rate-limited, unstable, or abnormal response targets when normal `200` web/document/static-resource targets are available.
-- Do not use raw IP addresses as SNI.
-- Apple/iCloud-like SNI on non-443 ports is explicitly warned by the script.
-- The fallback REALITY SNI is `www.microsoft.com`; Apple/iCloud domains are never used as built-in defaults.
-- Use Toolbox `10` to review the saved result after running Toolbox `3` or `4`.
+SNI preference testing is mainly for Xray REALITY and XHTTP REALITY.
+
+Run SNI testing on the VPS, not on your local computer. The best target depends on the VPS-to-target network path.
+
+Prefer results with `tls13=1`, `san=1`, valid ALPN, normal HTTP response, and a reasonable ASN or topology relationship with the VPS.
+
+The built-in fallback REALITY SNI is:
+
+```text
+www.microsoft.com
+```
+
+Apple/iCloud domains are not used as built-in defaults. The script warns if an Apple/iCloud-like SNI is used on a non-443 port.
+
+After running Toolbox `3` or `4`, use Toolbox `10` to view saved SNI records.
+
+## Safety Design
+
+A-Box is designed for production stability:
+
+- It does not automatically disable UFW or firewalld.
+- It adds only required A-Box ports when native firewalls are active.
+- It tracks A-Box-created native firewall rules for cleanup and rollback.
+- It avoids global `killall`.
+- It checks A-Box service ownership before stopping managed services.
+- It backs up important files before risky operations.
+- It restores configs, service files, core binaries, Xray Geo data, firewall state, cron blocks, and runtime metadata.
+- It validates GitHub Release asset SHA256 digests for core and Geo downloads.
+- It uses stable latest releases by default, not alpha or prerelease builds.
+- Third-party toolbox scripts require SHA256 display and exact confirmation unless their hash is explicitly allowlisted.
+- OTA from `main` requires syntax/fingerprint validation, SHA256 display, and `[Y/N]` confirmation. Non-interactive OTA requires `ABOX_OTA_SHA256_ALLOWLIST`.
 
 ## System Requirements
 
 | Item | Requirement |
 |---|---|
-| OS | Debian 10+, Ubuntu 20.04+, CentOS/RHEL/Rocky/AlmaLinux 8+, Alpine Linux. |
-| Init system | systemd or OpenRC. |
-| CPU | amd64/x86_64, arm64/aarch64. |
-| Privilege | root or sudo. |
-| Network | Access to system repositories and GitHub Releases. |
-| Dependencies | Bash, curl, jq, openssl, iptables, vnStat, and other packages are installed automatically when missing. |
+| OS | Debian 10+, Ubuntu 20.04+, CentOS/RHEL/Rocky/AlmaLinux 8+, Alpine Linux |
+| Init system | systemd or OpenRC |
+| CPU | amd64/x86_64, arm64/aarch64 |
+| Privilege | root or sudo |
+| Network | Access to system repositories and GitHub Releases |
+| Dependencies | Bash, curl, jq, openssl, iptables, vnStat, and other packages are installed automatically when missing |
 
 ## FAQ
 
 ### The script says no interactive TTY is available.
-Run it from an interactive terminal. If a pipeline environment fails, download the script first and run `sudo bash A-Box.sh`.
+Run it from an interactive terminal. If pipeline mode fails, download the script first and run `sudo bash A-Box.sh`.
 
 ### Deployment failed because a port is occupied.
-The script checks for non-A-Box processes using selected ports. Release the port manually or choose a different port.
+Release the port manually or choose another port. A-Box checks for non-A-Box processes before deployment.
 
-### Will preflight block reinstalling an already deployed stack?
-No. The lightweight preflight used before protocol deployment does not fail just because A-Box-managed services already hold ports. Actual deployment still stops managed services before writing the new stack.
+### Will preflight block reinstalling an existing A-Box stack?
+No. The lightweight preflight does not fail only because A-Box-managed services already hold ports. Deployment still stops A-Box-managed services before writing the new stack.
 
-### What is included in backups and diagnostics?
-Backups preserve A-Box configuration, service files, scripts, selected firewall/cron state, and related runtime metadata. Diagnostic bundles are redacted for troubleshooting.
+### What is included in backups?
+Backups include A-Box configs, service files, scripts, core binaries, Xray Geo data, native firewall state, A-Box cron blocks, iptables/ip6tables snapshots, and runtime metadata.
 
-### Why does Hysteria 2 ask for up/down bandwidth?
-Hysteria 2 uses configured `up` and `down` values as bandwidth control and congestion-control parameters. Set them according to the VPS line capacity.
+### Why does Hysteria 2 ask for upload and download bandwidth?
+Hysteria 2 uses these values for bandwidth and congestion control. Set them according to the VPS line capacity.
 
 ### ACME certificate application failed.
 For HTTP-01, make sure `80/TCP` is reachable and not occupied. For Cloudflare DNS-01, make sure the API token has DNS edit permission for the target zone.
 
 ### How should I choose SNI?
-Use Toolbox `3` or `4`, then review saved results with Toolbox `10`. Prefer TLS 1.3, SAN match, valid ALPN, and reasonable ASN/topology relationship with the VPS.
+Run Toolbox `3` or `4`, then check Toolbox `10`. Prefer TLS 1.3, SAN match, valid ALPN, normal HTTP response, and reasonable ASN/topology relationship with the VPS.
 
 ## Feedback and License
 
