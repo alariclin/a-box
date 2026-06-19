@@ -205,7 +205,6 @@ HTTP-01 模式下，确认 `80/TCP` 可达且未被占用。Cloudflare DNS-01 �
 运行工具箱 `3` 或 `4`，再查看工具箱 `10`。优先选择 TLS 1.3、SAN 命中、ALPN 正常、HTTP 响应正常，并与 VPS ASN/拓扑关系合理的候选。
 
 ## 反馈与许可证
-
 - [GitHub Issues](https://github.com/alariclin/a-box/issues)
 - 欢迎提交 Pull Request。
 - 本项目基于 [Apache License 2.0](LICENSE) 发布。
