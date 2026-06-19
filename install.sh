@@ -19,6 +19,7 @@ DEPS_MARKER='/etc/ddr/.deps.v20260507'
 SCRIPT_URL='https://raw.githubusercontent.com/alariclin/a-box/main/install.sh'
 ABOX_DIR='/etc/ddr'
 ABOX_ENV='/etc/ddr/.env'
+ABOX_FW_STATE='/etc/ddr/.firewall-native.rules'
 LOCK_FILE='/var/run/A-Box.lock'
 LANG_FILE='/etc/ddr/.lang'
 PUBLIC_IP_CACHE='/etc/ddr/.public_ip.cache'
@@ -26,7 +27,14 @@ PUBLIC_IP_CACHE_TTL=600
 ABOX_LANG='zh'
 
 msg() { echo -e "$*"; }
-die() { echo -e "${RED}[!] $*${NC}" >&2; exit 1; }
+die() {
+    echo -e "${RED}[!] $*${NC}" >&2
+    if [[ -n "${ABOX_DIE_HOOK:-}" ]] && declare -F "$ABOX_DIE_HOOK" >/dev/null 2>&1; then
+        "$ABOX_DIE_HOOK" "$*" || true
+    fi
+    exit 1
+}
+now_iso() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 
 normalize_lang() {
     case "${1:-}" in
@@ -514,7 +522,6 @@ init_system_environment() {
         case "$release" in
             debian|ubuntu)
                 deps=(wget curl jq openssl bc unzip vnstat iptables tar psmisc lsof qrencode ca-certificates iproute2 coreutils cron uuid-runtime iptables-persistent netfilter-persistent fail2ban python3)
-                command -v ufw >/dev/null 2>&1 && ufw disable >/dev/null 2>&1 || true
                 ;;
             centos)
                 deps=(wget curl jq openssl bc unzip vnstat iptables tar psmisc lsof qrencode ca-certificates coreutils cronie util-linux bind-utils iproute fail2ban iptables-services epel-release python3)
@@ -544,8 +551,11 @@ init_system_environment() {
             esac
             start_unit_if_exists vnstat
             if [[ "$release" == 'centos' ]]; then
-                systemctl disable --now firewalld 2>/dev/null || true
-                systemctl enable --now iptables ip6tables 2>/dev/null || true
+                if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+                    msg "${YELLOW}[*] firewalld is active; A-Box will add required ports natively and will not disable it.${NC}"
+                else
+                    systemctl enable --now iptables ip6tables 2>/dev/null || true
+                fi
             fi
         else
             rc-update add crond default 2>/dev/null || true
@@ -669,15 +679,83 @@ service_manager() {
     done
 }
 
-stop_all_managed_services() {
-    service_manager stop xray sing-box hysteria >/dev/null 2>&1 || true
-    if [[ "$INIT_SYS" == 'systemd' ]]; then
-        local srv pid
-        for srv in xray sing-box hysteria; do
-            pid=$(systemctl show -p MainPID --value "$srv" 2>/dev/null || true)
-            [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] && kill -TERM "$pid" 2>/dev/null || true
-        done
+service_file_is_abox_managed() {
+    local srv="$1" unit='' legacy_re=''
+    case "${INIT_SYS:-}" in
+        systemd)
+            unit="/etc/systemd/system/${srv}.service"
+            ;;
+        openrc)
+            unit="/etc/init.d/${srv}"
+            ;;
+        *) return 1 ;;
+    esac
+    [[ -f "$unit" ]] || return 1
+    grep -Eq 'Managed by A-Box|A-Box' "$unit" && return 0
+    # Backward compatibility: older A-Box service files did not contain an
+    # explicit marker. Treat a fixed-name unit as managed only when it points
+    # to the standard A-Box config paths.
+    case "$srv" in
+        xray) legacy_re='/usr/local/etc/xray/config\.json' ;;
+        sing-box) legacy_re='/etc/sing-box/config\.json' ;;
+        hysteria) legacy_re='/etc/hysteria/config\.yaml|A-Box-hysteria\.log' ;;
+        *) return 1 ;;
+    esac
+    [[ -r "$ABOX_ENV" ]] && grep -Eq "$legacy_re" "$unit"
+}
+
+stop_abox_service() {
+    local srv="$1"
+    if service_file_is_abox_managed "$srv"; then
+        service_manager stop "$srv" >/dev/null 2>&1 || true
+    else
+        msg "${YELLOW}[!] Skip non-A-Box service: ${srv}${NC}"
     fi
+}
+
+stop_all_managed_services() {
+    stop_abox_service xray
+    stop_abox_service sing-box
+    stop_abox_service hysteria
+    kill_managed_residual_pids >/dev/null 2>&1 || true
+}
+managed_service_pid() {
+    local srv="$1" pid=''
+    if [[ "${INIT_SYS:-}" == 'systemd' ]] && command -v systemctl >/dev/null 2>&1; then
+        pid=$(systemctl show -p MainPID --value "$srv" 2>/dev/null || true)
+        [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] && printf '%s\n' "$pid"
+    elif [[ "${INIT_SYS:-}" == 'openrc' ]]; then
+        case "$srv" in
+            xray) [[ -r /run/xray.pid ]] && cat /run/xray.pid ;;
+            sing-box) [[ -r /run/sing-box.pid ]] && cat /run/sing-box.pid ;;
+            hysteria) [[ -r /run/hysteria.pid ]] && cat /run/hysteria.pid ;;
+        esac
+    fi
+}
+
+pid_exe_matches() {
+    local pid="$1" expect="$2" exe
+    [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 ]] || return 1
+    exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+    [[ "$exe" == "$expect" ]]
+}
+
+kill_managed_residual_pids() {
+    local srv pid exe
+    for srv in xray sing-box hysteria; do
+        pid=$(managed_service_pid "$srv" | head -n 1 || true)
+        [[ -n "$pid" ]] || continue
+        case "$srv" in
+            xray) exe='/usr/local/bin/xray' ;;
+            sing-box) exe='/usr/local/bin/sing-box' ;;
+            hysteria) exe='/usr/local/bin/hysteria' ;;
+        esac
+        if pid_exe_matches "$pid" "$exe"; then
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 1
+            kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+        fi
+    done
 }
 
 is_service_running() {
@@ -766,18 +844,119 @@ save_firewall_rules() {
     fi
 }
 
+firewall_backend() {
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+        printf 'ufw\n'
+        return 0
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        printf 'firewalld\n'
+        return 0
+    fi
+    printf 'iptables\n'
+}
+
+record_native_firewall_rule() {
+    local backend="$1" port="$2" proto="$3"
+    valid_port "$port" || return 0
+    [[ "$proto" == 'tcp' || "$proto" == 'udp' ]] || return 0
+    mkdir -p "$ABOX_DIR"
+    grep -qxF "${backend}|${port}|${proto}" "$ABOX_FW_STATE" 2>/dev/null || printf '%s|%s|%s\n' "$backend" "$port" "$proto" >> "$ABOX_FW_STATE"
+    chmod 600 "$ABOX_FW_STATE" 2>/dev/null || true
+}
+
+ufw_rule_exists() {
+    local port="$1" proto="$2"
+    ufw status 2>/dev/null | grep -Eiq "(^|[[:space:]])${port}/${proto}([[:space:]]|$).*ALLOW"
+}
+
+remove_native_firewall_rules() {
+    [[ -r "$ABOX_FW_STATE" ]] || return 0
+    local backend port proto
+    while IFS='|' read -r backend port proto; do
+        valid_port "$port" || continue
+        [[ "$proto" == 'tcp' || "$proto" == 'udp' ]] || continue
+        case "$backend" in
+            ufw)
+                if command -v ufw >/dev/null 2>&1; then
+                    ufw --force delete allow proto "$proto" from any to any port "$port" >/dev/null 2>&1 || ufw --force delete allow "${port}/${proto}" >/dev/null 2>&1 || true
+                fi
+                ;;
+            firewalld)
+                if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+                    firewall-cmd --remove-port="${port}/${proto}" >/dev/null 2>&1 || true
+                    firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || true
+                fi
+                ;;
+        esac
+    done < "$ABOX_FW_STATE"
+    rm -f "$ABOX_FW_STATE"
+}
+
+apply_native_firewall_rules_from_state() {
+    [[ -r "$ABOX_FW_STATE" ]] || return 0
+    local backend port proto
+    while IFS='|' read -r backend port proto; do
+        valid_port "$port" || continue
+        [[ "$proto" == 'tcp' || "$proto" == 'udp' ]] || continue
+        case "$backend" in
+            ufw)
+                command -v ufw >/dev/null 2>&1 && ufw allow proto "$proto" from any to any port "$port" comment "A-Box-${port}-${proto}" >/dev/null 2>&1 || true
+                ;;
+            firewalld)
+                if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+                    firewall-cmd --add-port="${port}/${proto}" >/dev/null 2>&1 || true
+                    firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 || true
+                fi
+                ;;
+        esac
+    done < "$ABOX_FW_STATE"
+}
+
 allowPort() {
-    local port=$1 type=${2:-tcp}
-    if ! $IPT -w -C INPUT -p "$type" --dport "$port" -j ACCEPT 2>/dev/null; then
+    local port=$1 type=${2:-tcp} backend
+    valid_port "$port" || die "端口非法: $port"
+    [[ "$type" == 'tcp' || "$type" == 'udp' ]] || die "协议非法: $type"
+
+    backend=$(firewall_backend)
+    case "$backend" in
+        ufw)
+            if ! ufw_rule_exists "$port" "$type"; then
+                ufw allow proto "$type" from any to any port "$port" comment "A-Box-${port}-${type}" >/dev/null 2>&1 || ufw allow "${port}/${type}" >/dev/null 2>&1 || die "UFW 防火墙放行失败: ${port}/${type}"
+                record_native_firewall_rule ufw "$port" "$type"
+            fi
+            return 0
+            ;;
+        firewalld)
+            local fw_runtime_exists=0 fw_permanent_exists=0 fw_added_runtime=0
+            firewall-cmd --query-port="${port}/${type}" >/dev/null 2>&1 && fw_runtime_exists=1
+            firewall-cmd --permanent --query-port="${port}/${type}" >/dev/null 2>&1 && fw_permanent_exists=1
+            if [[ "$fw_runtime_exists" == '0' ]]; then
+                firewall-cmd --add-port="${port}/${type}" >/dev/null 2>&1 || die "firewalld runtime 放行失败: ${port}/${type}"
+                fw_added_runtime=1
+            fi
+            if [[ "$fw_permanent_exists" == '0' ]]; then
+                if ! firewall-cmd --permanent --add-port="${port}/${type}" >/dev/null 2>&1; then
+                    [[ "$fw_added_runtime" == '1' && "$fw_runtime_exists" == '0' ]] && firewall-cmd --remove-port="${port}/${type}" >/dev/null 2>&1 || true
+                    die "firewalld permanent 放行失败: ${port}/${type}"
+                fi
+            fi
+            if [[ "$fw_runtime_exists" == '0' && "$fw_permanent_exists" == '0' ]]; then
+                record_native_firewall_rule firewalld "$port" "$type"
+            fi
+            return 0
+            ;;
+    esac
+
+    if ! $IPT -w -C INPUT -p "$type" --dport "$port" -m comment --comment "A-Box-${port}-${type}" -j ACCEPT 2>/dev/null; then
         $IPT -w -I INPUT -p "$type" --dport "$port" -m comment --comment "A-Box-${port}-${type}" -j ACCEPT >/dev/null 2>&1 || die "IPv4 防火墙放行失败: ${port}/${type}"
     fi
     if has_ipv6 && command -v ip6tables >/dev/null 2>&1 && $IPT6 -w -S INPUT >/dev/null 2>&1; then
-        if ! $IPT6 -w -C INPUT -p "$type" --dport "$port" -j ACCEPT 2>/dev/null; then
+        if ! $IPT6 -w -C INPUT -p "$type" --dport "$port" -m comment --comment "A-Box-${port}-${type}" -j ACCEPT 2>/dev/null; then
             $IPT6 -w -I INPUT -p "$type" --dport "$port" -m comment --comment "A-Box-${port}-${type}" -j ACCEPT >/dev/null 2>&1 || die "IPv6 防火墙放行失败: ${port}/${type}"
         fi
     fi
 }
-
 remove_ss_open_accept_rules() {
     local proto rule
     [[ -n "${SS_PORT:-}" ]] || return 0
@@ -818,6 +997,7 @@ clean_nat_rules() {
 }
 
 clean_input_rules() {
+    remove_native_firewall_rules 2>/dev/null || true
     local rule
     while $IPT -w -S INPUT 2>/dev/null | grep -q 'A-Box-'; do
         rule=$($IPT -w -S INPUT 2>/dev/null | grep 'A-Box-' | head -n 1 | sed 's/^-A /-D /')
@@ -1054,7 +1234,7 @@ fetch_github_release() {
 }
 
 fetch_geo_data() {
-    local file_name official_url out tmp_out size
+    local file_name official_url out tmp_out size repo asset release_json asset_json download_url digest
     file_name="${1:-}"
     official_url="${2:-}"
     out="${3:-}"
@@ -1063,16 +1243,31 @@ fetch_geo_data() {
     [[ -n "$out" ]] || out="$(mktemp "/tmp/${file_name}.XXXXXX")"
     mkdir -p "$(dirname "$out")"
     tmp_out=$(mktemp "${out}.download.XXXXXX") || die 'Geo 数据临时文件创建失败。'
-    if curl -fLs --connect-timeout 10 -m 90 "$official_url" -o "$tmp_out"; then
-        size=$(wc -c < "$tmp_out" 2>/dev/null | tr -d ' ')
-        if [[ -n "$size" && "$size" -gt 500000 ]]; then
-            mv -f "$tmp_out" "$out"
-            FETCHED_GEO_PATH="$out"
-            return 0
-        fi
+
+    if [[ "$official_url" =~ ^https://github.com/([^/]+/[^/]+)/releases/latest/download/([^/?#]+)$ ]]; then
+        repo="${BASH_REMATCH[1]}"
+        asset="${BASH_REMATCH[2]}"
+        release_json=$(github_api_get "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null) || release_json=''
+        [[ -n "$release_json" ]] || { rm -f -- "$tmp_out"; die "Geo Release API 请求失败: ${repo}"; }
+        asset_json=$(jq -c --arg name "$asset" '.assets[]? | select(.name == $name) | {url:.browser_download_url,digest:(.digest // "")}' <<< "$release_json" | head -n 1)
+        [[ -n "$asset_json" && "$asset_json" != 'null' ]] || { rm -f -- "$tmp_out"; die "Geo Release asset 未找到: ${asset}"; }
+        download_url=$(jq -r '.url' <<< "$asset_json")
+        digest=$(jq -r '.digest // ""' <<< "$asset_json")
+        valid_github_download_url "$repo" "$download_url" || { rm -f -- "$tmp_out"; die 'Geo GitHub Release 下载地址域名/仓库不匹配。'; }
+        curl -fLs --connect-timeout 10 -m 90 "$download_url" -o "$tmp_out" || { rm -f -- "$tmp_out"; die "Geo 数据文件 ${file_name} 下载失败。"; }
+        verify_github_asset_digest "$tmp_out" "$digest"
+    else
+        curl -fLs --connect-timeout 10 -m 90 "$official_url" -o "$tmp_out" || { rm -f -- "$tmp_out"; die "Geo 数据文件 ${file_name} 下载失败。"; }
     fi
-    rm -f -- "$tmp_out" "$out"
-    die "Geo 数据文件 ${file_name} 下载或校验失败。"
+
+    size=$(wc -c < "$tmp_out" 2>/dev/null | tr -d ' ')
+    [[ -n "$size" && "$size" -gt 500000 ]] || { rm -f -- "$tmp_out" "$out"; die "Geo 数据文件 ${file_name} 大小异常。"; }
+    if head -c 256 "$tmp_out" 2>/dev/null | grep -Eiq '<(html|!doctype)'; then
+        rm -f -- "$tmp_out" "$out"
+        die "Geo 数据文件 ${file_name} 看起来是 HTML 错误页。"
+    fi
+    mv -f "$tmp_out" "$out"
+    FETCHED_GEO_PATH="$out"
 }
 
 reset_protocol_vars() {
@@ -1298,12 +1493,7 @@ if [[ -n "${SS_PORT:-}" ]] && ! ss -H -nlt 2>/dev/null | awk '{print $4}' | grep
 fi
 EOF_PROBE
     chmod +x "$ABOX_DIR/socket_probe.sh"
-    local tmp_cron
-    tmp_cron=$(mktemp)
-    crontab -l 2>/dev/null | grep -vE '^no crontab for|^#' | grep -v '/etc/ddr/socket_probe.sh' > "$tmp_cron" || true
-    echo '* * * * * /bin/bash /etc/ddr/socket_probe.sh >/dev/null 2>&1' >> "$tmp_cron"
-    crontab "$tmp_cron" 2>/dev/null || true
-    rm -f "$tmp_cron"
+    install_abox_cron_block PROBE '* * * * * /bin/bash /etc/ddr/socket_probe.sh >/dev/null 2>&1'
 }
 
 setup_geo_cron() {
@@ -1311,24 +1501,37 @@ setup_geo_cron() {
     cat > "$ABOX_DIR/geo_update.sh" <<'EOF_GEO'
 #!/usr/bin/env bash
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
-GEOIP_URL='https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat'
-GEOSITE_URL='https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat'
+GEO_REPO='Loyalsoldier/v2ray-rules-dat'
 fetch_one() {
-    local url="$1" out="$2" size
+    local asset="$1" out="$2" api release_json asset_json url digest expected actual size
     rm -f "$out"
-    if curl -fLs --connect-timeout 10 -m 90 "$url" -o "$out"; then
-        size=$(wc -c < "$out" 2>/dev/null | tr -d ' ')
-        [[ -n "$size" && "$size" -gt 500000 ]] && return 0
-    fi
-    return 1
+    api="https://api.github.com/repos/${GEO_REPO}/releases/latest"
+    release_json=$(curl -fLsS --connect-timeout 10 -m 60 \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'X-GitHub-Api-Version: 2022-11-28' \
+        "$api") || return 1
+    asset_json=$(jq -c --arg name "$asset" '.assets[]? | select(.name == $name) | {url:.browser_download_url,digest:(.digest // "")}' <<< "$release_json" | head -n 1)
+    [[ -n "$asset_json" && "$asset_json" != 'null' ]] || return 1
+    url=$(jq -r '.url' <<< "$asset_json")
+    digest=$(jq -r '.digest // ""' <<< "$asset_json")
+    [[ "$url" == "https://github.com/${GEO_REPO}/releases/download/"* ]] || return 1
+    [[ "$digest" == sha256:* ]] || return 1
+    expected="${digest#sha256:}"
+    [[ "$expected" =~ ^[A-Fa-f0-9]{64}$ ]] || return 1
+    curl -fLs --connect-timeout 10 -m 90 "$url" -o "$out" || return 1
+    actual=$(sha256sum "$out" | awk '{print $1}')
+    [[ "${actual,,}" == "${expected,,}" ]] || return 1
+    size=$(wc -c < "$out" 2>/dev/null | tr -d ' ')
+    [[ -n "$size" && "$size" -gt 500000 ]] || return 1
+    ! head -c 256 "$out" 2>/dev/null | grep -Eiq '<(html|!doctype)'
 }
 
 [[ -d '/usr/local/share/xray' ]] || exit 0
 
 tmpdir=$(mktemp -d /tmp/A-Box-geo.XXXXXX) || exit 1
 trap 'rm -rf "$tmpdir"' EXIT
-fetch_one "$GEOIP_URL" "$tmpdir/geoip.dat" || exit 1
-fetch_one "$GEOSITE_URL" "$tmpdir/geosite.dat" || exit 1
+fetch_one geoip.dat "$tmpdir/geoip.dat" || exit 1
+fetch_one geosite.dat "$tmpdir/geosite.dat" || exit 1
 
 install -m 644 "$tmpdir/geoip.dat" /usr/local/share/xray/geoip.dat
 install -m 644 "$tmpdir/geosite.dat" /usr/local/share/xray/geosite.dat
@@ -1337,12 +1540,7 @@ if command -v systemctl >/dev/null 2>&1; then systemctl restart xray 2>/dev/null
 # legacy geoip/geosite support; use rule-set based configs when route databases are needed.
 EOF_GEO
     chmod +x "$ABOX_DIR/geo_update.sh"
-    local tmp_cron
-    tmp_cron=$(mktemp)
-    crontab -l 2>/dev/null | grep -vE '^no crontab for|^#' | grep -v '/etc/ddr/geo_update.sh' > "$tmp_cron" || true
-    echo '0 3 * * 1 /bin/bash /etc/ddr/geo_update.sh >/dev/null 2>&1' >> "$tmp_cron"
-    crontab "$tmp_cron" 2>/dev/null || true
-    rm -f "$tmp_cron"
+    install_abox_cron_block GEO '0 3 * * 1 /bin/bash /etc/ddr/geo_update.sh >/dev/null 2>&1'
 }
 
 pre_install_setup() {
@@ -1784,8 +1982,9 @@ EOF_HY2
 
     if [[ "$INIT_SYS" == 'systemd' ]]; then
         cat > /etc/systemd/system/hysteria.service <<EOF_SVC
+# Managed by A-Box
 [Unit]
-Description=Hysteria 2 Service
+Description=A-Box Hysteria 2 Service
 After=network-online.target
 Wants=network-online.target
 
@@ -1806,7 +2005,8 @@ EOF_SVC
         echo 'rc_ulimit="-n 1048576"' > /etc/conf.d/hysteria
         cat > /etc/init.d/hysteria <<'EOF_SVC'
 #!/sbin/openrc-run
-description="Hysteria 2 Service"
+# Managed by A-Box
+description="A-Box Hysteria 2 Service"
 command="/usr/local/bin/hysteria"
 command_args="server -c /etc/hysteria/config.yaml >>/var/log/A-Box-hysteria.log 2>&1"
 command_background="yes"
@@ -1825,6 +2025,19 @@ EOF_SVC
     fi
 }
 
+xray_all_die_rollback() {
+    [[ "${ABOX_XRAY_ALL_DEPLOYING:-0}" == '1' ]] || return 0
+    ABOX_XRAY_ALL_DEPLOYING=0
+    ABOX_DIE_HOOK=''
+    msg "${YELLOW}[!] Xray ALL deployment failed; stopping services and rolling back latest auto backup.${NC}"
+    stop_all_managed_services >/dev/null 2>&1 || true
+    kill_managed_residual_pids >/dev/null 2>&1 || true
+    clean_nat_rules >/dev/null 2>&1 || true
+    clean_input_rules >/dev/null 2>&1 || true
+    save_firewall_rules >/dev/null 2>&1 || true
+    restore_latest_backup_silent "$ABOX_DIR/backups" || msg "${YELLOW}[!] Auto rollback could not restore a backup; use menu 7 if a backup is available.${NC}"
+}
+
 deploy_xray() {
     local MODE_IN=$1 KEYPAIR PK_LOCAL
     clear; msg "${BOLD}${GREEN}部署 Xray-core [$MODE_IN]${NC}"
@@ -1832,6 +2045,11 @@ deploy_xray() {
     source "$ABOX_ENV" 2>/dev/null || true
     light_preflight_check
     confirm_deployment_replacement xray "$MODE_IN"
+    if [[ "$MODE_IN" == *'ALL'* ]]; then
+        auto_backup_silent 'xray all deployment' "$ABOX_DIR/backups"
+        ABOX_XRAY_ALL_DEPLOYING=1
+        ABOX_DIE_HOOK='xray_all_die_rollback'
+    fi
     release_ports
     clean_nat_rules
     clean_input_rules
@@ -1875,8 +2093,9 @@ deploy_xray() {
 
     if [[ "$INIT_SYS" == 'systemd' ]]; then
         cat > /etc/systemd/system/xray.service <<'EOF_SVC'
+# Managed by A-Box
 [Unit]
-Description=Xray Service
+Description=A-Box Xray Service
 After=network-online.target nss-lookup.target
 Wants=network-online.target
 
@@ -1899,7 +2118,8 @@ EOF_SVC
         echo 'XRAY_LOCATION_ASSET="/usr/local/share/xray"' >> /etc/conf.d/xray
         cat > /etc/init.d/xray <<'EOF_SVC'
 #!/sbin/openrc-run
-description="Xray Service"
+# Managed by A-Box
+description="A-Box Xray Service"
 command="/usr/local/bin/xray"
 command_args="run -config /usr/local/etc/xray/config.json"
 command_background="yes"
@@ -1914,7 +2134,9 @@ EOF_SVC
     setup_health_monitor
 
     if [[ "$MODE_IN" == *'ALL'* ]]; then
-        deploy_official_hy2 SILENT
+        deploy_official_hy2 SILENT || die 'HY2 deployment failed during Xray ALL.'
+        ABOX_XRAY_ALL_DEPLOYING=0
+        ABOX_DIE_HOOK=''
     fi
     write_env xray "$MODE_IN"
     view_config deploy
@@ -2006,8 +2228,9 @@ ExecStopPost=-/bin/sh -c '$IPT6 -w -t nat -D PREROUTING -i $INGRESS_IF -p udp --
 
     if [[ "$INIT_SYS" == 'systemd' ]]; then
         cat > /etc/systemd/system/sing-box.service <<EOF_SVC
+# Managed by A-Box
 [Unit]
-Description=Sing-Box Service
+Description=A-Box Sing-Box Service
 After=network-online.target nss-lookup.target
 Wants=network-online.target
 
@@ -2030,7 +2253,8 @@ EOF_SVC
         echo 'rc_ulimit="-n 1048576"' > /etc/conf.d/sing-box
         cat > /etc/init.d/sing-box <<EOF_SVC
 #!/sbin/openrc-run
-description="Sing-Box Service"
+# Managed by A-Box
+description="A-Box Sing-Box Service"
 command="/usr/local/bin/sing-box"
 command_args="run -c /etc/sing-box/config.json"
 command_background="yes"
@@ -2093,27 +2317,15 @@ if (( $(echo "$USED_GB >= $TRAFFIC_LIMIT_GB" | bc -l) )); then
         rc-service sing-box stop 2>/dev/null || true
         rc-service hysteria stop 2>/dev/null || true
     fi
-    sleep 2
-    killall -TERM hysteria xray sing-box 2>/dev/null || true
-    sleep 2
-    killall -9 hysteria xray sing-box 2>/dev/null || true
 fi
 EOF_TRAFFIC
     chmod +x "$ABOX_DIR/traffic_monitor.sh"
-    local tmp_cron
-    tmp_cron=$(mktemp)
-    crontab -l 2>/dev/null | grep -vE '^no crontab for|^#' | grep -v '/etc/ddr/traffic_monitor.sh' > "$tmp_cron" || true
-    echo '* * * * * /bin/bash /etc/ddr/traffic_monitor.sh >/dev/null 2>&1' >> "$tmp_cron"
-    crontab "$tmp_cron" 2>/dev/null || true
-    rm -f "$tmp_cron"
+    install_abox_cron_block TRAFFIC '* * * * * /bin/bash /etc/ddr/traffic_monitor.sh >/dev/null 2>&1'
 }
 
 disable_traffic_monitor() {
-    local tmp_cron
-    tmp_cron=$(mktemp)
-    crontab -l 2>/dev/null | grep -vE '^no crontab for|^#' | grep -v '/etc/ddr/traffic_monitor.sh' > "$tmp_cron" || true
-    crontab "$tmp_cron" 2>/dev/null || true
-    rm -f "$tmp_cron" "$ABOX_DIR/traffic_monitor.sh"
+    remove_abox_cron_block TRAFFIC
+    rm -f "$ABOX_DIR/traffic_monitor.sh"
 }
 
 traffic_management_menu() {
@@ -2292,19 +2504,13 @@ do_cleanup() {
     clean_nat_rules
     clean_input_rules
     save_firewall_rules
-    killall -TERM xray sing-box hysteria 2>/dev/null || true
-    sleep 1
-    killall -9 xray sing-box hysteria 2>/dev/null || true
+    kill_managed_residual_pids
     rm -rf /usr/local/etc/xray /usr/local/share/xray /etc/sing-box /etc/hysteria /usr/local/bin/xray /usr/local/bin/sing-box /usr/local/bin/hysteria
     rm -f /etc/systemd/system/xray.service /etc/systemd/system/sing-box.service /etc/systemd/system/hysteria.service
     rm -f /etc/init.d/xray /etc/init.d/sing-box /etc/init.d/hysteria
     rm -f /etc/sysctl.d/99-A-Box-tune.conf /etc/security/limits.d/A-Box.conf
     sysctl --system >/dev/null 2>&1 || true
-    local tmp_cron
-    tmp_cron=$(mktemp)
-    crontab -l 2>/dev/null | grep -vE '^no crontab for|^#' | grep -vE '/etc/ddr/traffic_monitor.sh|/etc/ddr/geo_update.sh|/etc/ddr/socket_probe.sh' > "$tmp_cron" || true
-    crontab "$tmp_cron" 2>/dev/null || true
-    rm -f "$tmp_cron"
+    remove_all_abox_cron_blocks
     rm -f /var/log/A-Box-*.log /etc/fail2ban/jail.d/A-Box.local /etc/fail2ban/filter.d/A-Box.conf /etc/logrotate.d/A-Box 2>/dev/null || true
     if [[ "$INIT_SYS" == 'systemd' ]]; then
         systemctl restart fail2ban 2>/dev/null || true
@@ -2332,17 +2538,11 @@ check_virgin_state() {
     is_yes "$confirm_virgin" || { msg "${GREEN}操作已取消。${NC}"; pause_return; return; }
     auto_backup_prompt 'environment reset' "$ABOX_DIR/backups"
     stop_all_managed_services
-    killall -TERM xray sing-box hysteria 2>/dev/null || true
-    sleep 1
-    killall -9 xray sing-box hysteria 2>/dev/null || true
+    kill_managed_residual_pids
     clean_nat_rules
     clean_input_rules
     save_firewall_rules
-    local tmp_cron
-    tmp_cron=$(mktemp)
-    crontab -l 2>/dev/null | grep -vE '^no crontab for|^#' | grep -vE '/etc/ddr/traffic_monitor.sh|/etc/ddr/geo_update.sh|/etc/ddr/socket_probe.sh' > "$tmp_cron" || true
-    crontab "$tmp_cron" 2>/dev/null || true
-    rm -f "$tmp_cron"
+    remove_all_abox_cron_blocks
     rm -f "$ABOX_ENV" "$ABOX_DIR"/.deps* "$ABOX_DIR/traffic_monitor.sh" "$ABOX_DIR/geo_update.sh" "$ABOX_DIR/socket_probe.sh"
     rm -rf /usr/local/etc/xray /usr/local/share/xray /etc/sing-box /etc/hysteria /usr/local/bin/xray /usr/local/bin/sing-box /usr/local/bin/hysteria
     rm -f /etc/systemd/system/xray.service /etc/systemd/system/sing-box.service /etc/systemd/system/hysteria.service /etc/init.d/xray /etc/init.d/sing-box /etc/init.d/hysteria
@@ -2430,10 +2630,6 @@ confirm_remote_script_hash() {
             return 0
         fi
         die "Remote script SHA256 is not in ABOX_REMOTE_SHA256_ALLOWLIST: ${label}"
-    fi
-    if [[ "${ABOX_ALLOW_UNTRUSTED_REMOTE:-}" == '1' ]]; then
-        msg "${YELLOW}[!] ABOX_ALLOW_UNTRUSTED_REMOTE=1 set; executing without interactive strong confirmation.${NC}"
-        return 0
     fi
     if [[ "${ABOX_LANG:-zh}" == 'en' ]]; then
         msg "${YELLOW}[!] This is third-party code outside A-Box control. Syntax validation is not a trust guarantee.${NC}"
@@ -6965,19 +7161,20 @@ setup_swap_2g() {
     if [[ -f /swapfile ]]; then
         msg "${YELLOW}$(tr_msg swap_exists)${NC}"
     else
-        fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048 status=progress
-        chmod 600 /swapfile
-        mkswap /swapfile
+        if ! fallocate -l 2G /swapfile 2>/dev/null; then
+            dd if=/dev/zero of=/swapfile bs=1M count=2048 status=progress || die 'Swap 文件创建失败。'
+        fi
+        chmod 600 /swapfile || die 'Swap 文件权限设置失败。'
+        mkswap /swapfile >/dev/null || die 'mkswap 失败。'
     fi
-    swapon /swapfile 2>/dev/null || true
+    swapon /swapfile || die 'swapon 失败；不会写入 /etc/fstab。'
     if ! grep -qE '^/swapfile[[:space:]]+none[[:space:]]+swap[[:space:]]+sw[[:space:]]+0[[:space:]]+0' /etc/fstab 2>/dev/null; then
-        echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        echo '/swapfile none swap sw 0 0' >> /etc/fstab || die '/etc/fstab 写入失败。'
     fi
     swapon --show || true
     msg "${GREEN}$(tr_msg swap_done)${NC}"
     pause_return
 }
-
 
 redact_secrets_stream() {
     sed -E \
@@ -6999,6 +7196,36 @@ write_redacted_file() {
 
 collect_abox_cron() {
     crontab -l 2>/dev/null | grep -E '(/etc/ddr/|A-Box|geo_update|socket_probe)' || true
+}
+
+install_abox_cron_block() {
+    local name="$1" line="$2" tmp
+    [[ -n "$name" && -n "$line" ]] || return 1
+    tmp=$(mktemp) || die 'crontab 临时文件创建失败。'
+    crontab -l 2>/dev/null | sed "/^# A-Box ${name} BEGIN$/,/^# A-Box ${name} END$/d" > "$tmp" || true
+    {
+        echo "# A-Box ${name} BEGIN"
+        echo "$line"
+        echo "# A-Box ${name} END"
+    } >> "$tmp"
+    crontab "$tmp" 2>/dev/null || die 'crontab 写入失败。'
+    rm -f "$tmp"
+}
+
+remove_abox_cron_block() {
+    local name="$1" tmp
+    tmp=$(mktemp) || die 'crontab 临时文件创建失败。'
+    crontab -l 2>/dev/null | sed "/^# A-Box ${name} BEGIN$/,/^# A-Box ${name} END$/d" | grep -vE "/etc/ddr/(traffic_monitor|geo_update|socket_probe)\.sh" > "$tmp" || true
+    crontab "$tmp" 2>/dev/null || true
+    rm -f "$tmp"
+}
+
+remove_all_abox_cron_blocks() {
+    local tmp
+    tmp=$(mktemp) || die 'crontab 临时文件创建失败。'
+    crontab -l 2>/dev/null | sed '/^# A-Box .* BEGIN$/,/^# A-Box .* END$/d' | grep -vE "/etc/ddr/(traffic_monitor|geo_update|socket_probe)\.sh" > "$tmp" || true
+    crontab "$tmp" 2>/dev/null || true
+    rm -f "$tmp"
 }
 
 backup_current_config() {
@@ -7034,7 +7261,12 @@ backup_current_config() {
 
     backup_copy_abox_dir
     backup_copy_path /usr/local/bin/sb
+    backup_copy_path /usr/local/bin/xray
+    backup_copy_path /usr/local/bin/sing-box
+    backup_copy_path /usr/local/bin/hysteria
     backup_copy_path /usr/local/etc/xray
+    backup_copy_path /usr/local/share/xray
+    backup_copy_path "$ABOX_FW_STATE"
     backup_copy_path /etc/sing-box
     backup_copy_path /etc/hysteria
     backup_copy_path /etc/logrotate.d/A-Box
@@ -7049,7 +7281,7 @@ backup_current_config() {
 
     {
         echo "A-Box backup"
-        echo "Created: $(date -Is)"
+        echo "Created: $(now_iso)"
         echo "Host: $(hostname 2>/dev/null || true)"
         echo "Kernel: $(uname -a 2>/dev/null || true)"
         echo "Init: ${INIT_SYS:-unknown}"
@@ -7088,6 +7320,69 @@ auto_backup_silent() {
     backup_current_config "$dest"
 }
 
+restore_latest_backup_silent() {
+    local backup_dir="${1:-$ABOX_DIR/backups}" selected work root checksum tmp_cron
+    [[ -d "$backup_dir" ]] || return 1
+    selected=$(find "$backup_dir" -maxdepth 1 -type f -name 'A-Box-backup-*.tar.gz' | sort -r | head -n 1)
+    [[ -n "$selected" ]] || return 1
+    checksum="${selected}.sha256"
+    if [[ -f "$checksum" ]]; then
+        sha256sum -c "$checksum" >/dev/null 2>&1 || return 1
+    fi
+    work=$(mktemp -d /tmp/A-Box-rollback.XXXXXX) || return 1
+    tar -xzf "$selected" -C "$work" || { rm -rf "$work"; return 1; }
+    root="$work/root"
+
+    stop_all_managed_services >/dev/null 2>&1 || true
+    kill_managed_residual_pids >/dev/null 2>&1 || true
+    remove_native_firewall_rules >/dev/null 2>&1 || true
+
+    rm -rf /usr/local/etc/xray /usr/local/share/xray /etc/sing-box /etc/hysteria
+    rm -f /usr/local/bin/xray /usr/local/bin/sing-box /usr/local/bin/hysteria
+    rm -f /etc/systemd/system/xray.service /etc/systemd/system/sing-box.service /etc/systemd/system/hysteria.service
+    rm -f /etc/init.d/xray /etc/init.d/sing-box /etc/init.d/hysteria
+
+    restore_copy_path_silent() {
+        local path="$1"
+        [[ -e "$root$path" ]] || return 0
+        mkdir -p "$(dirname "$path")"
+        cp -a "$root$path" "$(dirname "$path")/" 2>/dev/null || true
+    }
+
+    restore_copy_path_silent "$ABOX_DIR"
+    restore_copy_path_silent /usr/local/bin/sb
+    restore_copy_path_silent /usr/local/bin/xray
+    restore_copy_path_silent /usr/local/bin/sing-box
+    restore_copy_path_silent /usr/local/bin/hysteria
+    restore_copy_path_silent /usr/local/etc/xray
+    restore_copy_path_silent /usr/local/share/xray
+    restore_copy_path_silent "$ABOX_FW_STATE"
+    restore_copy_path_silent /etc/sing-box
+    restore_copy_path_silent /etc/hysteria
+    restore_copy_path_silent /etc/logrotate.d/A-Box
+    restore_copy_path_silent /etc/fail2ban/filter.d/A-Box.conf
+    restore_copy_path_silent /etc/fail2ban/jail.d/A-Box.local
+    restore_copy_path_silent /etc/systemd/system/xray.service
+    restore_copy_path_silent /etc/systemd/system/sing-box.service
+    restore_copy_path_silent /etc/systemd/system/hysteria.service
+    restore_copy_path_silent /etc/init.d/xray
+    restore_copy_path_silent /etc/init.d/sing-box
+    restore_copy_path_silent /etc/init.d/hysteria
+
+    if [[ -f "$work/meta/cron.abox.txt" ]]; then
+        tmp_cron=$(mktemp) || { rm -rf "$work"; return 1; }
+        crontab -l 2>/dev/null | sed '/^# A-Box .* BEGIN$/,/^# A-Box .* END$/d' | grep -vE '/etc/ddr/(traffic_monitor|geo_update|socket_probe)\.sh' > "$tmp_cron" || true
+        cat "$work/meta/cron.abox.txt" >> "$tmp_cron"
+        crontab "$tmp_cron" 2>/dev/null || true
+        rm -f "$tmp_cron"
+    fi
+
+    apply_native_firewall_rules_from_state >/dev/null 2>&1 || true
+    [[ "${INIT_SYS:-}" == 'systemd' ]] && systemctl daemon-reload 2>/dev/null || true
+    rm -rf "$work"
+    msg "${GREEN}[*] Rollback restored latest backup:${NC} $selected"
+}
+
 restore_from_backup() {
     local backup_dir backups i choice selected work root checksum answer
     backup_dir="$ABOX_DIR/backups"
@@ -7119,6 +7414,12 @@ restore_from_backup() {
 
     backup_current_config
     stop_all_managed_services
+    kill_managed_residual_pids >/dev/null 2>&1 || true
+    remove_native_firewall_rules >/dev/null 2>&1 || true
+    rm -rf /usr/local/etc/xray /usr/local/share/xray /etc/sing-box /etc/hysteria
+    rm -f /usr/local/bin/xray /usr/local/bin/sing-box /usr/local/bin/hysteria
+    rm -f /etc/systemd/system/xray.service /etc/systemd/system/sing-box.service /etc/systemd/system/hysteria.service
+    rm -f /etc/init.d/xray /etc/init.d/sing-box /etc/init.d/hysteria
     work=$(mktemp -d /tmp/A-Box-restore.XXXXXX) || die 'Restore temp directory creation failed.'
     tar -xzf "$selected" -C "$work" || { rm -rf "$work"; die 'Backup extraction failed.'; }
     root="$work/root"
@@ -7132,7 +7433,12 @@ restore_from_backup() {
 
     restore_copy_path "$ABOX_DIR"
     restore_copy_path /usr/local/bin/sb
+    restore_copy_path /usr/local/bin/xray
+    restore_copy_path /usr/local/bin/sing-box
+    restore_copy_path /usr/local/bin/hysteria
     restore_copy_path /usr/local/etc/xray
+    restore_copy_path /usr/local/share/xray
+    restore_copy_path "$ABOX_FW_STATE"
     restore_copy_path /etc/sing-box
     restore_copy_path /etc/hysteria
     restore_copy_path /etc/logrotate.d/A-Box
@@ -7148,16 +7454,20 @@ restore_from_backup() {
     [[ -d "$ABOX_DIR" ]] && chmod 700 "$ABOX_DIR" 2>/dev/null || true
     [[ -f "$ABOX_ENV" ]] && chmod 600 "$ABOX_ENV" 2>/dev/null || true
     [[ -x /usr/local/bin/sb ]] && chmod 755 /usr/local/bin/sb 2>/dev/null || true
+    [[ -x /usr/local/bin/xray ]] && chmod 755 /usr/local/bin/xray 2>/dev/null || true
+    [[ -x /usr/local/bin/sing-box ]] && chmod 755 /usr/local/bin/sing-box 2>/dev/null || true
+    [[ -x /usr/local/bin/hysteria ]] && chmod 755 /usr/local/bin/hysteria 2>/dev/null || true
 
     if [[ -f "$work/meta/cron.abox.txt" ]]; then
         local tmp_cron
         tmp_cron=$(mktemp)
-        crontab -l 2>/dev/null | grep -vE '(/etc/ddr/|A-Box|geo_update|socket_probe)' > "$tmp_cron" || true
+        crontab -l 2>/dev/null | sed '/^# A-Box .* BEGIN$/,/^# A-Box .* END$/d' | grep -vE '/etc/ddr/(traffic_monitor|geo_update|socket_probe)\.sh' > "$tmp_cron" || true
         cat "$work/meta/cron.abox.txt" >> "$tmp_cron"
         crontab "$tmp_cron" 2>/dev/null || true
         rm -f "$tmp_cron"
     fi
 
+    apply_native_firewall_rules_from_state >/dev/null 2>&1 || true
     if [[ "${INIT_SYS:-}" == 'systemd' ]]; then
         systemctl daemon-reload 2>/dev/null || true
     fi
@@ -7200,7 +7510,7 @@ export_diagnostic_bundle() {
     msg "${YELLOW}[*] Collecting diagnostic information with secret redaction...${NC}"
     {
         echo "A-Box diagnostic bundle"
-        echo "Created: $(date -Is)"
+        echo "Created: $(now_iso)"
         echo "Host: $(hostname 2>/dev/null || true)"
         echo "Script: $0"
         echo "Script SHA256: $(sha256sum "$0" 2>/dev/null | awk '{print $1}')"
@@ -7283,7 +7593,7 @@ preflight_check() {
     pf_fail() { fail=$((fail+1)); printf '[FAIL] %s\n' "$*" | tee -a "$report"; }
 
     : > "$report"
-    echo "A-Box preflight check: $(date -Is)" | tee -a "$report"
+    echo "A-Box preflight check: $(now_iso)" | tee -a "$report"
     echo "----------------------------------------------------------------------" | tee -a "$report"
 
     [[ $EUID -eq 0 ]] && pf_pass 'root privilege available' || pf_fail 'not running as root'
@@ -8211,7 +8521,7 @@ run_self_tests() {
     [[ "$sni_count" =~ ^[0-9]+$ && "$sni_count" -ge 2500 ]] || { echo "FAIL: SNI library size < 2500 ($sni_count)"; failures=$((failures + 1)); }
     grep -qx 'www.confluent.io' "$tmp/sni-full.txt" || { echo 'FAIL: SNI library missing www.confluent.io'; failures=$((failures + 1)); }
     grep -qx 'www.apache.org' "$tmp/sni-full.txt" || { echo 'FAIL: SNI library missing www.apache.org'; failures=$((failures + 1)); }
-    if grep -Eiq '(^|\.)(google|gstatic|googleapis|youtube|facebook|instagram|twitter|tiktok|telegram|whatsapp|wikipedia|wikimedia|openai|anthropic|huggingface|torproject|apple|icloud|nist|cisa)\.' "$tmp/sni-full.txt"; then
+    if grep -Eiq '(^|\.)(google|gstatic|googleapis|googleusercontent|youtube|facebook|instagram|twitter|x|tiktok|telegram|whatsapp|wikipedia|wikimedia|openai|anthropic|huggingface|torproject|apple|icloud|nist|cisa|github)\.' "$tmp/sni-full.txt"; then
         echo 'FAIL: SNI library contains high-risk blocked/sanction-sensitive domains'
         failures=$((failures + 1))
     fi
