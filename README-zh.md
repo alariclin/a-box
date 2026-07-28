@@ -26,46 +26,31 @@ A-Box 是一个独立 Bash 脚本，用于部署和维护 Linux 网络网关服�
 
 ## 安全快速开始
 
-本仓库对应已审核构建 `2026-07-28-final-v8-rc2`（`ABOX_BUILD_EPOCH=2026072804`）。请使用不可变的本地文件或 Release 资产，不要把可变 `main` 分支直接管道给 root Shell。
+### 全球网络
 
 ```bash
-sha256sum -c install.sh.sha256
-sudo bash install.sh --self-test
-sudo bash install.sh --preflight
-sudo bash install.sh
+curl -fsSL https://raw.githubusercontent.com/alariclin/a-box/main/install.sh -o A-Box.sh && sudo bash A-Box.sh
 ```
 
-常用非交互命令：
+### 中国大陆镜像
 
 ```bash
-sudo bash install.sh --status
-sudo bash install.sh --start
-sudo bash install.sh --stop
-sudo bash install.sh --version
+curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/alariclin/a-box/main/install.sh -o A-Box.sh && sudo bash A-Box.sh
 ```
 
-备份使用 manifest v3、SHA-256 和主机 HMAC 认证。外部备份不再自动把恢复密钥放在归档旁边，必须显式导出到独立可信介质：
-
-```bash
-sudo bash install.sh --export-backup-key /secure/offline/A-Box-recovery.key
-sudo bash install.sh --convert-legacy-backup OLD.tar.gz /root/A-Box-backups
-```
-
-恢复密钥与备份归档必须存放在不同信任域；同时持有两者的人可以为修改后的归档重新生成有效认证。
+镜像为第三方加速服务；镜像不可用时请使用全球网络命令。安装完成后输入 `sb` 打开菜单。
 
 ## 主要功能
 
-| 模块 | 作用 |
+| 模块 | 功能 |
 |---|---|
-| 部署 | 安装依赖，部署 Xray-core、sing-box 或官方 Hysteria 2。 |
-| 协议 | VLESS Vision REALITY、VLESS XHTTP REALITY、Shadowsocks-2022、Hysteria 2。 |
-| 默认端口 | Vision `443/TCP`、XHTTP `8443/TCP`、HY2 `443/UDP`、SS-2022 `2053/TCP+UDP`。 |
-| SNI 雷达 | 内置 4096 个候选的 SNI 测试库，用于 REALITY/XHTTP 目标优选。 |
-| 导出 | URI、二维码、Clash/Mihomo YAML、sing-box outbound 模板、v2rayN/v2rayNG JSON。 |
-| 防火墙安全 | 不会自动关闭 UFW 或 firewalld；会记录 A-Box 新增的防火墙规则，用于清理和回滚。 |
-| 服务安全 | 避免全局 `killall`；停止托管服务前会检查 A-Box 服务归属。 |
-| 恢复能力 | 备份并恢复配置、服务文件、核心二进制、Xray Geo 数据、防火墙状态、cron 块和运行元数据。 |
-| 运维 | 支持预检查、诊断、流量限制、Fail2Ban、logrotate、健康探针、Geo 更新和受控 OTA。 |
+| 核心部署 | Xray-core、sing-box、官方 Hysteria 2 |
+| 协议 | VLESS Vision REALITY、VLESS XHTTP REALITY、Shadowsocks-2022、Hysteria 2 |
+| 节点导出 | URI、二维码、Clash/Mihomo YAML、sing-box outbound、v2rayN/v2rayNG JSON |
+| 网络工具 | SNI 测试、IP 质量、路由测试、WARP、VPS 优化 |
+| 运维 | 健康检查、流量限制、Fail2Ban、logrotate、Geo 更新、核心升级 |
+| 安全 | 托管服务归属检查、防火墙回滚、部署事务、受控 OTA |
+| 恢复 | 备份恢复、旧备份转换、脱敏诊断包 |
 
 ## 主菜单
 
@@ -93,101 +78,59 @@ sudo bash install.sh --convert-legacy-backup OLD.tar.gz /root/A-Box-backups
 | `20` | 语言设置 |
 | `0` | 退出 |
 
-## 工具箱
+### 工具箱
 
 | 编号 | 功能 |
 |---:|---|
-| `1` | 系统 benchmark |
+| `1` | 系统性能测试 |
 | `2` | IP 质量和路由测试 |
-| `3` | 本地全量 SNI 优选 |
-| `4` | 小机器本地 SNI 优选 |
+| `3` | 本地全量 SNI 测试 |
+| `4` | 低配置服务器 SNI 测试 |
 | `5` | Cloudflare WARP 管理 |
-| `6` | 2G Swap |
+| `6` | 创建 2 GB Swap |
 | `7` | 备份和恢复 |
 | `8` | 脱敏诊断包 |
 | `9` | 完整 dry-run 预检查 |
-| `10` | SNI 优选记录 |
+| `10` | 已保存的 SNI 结果 |
 
-## 推荐部署
+## 使用说明
 
-| 场景 | 推荐选项 |
+| 命令 | 功能 |
 |---|---|
-| 均衡生产使用 | 菜单 `5`：Xray + 官方 HY2 全家桶 |
-| 低内存 VPS | 菜单 `10`：sing-box 全家桶 |
-| 主 TCP 路径 | 菜单 `1`：Xray VLESS Vision REALITY |
-| 高吞吐 TCP 备用 | 菜单 `2`：Xray VLESS XHTTP REALITY |
-| 移动或不稳定网络 | 菜单 `4`：官方 Hysteria 2 |
-| 中转或落地节点 | 菜单 `3`：Xray Shadowsocks-2022 + 白名单 |
-
-## SNI 说明
-
-SNI 优选主要用于 Xray REALITY 和 XHTTP REALITY。
-
-请在 VPS 上运行 SNI 测试，不要在本地电脑运行。最佳目标取决于 VPS 到目标站的网络路径。
-
-优先选择 `tls13=1`、`san=1`、ALPN 正常、HTTP 响应正常，并且与 VPS 有合理 ASN 或拓扑关系的结果。
-
-内置 fallback REALITY SNI 是：
-
-```text
-www.microsoft.com
-```
-
-Apple/iCloud 域名不会作为内置默认值。非 443 端口使用 Apple/iCloud 类 SNI 时，脚本会给出警告。
-
-运行工具箱 `3` 或 `4` 后，可以用工具箱 `10` 查看保存的 SNI 记录。
-
-## 安全设计
-
-A-Box 面向生产稳定性设计：
-
-- 不会自动关闭 UFW 或 firewalld。
-- 原生防火墙启用时，只添加 A-Box 所需端口。
-- 记录 A-Box 新增的原生防火墙规则，用于清理和回滚。
-- 避免全局 `killall`。
-- 停止托管服务前会检查 A-Box 服务归属。
-- 危险操作前会备份重要文件。
-- 可恢复配置、服务文件、核心二进制、Xray Geo 数据、防火墙状态、cron 块和运行元数据。
-- 核心和 Geo 下载会校验 GitHub Release asset SHA256 digest。
-- 默认使用稳定 latest release，不使用 alpha 或 prerelease 版本。
-- 第三方工具脚本会显示 SHA256，并要求精确确认，除非哈希已显式加入 allowlist。
-- 从 `main` OTA 需要语法/指纹校验、SHA256 显示和 `[Y/N]` 确认。非交互 OTA 需要 `ABOX_OTA_SHA256_ALLOWLIST`。
+| `sb` | 安装后打开主菜单 |
+| `sudo bash A-Box.sh --self-test` | 运行内置检查 |
+| `sudo bash A-Box.sh --preflight` | 部署前检查服务器环境 |
+| `sudo bash A-Box.sh --status` | 查看配置和服务状态 |
+| `sudo bash A-Box.sh --start` | 启动托管服务 |
+| `sudo bash A-Box.sh --stop` | 停止托管服务 |
+| `sudo bash A-Box.sh --version` | 查看构建版本 |
 
 ## 系统要求
 
 | 项目 | 要求 |
 |---|---|
 | 系统 | Debian 10+、Ubuntu 20.04+、CentOS/RHEL/Rocky/AlmaLinux 8+、Alpine Linux |
-| Init | systemd 或 OpenRC |
-| CPU | amd64/x86_64、arm64/aarch64 |
+| 初始化系统 | systemd 或 OpenRC |
+| 架构 | amd64/x86_64、arm64/aarch64 |
 | 权限 | root 或 sudo |
 | 网络 | 可访问系统软件源和 GitHub Releases |
-| 依赖 | Bash、curl、jq、openssl、iptables、vnStat 等；缺失时自动安装 |
+| 依赖 | 缺少的必要软件包会自动安装 |
 
-## 常见问题
+## 最佳使用方式
 
-### 脚本提示没有交互式 TTY。
-请从交互式终端运行。如果管道模式失败，先下载脚本，再运行 `sudo bash install.sh`。
+| 场景 | 推荐选项 |
+|---|---|
+| 均衡部署 | 菜单 `5`：Xray + 官方 HY2 全家桶 |
+| 低内存 VPS | 菜单 `10`：sing-box 全家桶 |
+| 主 TCP 连接 | 菜单 `1`：Xray VLESS Vision REALITY |
+| 高吞吐 TCP 备用 | 菜单 `2`：Xray VLESS XHTTP REALITY |
+| 移动或不稳定网络 | 菜单 `4`：官方 Hysteria 2 |
+| 中转或落地节点 | 菜单 `3`：Xray Shadowsocks-2022 + 白名单 |
 
-### 部署因端口占用失败。
-请手动释放端口，或选择其他端口。A-Box 部署前会检查非 A-Box 进程。
-
-### 预检查会阻止重装已部署的 A-Box 协议栈吗？
-不会。轻量预检查不会因为 A-Box 托管服务已占用端口而失败。部署时仍会先停止 A-Box 托管服务，再写入新协议栈。
-
-### 备份包含什么？
-备份包含 A-Box 配置、服务文件、脚本、核心二进制、Xray Geo 数据、原生防火墙状态、A-Box cron 块、选定防火墙状态和运行元数据。
-
-### Hysteria 2 为什么要求填写上行和下行带宽？
-Hysteria 2 使用这些值进行带宽和拥塞控制。请按照 VPS 线路容量填写。
-
-### ACME 证书申请失败。
-HTTP-01 模式下，确认 `80/TCP` 可达且未被占用。Cloudflare DNS-01 模式下，确认 API token 对目标 zone 有 DNS 编辑权限。
-
-### 如何选择 SNI？
-运行工具箱 `3` 或 `4`，再查看工具箱 `10`。优先选择 TLS 1.3、SAN 命中、ALPN 正常、HTTP 响应正常，并与 VPS ASN/拓扑关系合理的候选。
+生产环境建议先运行 `--self-test` 和 `--preflight`，将备份恢复密钥独立保存，并优先使用带版本标签的 GitHub Release。
 
 ## 反馈与许可证
+
 - [GitHub Issues](https://github.com/alariclin/a-box/issues)
 - 欢迎提交 Pull Request。
-- 本项目基于 [Apache License 2.0](LICENSE) 发布。
+- 本项目使用 [Apache License 2.0](LICENSE)。
