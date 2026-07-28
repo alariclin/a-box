@@ -26,19 +26,19 @@ A-Box 是一个独立 Bash 脚本，用于部署和维护 Linux 网络网关服�
 
 ## 安全快速开始
 
-### 全球网络
+### 全球官方源
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/alariclin/a-box/main/install.sh -o A-Box.sh && sudo bash A-Box.sh
 ```
 
-### 中国大陆镜像
+### 访问困难网络备用镜像（第三方）
 
 ```bash
 curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/alariclin/a-box/main/install.sh -o A-Box.sh && sudo bash A-Box.sh
 ```
 
-镜像为第三方加速服务；镜像不可用时请使用全球网络命令。安装完成后输入 `sb` 打开菜单。
+仅在 GitHub 官方源无法访问或连接不稳定时使用该第三方镜像；正常情况下请优先使用全球官方源。安装完成后输入 `sb` 打开菜单。
 
 ## 主要功能
 

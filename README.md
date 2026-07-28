@@ -26,19 +26,19 @@ This project is provided "as is", without warranty. By downloading, copying, dep
 
 ## Safe Quick Start
 
-### Global network
+### Official global source
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/alariclin/a-box/main/install.sh -o A-Box.sh && sudo bash A-Box.sh
 ```
 
-### Mainland China mirror
+### Backup mirror for restricted or unreliable networks (third-party)
 
 ```bash
 curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/alariclin/a-box/main/install.sh -o A-Box.sh && sudo bash A-Box.sh
 ```
 
-The mirror is a third-party acceleration service. If it is unavailable, use the global command. After installation, run `sb` to open the menu.
+Use this third-party mirror only when the official GitHub source is unavailable or unreliable. Prefer the official global source whenever possible. After installation, run `sb` to open the menu.
 
 ## Main Features
 
