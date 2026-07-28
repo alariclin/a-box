@@ -26,49 +26,32 @@ This project is provided "as is", without warranty. By downloading, copying, dep
 
 ## Safe Quick Start
 
-Recommended method:
+This repository contains the reviewed build `2026-07-28-final-v8-rc2` (`ABOX_BUILD_EPOCH=2026072804`). Use the immutable local/release asset; do not pipe the mutable `main` branch directly into a root shell.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/alariclin/a-box/main/install.sh -o A-Box.sh
-sha256sum A-Box.sh
-sudo bash A-Box.sh --self-test
-sudo bash A-Box.sh
+sha256sum -c install.sh.sha256
+sudo bash install.sh --self-test
+sudo bash install.sh --preflight
+sudo bash install.sh
 ```
 
-Fast pipeline method:
+Useful non-interactive commands:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/alariclin/a-box/main/install.sh | sudo bash
+sudo bash install.sh --status
+sudo bash install.sh --start
+sudo bash install.sh --stop
+sudo bash install.sh --version
 ```
 
-Mirror fallback, only when GitHub raw is unreachable:
+Backups use manifest v3 plus SHA-256 and host HMAC authentication. The recovery key is **not** placed beside external archives. Export it explicitly to a separate trusted medium:
 
 ```bash
-curl -fsSL https://ghp.ci/https://raw.githubusercontent.com/alariclin/a-box/main/install.sh | sudo bash
+sudo bash install.sh --export-backup-key /secure/offline/A-Box-recovery.key
+sudo bash install.sh --convert-legacy-backup OLD.tar.gz /root/A-Box-backups
 ```
 
-After installation, open the menu with:
-
-```bash
-sb
-```
-
-Language selection:
-
-```bash
-sudo bash A-Box.sh --lang zh
-sudo bash A-Box.sh --lang en
-```
-
-Read-only checks:
-
-```bash
-sudo bash A-Box.sh --self-test
-sudo bash A-Box.sh --status
-sudo bash A-Box.sh --help
-sudo bash A-Box.sh --preflight
-sudo bash A-Box.sh --dry-run
-```
+Keep the recovery key in a different trust domain from the backup archive. Anyone holding both can authenticate modified archives.
 
 ## Main Features
 
@@ -184,7 +167,7 @@ A-Box is designed for production stability:
 ## FAQ
 
 ### The script says no interactive TTY is available.
-Run it from an interactive terminal. If pipeline mode fails, download the script first and run `sudo bash A-Box.sh`.
+Run it from an interactive terminal. If pipeline mode fails, download the script first and run `sudo bash install.sh`.
 
 ### Deployment failed because a port is occupied.
 Release the port manually or choose another port. A-Box checks for non-A-Box processes before deployment.
