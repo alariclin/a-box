@@ -10,7 +10,7 @@ Linux 网络网关一键工具箱。
 
 A-Box 是一个独立 Bash 脚本，用于部署和维护 Linux 网络网关服务。
 
-它支持 Xray-core、sing-box、官方 Hysteria 2、VLESS Vision REALITY、VLESS XHTTP REALITY、Shadowsocks-2022、Hysteria 2、节点导出、SNI 优选、备份恢复、防火墙处理、诊断、流量限制、健康检查和核心更新。
+它支持 Xray-core、sing-box、官方 Hysteria 2 服务端、VLESS Vision REALITY、VLESS XHTTP REALITY、Shadowsocks-2022、客户端配置导出、SNI 测试、备份恢复、防火墙管理、诊断、流量限制、健康检查和核心软件升级。
 
 > 仅限在合法、授权、合规的环境中使用。用户自行承担所有法律、运维和安全后果。
 
@@ -26,31 +26,31 @@ A-Box 是一个独立 Bash 脚本，用于部署和维护 Linux 网络网关服�
 
 ## 安全快速开始
 
-### 全球官方源
+### GitHub 官方源
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/alariclin/a-box/main/install.sh -o A-Box.sh && sudo bash A-Box.sh
 ```
 
-### 访问困难网络备用镜像（第三方）
+### GitHub 访问困难或不稳定时的备用镜像（第三方）
 
 ```bash
 curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/alariclin/a-box/main/install.sh -o A-Box.sh && sudo bash A-Box.sh
 ```
 
-仅在 GitHub 官方源无法访问或连接不稳定时使用该第三方镜像；正常情况下请优先使用全球官方源。安装完成后输入 `sb` 打开菜单。
+仅在 GitHub 官方源无法访问或连接不稳定时使用该第三方镜像；正常情况下请优先使用官方源。安装完成后输入 `sb` 打开菜单。
 
 ## 主要功能
 
 | 模块 | 功能 |
 |---|---|
-| 核心部署 | Xray-core、sing-box、官方 Hysteria 2 |
+| 服务部署 | Xray-core、sing-box、官方 Hysteria 2 服务端 |
 | 协议 | VLESS Vision REALITY、VLESS XHTTP REALITY、Shadowsocks-2022、Hysteria 2 |
-| 节点导出 | URI、二维码、Clash/Mihomo YAML、sing-box outbound、v2rayN/v2rayNG JSON |
-| 网络工具 | SNI 测试、IP 质量、路由测试、WARP、VPS 优化 |
-| 运维 | 健康检查、流量限制、Fail2Ban、logrotate、Geo 更新、核心升级 |
+| 配置导出 | URI、二维码、Clash/Mihomo YAML、sing-box 出站模板、v2rayN/v2rayNG JSON |
+| 网络工具 | SNI 测试、IP 质量和路由测试、WARP 管理、VPS 优化 |
+| 运维 | 健康检查、流量限制、Fail2Ban、logrotate、Geo 更新、核心软件升级 |
 | 安全 | 托管服务归属检查、防火墙回滚、部署事务、受控 OTA |
-| 恢复 | 备份恢复、旧备份转换、脱敏诊断包 |
+| 恢复 | 备份和恢复、旧备份转换、脱敏诊断包 |
 
 ## 主菜单
 
@@ -60,21 +60,21 @@ curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/alariclin/a-box
 | `2` | Xray VLESS XHTTP REALITY |
 | `3` | Xray Shadowsocks-2022 |
 | `4` | 官方 Hysteria 2 |
-| `5` | Xray + 官方 HY2 全家桶 |
+| `5` | Xray + 官方 Hysteria 2 组合 |
 | `6` | sing-box VLESS Vision REALITY |
 | `7` | sing-box Shadowsocks-2022 |
 | `8` | sing-box VLESS + Shadowsocks-2022 |
 | `9` | sing-box Hysteria 2 |
-| `10` | sing-box 全家桶 |
+| `10` | sing-box 组合 |
 | `11` | 工具箱 |
 | `12` | VPS 优化 |
-| `13` | 显示节点参数 |
+| `13` | 显示客户端配置 |
 | `14` | 使用说明 |
-| `15` | OTA、Geo 数据和核心升级 |
+| `15` | OTA、Geo 数据和核心软件升级 |
 | `16` | 完整卸载 |
-| `17` | 删除节点并重置环境 |
+| `17` | 删除配置并重置环境 |
 | `18` | 月流量限制 |
-| `19` | SS-2022 白名单管理 |
+| `19` | SS-2022 允许列表管理 |
 | `20` | 语言设置 |
 | `0` | 退出 |
 
@@ -84,13 +84,13 @@ curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/alariclin/a-box
 |---:|---|
 | `1` | 系统性能测试 |
 | `2` | IP 质量和路由测试 |
-| `3` | 本地全量 SNI 测试 |
+| `3` | 本地完整 SNI 测试 |
 | `4` | 低配置服务器 SNI 测试 |
 | `5` | Cloudflare WARP 管理 |
-| `6` | 创建 2 GB Swap |
+| `6` | 创建 2 GB Swap 文件 |
 | `7` | 备份和恢复 |
 | `8` | 脱敏诊断包 |
-| `9` | 完整 dry-run 预检查 |
+| `9` | 完整只读预检查（`dry-run`） |
 | `10` | 已保存的 SNI 结果 |
 
 ## 使用说明
@@ -111,23 +111,26 @@ curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/alariclin/a-box
 |---|---|
 | 系统 | Debian 10+、Ubuntu 20.04+、CentOS/RHEL/Rocky/AlmaLinux 8+、Alpine Linux |
 | 初始化系统 | systemd 或 OpenRC |
-| 架构 | amd64/x86_64、arm64/aarch64 |
+| CPU 架构 | amd64/x86_64、arm64/aarch64 |
 | 权限 | root 或 sudo |
 | 网络 | 可访问系统软件源和 GitHub Releases |
 | 依赖 | 缺少的必要软件包会自动安装 |
+| 脚本界面 | 简体中文或 English |
 
 ## 最佳使用方式
 
 | 场景 | 推荐选项 |
 |---|---|
-| 均衡部署 | 菜单 `5`：Xray + 官方 HY2 全家桶 |
-| 低内存 VPS | 菜单 `10`：sing-box 全家桶 |
+| 均衡部署 | 菜单 `5`：Xray + 官方 Hysteria 2 组合 |
+| 低内存 VPS | 菜单 `10`：sing-box 组合 |
 | 主 TCP 连接 | 菜单 `1`：Xray VLESS Vision REALITY |
 | 高吞吐 TCP 备用 | 菜单 `2`：Xray VLESS XHTTP REALITY |
 | 移动或不稳定网络 | 菜单 `4`：官方 Hysteria 2 |
-| 中转或落地节点 | 菜单 `3`：Xray Shadowsocks-2022 + 白名单 |
+| 中转或出口节点 | 菜单 `3`：Xray Shadowsocks-2022 + 允许列表 |
 
-生产环境建议先运行 `--self-test` 和 `--preflight`，将备份恢复密钥独立保存，并优先使用带版本标签的 GitHub Release。
+生产环境建议先运行 `--self-test` 和 `--preflight`，将备份恢复密钥独立保存，并优先使用带固定版本标签的 GitHub Release，而不是 `main` 等可变分支。
+
+文档提供 English、简体中文、俄语和波斯语版本；脚本交互界面仅提供简体中文和 English。
 
 ## 反馈与许可证
 
