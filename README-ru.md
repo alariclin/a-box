@@ -26,49 +26,32 @@ A-Box — автономный Bash-скрипт для развёртывани
 
 ## Безопасный быстрый старт
 
-Рекомендуемый способ:
+Этот репозиторий содержит проверенную сборку `2026-07-28-final-v8-rc2` (`ABOX_BUILD_EPOCH=2026072804`). Используйте неизменяемый локальный файл или asset Release; не передавайте изменяемую ветку `main` напрямую в root shell через pipeline.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/alariclin/a-box/main/install.sh -o A-Box.sh
-sha256sum A-Box.sh
-sudo bash A-Box.sh --self-test
-sudo bash A-Box.sh
+sha256sum -c install.sh.sha256
+sudo bash install.sh --self-test
+sudo bash install.sh --preflight
+sudo bash install.sh
 ```
 
-Быстрый запуск через конвейер:
+Команды управления:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/alariclin/a-box/main/install.sh | sudo bash
+sudo bash install.sh --status
+sudo bash install.sh --start
+sudo bash install.sh --stop
+sudo bash install.sh --version
 ```
 
-Резервное зеркало используйте только тогда, когда GitHub raw недоступен:
+Резервные копии используют manifest v3, SHA-256 и HMAC хоста. Ключ восстановления больше не сохраняется рядом с внешним архивом; экспортируйте его на отдельный доверенный носитель:
 
 ```bash
-curl -fsSL https://ghp.ci/https://raw.githubusercontent.com/alariclin/a-box/main/install.sh | sudo bash
+sudo bash install.sh --export-backup-key /secure/offline/A-Box-recovery.key
+sudo bash install.sh --convert-legacy-backup OLD.tar.gz /root/A-Box-backups
 ```
 
-После установки откройте меню командой:
-
-```bash
-sb
-```
-
-Выбор языка:
-
-```bash
-sudo bash A-Box.sh --lang zh
-sudo bash A-Box.sh --lang en
-```
-
-Проверки только для чтения:
-
-```bash
-sudo bash A-Box.sh --self-test
-sudo bash A-Box.sh --status
-sudo bash A-Box.sh --help
-sudo bash A-Box.sh --preflight
-sudo bash A-Box.sh --dry-run
-```
+Храните ключ восстановления отдельно от архива.
 
 ## Основные возможности
 
@@ -184,7 +167,7 @@ A-Box ориентирован на стабильную production-эксплу
 ## Частые вопросы
 
 ### Скрипт сообщает, что интерактивный TTY недоступен.
-Запустите его из интерактивного терминала. Если pipeline-режим не работает, сначала скачайте скрипт и выполните `sudo bash A-Box.sh`.
+Запустите его из интерактивного терминала. Если pipeline-режим не работает, сначала скачайте скрипт и выполните `sudo bash install.sh`.
 
 ### Развёртывание не удалось из-за занятого порта.
 Освободите порт вручную или выберите другой порт. A-Box проверяет процессы вне A-Box перед развёртыванием.

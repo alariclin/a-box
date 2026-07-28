@@ -26,49 +26,32 @@ A-Box 是一个独立 Bash 脚本，用于部署和维护 Linux 网络网关服�
 
 ## 安全快速开始
 
-推荐方式：
+本仓库对应已审核构建 `2026-07-28-final-v8-rc2`（`ABOX_BUILD_EPOCH=2026072804`）。请使用不可变的本地文件或 Release 资产，不要把可变 `main` 分支直接管道给 root Shell。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/alariclin/a-box/main/install.sh -o A-Box.sh
-sha256sum A-Box.sh
-sudo bash A-Box.sh --self-test
-sudo bash A-Box.sh
+sha256sum -c install.sh.sha256
+sudo bash install.sh --self-test
+sudo bash install.sh --preflight
+sudo bash install.sh
 ```
 
-快速管道方式：
+常用非交互命令：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/alariclin/a-box/main/install.sh | sudo bash
+sudo bash install.sh --status
+sudo bash install.sh --start
+sudo bash install.sh --stop
+sudo bash install.sh --version
 ```
 
-当 GitHub raw 不可达时，才使用镜像备用通道：
+备份使用 manifest v3、SHA-256 和主机 HMAC 认证。外部备份不再自动把恢复密钥放在归档旁边，必须显式导出到独立可信介质：
 
 ```bash
-curl -fsSL https://ghp.ci/https://raw.githubusercontent.com/alariclin/a-box/main/install.sh | sudo bash
+sudo bash install.sh --export-backup-key /secure/offline/A-Box-recovery.key
+sudo bash install.sh --convert-legacy-backup OLD.tar.gz /root/A-Box-backups
 ```
 
-安装后用下面命令打开菜单：
-
-```bash
-sb
-```
-
-语言选择：
-
-```bash
-sudo bash A-Box.sh --lang zh
-sudo bash A-Box.sh --lang en
-```
-
-只读检查：
-
-```bash
-sudo bash A-Box.sh --self-test
-sudo bash A-Box.sh --status
-sudo bash A-Box.sh --help
-sudo bash A-Box.sh --preflight
-sudo bash A-Box.sh --dry-run
-```
+恢复密钥与备份归档必须存放在不同信任域；同时持有两者的人可以为修改后的归档重新生成有效认证。
 
 ## 主要功能
 
@@ -184,7 +167,7 @@ A-Box 面向生产稳定性设计：
 ## 常见问题
 
 ### 脚本提示没有交互式 TTY。
-请从交互式终端运行。如果管道模式失败，先下载脚本，再运行 `sudo bash A-Box.sh`。
+请从交互式终端运行。如果管道模式失败，先下载脚本，再运行 `sudo bash install.sh`。
 
 ### 部署因端口占用失败。
 请手动释放端口，或选择其他端口。A-Box 部署前会检查非 A-Box 进程。

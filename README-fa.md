@@ -26,49 +26,32 @@ A-Box یک اسکریپت مستقل Bash برای استقرار و نگه‌د
 
 ## شروع سریع ایمن
 
-روش پیشنهادی:
+این مخزن شامل ساخت بررسی‌شدهٔ `2026-07-28-final-v8-rc2` با `ABOX_BUILD_EPOCH=2026072804` است. از فایل محلی یا دارایی تغییرناپذیر Release استفاده کنید و شاخهٔ متغیر `main` را مستقیماً به پوستهٔ root پایپ نکنید.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/alariclin/a-box/main/install.sh -o A-Box.sh
-sha256sum A-Box.sh
-sudo bash A-Box.sh --self-test
-sudo bash A-Box.sh
+sha256sum -c install.sh.sha256
+sudo bash install.sh --self-test
+sudo bash install.sh --preflight
+sudo bash install.sh
 ```
 
-روش سریع با pipeline:
+فرمان‌های مدیریتی:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/alariclin/a-box/main/install.sh | sudo bash
+sudo bash install.sh --status
+sudo bash install.sh --start
+sudo bash install.sh --stop
+sudo bash install.sh --version
 ```
 
-مسیر آینه را فقط زمانی استفاده کنید که GitHub raw در دسترس نیست:
+پشتیبان‌ها از manifest v3، SHA-256 و HMAC میزبان استفاده می‌کنند. کلید بازیابی دیگر کنار آرشیو خارجی ذخیره نمی‌شود؛ آن را صریحاً روی رسانه‌ای جدا و مورداعتماد صادر کنید:
 
 ```bash
-curl -fsSL https://ghp.ci/https://raw.githubusercontent.com/alariclin/a-box/main/install.sh | sudo bash
+sudo bash install.sh --export-backup-key /secure/offline/A-Box-recovery.key
+sudo bash install.sh --convert-legacy-backup OLD.tar.gz /root/A-Box-backups
 ```
 
-پس از نصب، منو را با این دستور باز کنید:
-
-```bash
-sb
-```
-
-انتخاب زبان:
-
-```bash
-sudo bash A-Box.sh --lang zh
-sudo bash A-Box.sh --lang en
-```
-
-بررسی‌های فقط‌خواندنی:
-
-```bash
-sudo bash A-Box.sh --self-test
-sudo bash A-Box.sh --status
-sudo bash A-Box.sh --help
-sudo bash A-Box.sh --preflight
-sudo bash A-Box.sh --dry-run
-```
+کلید بازیابی را جدا از آرشیو نگه دارید.
 
 ## قابلیت‌های اصلی
 
@@ -184,7 +167,7 @@ A-Box برای پایداری تولیدی طراحی شده است:
 ## پرسش‌های متداول
 
 ### اسکریپت می‌گوید TTY تعاملی در دسترس نیست.
-آن را از یک ترمینال تعاملی اجرا کنید. اگر حالت pipeline شکست خورد، ابتدا فایل را دانلود کنید و سپس `sudo bash A-Box.sh` را اجرا کنید.
+آن را از یک ترمینال تعاملی اجرا کنید. اگر حالت pipeline شکست خورد، ابتدا فایل را دانلود کنید و سپس `sudo bash install.sh` را اجرا کنید.
 
 ### استقرار به دلیل اشغال بودن پورت شکست خورد.
 پورت را دستی آزاد کنید یا پورت دیگری انتخاب کنید. A-Box پیش از استقرار، فرایندهای غیر A-Box را بررسی می‌کند.
