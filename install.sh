@@ -13,7 +13,7 @@ export LANG=${LANG:-en_US.UTF-8}
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
+BLUE='\033[0;36m'
 CYAN='\033[0;36m'
 MAGENTA='\033[0;35m'
 NC='\033[0m'
@@ -33,8 +33,8 @@ PUBLIC_IP_CACHE_TTL=600
 BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-10}
 LOCK_FALLBACK_DIR='/run/A-Box.lock.d'
 ABOX_LANG='zh'
-ABOX_BUILD='2026-07-28-final-v8-rc2'
-ABOX_BUILD_EPOCH=2026072804
+ABOX_BUILD='2026-07-29-final-v8-rc4'
+ABOX_BUILD_EPOCH=2026072902
 ABOX_DESIRED_STATE='/etc/ddr/.desired_state'
 ABOX_TRAFFIC_BLOCK_STATE='/etc/ddr/.traffic-block-state'
 PUBLIC_IP_CONNECT_TIMEOUT=${PUBLIC_IP_CONNECT_TIMEOUT:-3}
@@ -11104,6 +11104,14 @@ open_runtime_flock_fd() {
         gid=$(stat -c %g "$LOCK_FILE" 2>/dev/null) || return 1
         mode=$(stat -c %a "$LOCK_FILE" 2>/dev/null) || return 1
         [[ "$uid" == 0 && "$gid" == 0 && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+        # Upgrade compatibility: older A-Box builds created the root-owned
+        # regular lock file with the caller's default umask (commonly 0644).
+        # Tightening that exact safe legacy case does not replace the inode or
+        # bypass flock; an active older process is still detected below.
+        if (( (8#$mode & 8#077) != 0 )); then
+            chmod 600 "$LOCK_FILE" || return 1
+            mode=$(stat -c %a "$LOCK_FILE" 2>/dev/null) || return 1
+        fi
         (( (8#$mode & 8#077) == 0 )) || return 1
     else
         ( umask 077; set -o noclobber; : > "$LOCK_FILE" ) 2>/dev/null || return 1
