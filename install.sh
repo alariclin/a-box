@@ -11543,7 +11543,7 @@ main_loop() {
         load_abox_env "$ABOX_ENV" 2>/dev/null && CUR_MODE="[${CORE}-${MODE}]" || CUR_MODE=''
         clear
         msg "${BLUE}======================================================================${NC}"
-        msg "${BOLD}${YELLOW}=================================A-Box===============================${NC}"
+        msg "${BOLD}${YELLOW}==================================A-Box===============================${NC}"
         msg "${BLUE}======================================================================${NC}"
         if [[ "${ABOX_LANG:-zh}" == 'en' ]]; then
             msg "Gateway: ${YELLOW}$GLOBAL_PUBLIC_IP${NC} | Core: $STATUS_STR $CUR_MODE"
