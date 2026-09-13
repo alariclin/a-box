@@ -2432,7 +2432,13 @@ verify_github_asset_digest() {
 
 valid_github_download_url() {
     local repo="$1" url="$2"
-    [[ "$url" == "https://github.com/${repo}/releases/download/"* ]]
+    local repo_lower="${repo,,}" url_lower="${url,,}"
+    if [[ "$repo_lower" == 'apernet/hysteria' ]]; then
+        [[ "$url_lower" == "https://github.com/apernet/hysteria/releases/download/"* || \
+           "$url_lower" == "https://github.com/hynetwork/hysteria/releases/download/"* ]]
+    else
+        [[ "$url_lower" == "https://github.com/${repo_lower}/releases/download/"* ]]
+    fi
 }
 
 fetch_github_release() {
