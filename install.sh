@@ -514,6 +514,11 @@ PY
     return 1
 }
 
+valid_interface_name() {
+    local iface="${1:-}"
+    [[ "$iface" =~ ^[a-zA-Z0-9_.:-]+$ && ${#iface} -le 16 ]]
+}
+
 shell_quote() { printf '%q' "${1:-}"; }
 json_escape() { jq -Rn --arg v "${1:-}" '$v'; }
 
@@ -2245,6 +2250,22 @@ validate_abox_script_file() {
     grep -q '^main "\$@"' "$f" || die "${context} 入口指纹不匹配。"
 }
 
+validate_ota_version_direction() {
+    local target="$1" target_epoch
+    [[ -s "$target" ]] || die 'OTA 目标版本文件不存在或为空。'
+    target_epoch=$(sed -nE 's/^ABOX_BUILD_EPOCH=([0-9]+).*/\1/p' "$target" | head -n 1)
+    if [[ -n "$target_epoch" && "$target_epoch" =~ ^[0-9]+$ ]]; then
+        if (( target_epoch < ABOX_BUILD_EPOCH )) && [[ "${ABOX_ALLOW_DOWNGRADE:-0}" != 1 ]]; then
+            die "检测到版本倒退风险：目标构建版本 (${target_epoch}) 低于当前运行版本 (${ABOX_BUILD_EPOCH})。如需强行降级请设置 ABOX_ALLOW_DOWNGRADE=1。"
+        fi
+    fi
+}
+
+confirm_ota_script_hash() {
+    local sha="$1" url="$2"
+    confirm_remote_script_hash 'A-Box 脚本 OTA 升级' "$url" "$sha"
+}
+
 resolve_abox_main_commit_url() {
     local api='https://api.github.com/repos/alariclin/a-box/commits/main' json sha
     json=$(github_api_get "$api") || return 1
@@ -2435,7 +2456,8 @@ valid_github_download_url() {
     local repo_lower="${repo,,}" url_lower="${url,,}"
     if [[ "$repo_lower" == 'apernet/hysteria' ]]; then
         [[ "$url_lower" == "https://github.com/apernet/hysteria/releases/download/"* || \
-           "$url_lower" == "https://github.com/hynetwork/hysteria/releases/download/"* ]]
+           "$url_lower" == "https://github.com/hynetwork/hysteria/releases/download/"* || \
+           "$url_lower" == "https://github.com/hynetworks/hysteria/releases/download/"* ]]
     else
         [[ "$url_lower" == "https://github.com/${repo_lower}/releases/download/"* ]]
     fi
@@ -2478,7 +2500,11 @@ fetch_github_release() {
                 msg "${GREEN}   核心资产提取成功。${NC}"
                 return 0
             fi
-            if [[ -z "$mirror" ]]; then rm -f "$tmp_file"; die 'GitHub 官方通道返回的资产校验失败。'; fi
+           if [[ -z "$mirror" ]]; then
+                rm -f "$tmp_file"
+                msg "${YELLOW}[!] GitHub 官方直连通道校验未通过，正在自动回退尝试备用加速镜像...${NC}"
+                continue
+            fi
             msg "${YELLOW}[!] 第三方镜像资产校验失败，继续尝试下一通道。${NC}"
         fi
         rm -f "$tmp_file"
@@ -3279,7 +3305,7 @@ build_singbox_config() {
         def hy2:
           {type:"hysteria2", listen:$listen_addr, listen_port:$hy2port, up_mbps:$hy2up, down_mbps:$hy2down,
             obfs:{type:"salamander", password:$hy2obfs}, users:[{password:$hy2pass}],
-            tls:{enabled:true, server_name:$cert_cn, certificate_path:"/etc/sing-box/hy2.crt", key_path:"/etc/sing-box/hy2.key"}, masquerade:$masq};
+            tls:{enabled:true, server_name:$cert_cn, alpn:["h3"], certificate_path:"/etc/sing-box/hy2.crt", key_path:"/etc/sing-box/hy2.key"}, masquerade:$masq};
         def ss:
           ({type:"shadowsocks", listen:$listen_addr, listen_port:$ssport, tcp_fast_open:true,
             method:"2022-blake3-aes-128-gcm", password:$ss_pass} + $ka);
@@ -9142,32 +9168,24 @@ capture_managed_service_state() {
     done
 }
 
-restore_managed_service_state() {
-    local state="$1" srv active enabled failed=0
-    [[ -r "$state" ]] || return 0
-    local -A seen_services=()
-    while IFS='|' read -r srv active enabled; do
-        [[ "$srv" =~ ^(xray|sing-box|hysteria)$ && "$active" =~ ^[01]$ && "$enabled" =~ ^[01]$ ]] || { failed=1; continue; }
-        [[ -z "${seen_services[$srv]:-}" ]] || { failed=1; continue; }
-        seen_services[$srv]=1
-        service_file_is_abox_managed "$srv" || { failed=1; continue; }
-        if [[ "${INIT_SYS:-}" == systemd ]]; then
-            if [[ "$enabled" == 1 ]]; then systemctl enable "$srv" >/dev/null 2>&1 || failed=1; else systemctl disable "$srv" >/dev/null 2>&1 || failed=1; fi
-        else
-            if [[ "$enabled" == 1 ]]; then rc-update add "$srv" default >/dev/null 2>&1 || failed=1; else rc-update del "$srv" default >/dev/null 2>&1 || failed=1; fi
-        fi
-        if [[ "$active" == 1 ]]; then
-            restart_service_soft "$srv" >/dev/null 2>&1 || failed=1
-        elif [[ "${INIT_SYS:-}" == systemd ]]; then
-            systemctl stop "$srv" >/dev/null 2>&1 || { systemctl is-active --quiet "$srv" && failed=1; }
-            systemctl is-active --quiet "$srv" && failed=1
-        else
-            rc-service "$srv" stop >/dev/null 2>&1 || { rc-service "$srv" status >/dev/null 2>&1 && failed=1; }
-            rc-service "$srv" status >/dev/null 2>&1 && failed=1
-        fi
-    done < "$state"
-    (( failed == 0 ))
+restart_service_soft() {
+    local srv="$1"
+    abox_owns_service "$srv" || return 1
+    if [[ "${INIT_SYS:-}" == 'systemd' ]]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl restart "$srv" >/dev/null 2>&1 || return 1
+        sleep 2
+        systemctl is-active --quiet "$srv" || return 1
+        record_core_family_ownership "$srv"
+    else
+        rc-service "$srv" restart >/dev/null 2>&1 || return 1
+        sleep 2
+        rc-service "$srv" status >/dev/null 2>&1 || return 1
+        record_core_family_ownership "$srv"
+    fi
 }
+
+restore_managed_service_state() {
 
 extract_abox_iptables_rules() {
     local snapshot="$1" mode="${2:-all}"
