@@ -33,8 +33,8 @@ PUBLIC_IP_CACHE_TTL=600
 BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-10}
 LOCK_FALLBACK_DIR='/run/A-Box.lock.d'
 ABOX_LANG='zh'
-ABOX_BUILD='2026-07-29-final-v8-rc4'
-ABOX_BUILD_EPOCH=2026072902
+ABOX_BUILD='2026-09-14-final-v9'
+ABOX_BUILD_EPOCH=2026091401
 ABOX_DESIRED_STATE='/etc/ddr/.desired_state'
 ABOX_TRAFFIC_BLOCK_STATE='/etc/ddr/.traffic-block-state'
 PUBLIC_IP_CONNECT_TIMEOUT=${PUBLIC_IP_CONNECT_TIMEOUT:-3}
@@ -2250,21 +2250,6 @@ validate_abox_script_file() {
     grep -q '^main "\$@"' "$f" || die "${context} 入口指纹不匹配。"
 }
 
-validate_ota_version_direction() {
-    local target="$1" target_epoch
-    [[ -s "$target" ]] || die 'OTA 目标版本文件不存在或为空。'
-    target_epoch=$(sed -nE 's/^ABOX_BUILD_EPOCH=([0-9]+).*/\1/p' "$target" | head -n 1)
-    if [[ -n "$target_epoch" && "$target_epoch" =~ ^[0-9]+$ ]]; then
-        if (( target_epoch < ABOX_BUILD_EPOCH )) && [[ "${ABOX_ALLOW_DOWNGRADE:-0}" != 1 ]]; then
-            die "检测到版本倒退风险：目标构建版本 (${target_epoch}) 低于当前运行版本 (${ABOX_BUILD_EPOCH})。如需强行降级请设置 ABOX_ALLOW_DOWNGRADE=1。"
-        fi
-    fi
-}
-
-confirm_ota_script_hash() {
-    local sha="$1" url="$2"
-    confirm_remote_script_hash 'A-Box 脚本 OTA 升级' "$url" "$sha"
-}
 
 resolve_abox_main_commit_url() {
     local api='https://api.github.com/repos/alariclin/a-box/commits/main' json sha
@@ -2454,10 +2439,10 @@ verify_github_asset_digest() {
 valid_github_download_url() {
     local repo="$1" url="$2"
     local repo_lower="${repo,,}" url_lower="${url,,}"
-    if [[ "$repo_lower" == 'apernet/hysteria' ]]; then
-        [[ "$url_lower" == "https://github.com/apernet/hysteria/releases/download/"* || \
-           "$url_lower" == "https://github.com/hynetwork/hysteria/releases/download/"* || \
-           "$url_lower" == "https://github.com/hynetworks/hysteria/releases/download/"* ]]
+    if [[ "$repo_lower" == 'hynetworks/hysteria' || "$repo_lower" == 'apernet/hysteria' ]]; then
+        [[ "$url_lower" == "https://github.com/hynetworks/hysteria/releases/download/"* || \
+           "$url_lower" == "https://github.com/apernet/hysteria/releases/download/"* || \
+           "$url_lower" == "https://github.com/hynetwork/hysteria/releases/download/"* ]]
     else
         [[ "$url_lower" == "https://github.com/${repo_lower}/releases/download/"* ]]
     fi
@@ -2469,7 +2454,7 @@ fetch_github_release() {
     case "${repo}:${output_file}" in
         XTLS/Xray-core:xray_core.zip) asset_re="^Xray-linux-${XRAY_ARCH//+/\\+}\\.zip$" ;;
         SagerNet/sing-box:singbox_core.tar.gz) asset_re="^sing-box-.*-linux-${SB_ARCH}\\.tar\\.gz$" ;;
-        apernet/hysteria:hysteria_core) asset_re="^hysteria-linux-${HY2_ARCH}$" ;;
+        HyNetworks/hysteria:hysteria_core) asset_re="^hysteria-linux-${HY2_ARCH}$" ;;
         *) die "未定义的资产匹配规则: ${repo}:${output_file}" ;;
     esac
     msg "${YELLOW} -> 正在从 GitHub 抓取最新架构版本 [${repo}]...${NC}"
@@ -3251,14 +3236,14 @@ build_xray_config() {
           {
             listen:$listen_addr, port:$vport, protocol:"vless",
             settings:{clients:[{id:$uuid, flow:"xtls-rprx-vision"}], decryption:"none"},
-            streamSettings:({network:"tcp", security:"reality", realitySettings:{target:($v_sni + ":443"), serverNames:[$v_sni], privateKey:$pk, shortIds:[$sid]}} + maybe_sock),
+            streamSettings:({network:"tcp", security:"reality", realitySettings:{target:($v_sni + ":443"), serverNames:[$v_sni], privateKey:$pk, shortIds:[$sid], minClientVer:"1.8.2"}} + maybe_sock),
             sniffing:{enabled:true, destOverride:["http","tls","quic"]}
           };
         def xhttp:
           {
             listen:$listen_addr, port:$xport, protocol:"vless",
             settings:{clients:[{id:$uuid}], decryption:"none"},
-            streamSettings:({network:"xhttp", security:"reality", xhttpSettings:{mode:"auto", path:"/xhttp"}, realitySettings:{target:($x_sni + ":443"), serverNames:[$x_sni], privateKey:$pk, shortIds:[$sid]}} + maybe_sock),
+            streamSettings:({network:"xhttp", security:"reality", xhttpSettings:{mode:"auto", path:"/xhttp"}, realitySettings:{target:($x_sni + ":443"), serverNames:[$x_sni], privateKey:$pk, shortIds:[$sid], minClientVer:"1.8.2"}} + maybe_sock),
             sniffing:{enabled:true, destOverride:["http","tls","quic"]}
           };
         def ss:
@@ -3413,7 +3398,7 @@ deploy_official_hy2() {
 
     hy2_tmp=$(mktemp -d /tmp/A-Box-hysteria.XXXXXX) || die 'Hysteria 临时目录创建失败。'
     hy2_bin="$hy2_tmp/hysteria_core"
-    fetch_github_release apernet/hysteria hysteria_core "$hy2_bin"
+    fetch_github_release HyNetworks/hysteria hysteria_core "$hy2_bin"
     chmod 755 "$hy2_bin" || die 'Hysteria staged binary chmod failed.'
     "$hy2_bin" version >/dev/null 2>&1 || die 'Hysteria staged binary execution check failed.'
     install_binary_atomically "$hy2_bin" /usr/local/bin/hysteria || die 'Hysteria binary atomic install failed.'
@@ -9168,24 +9153,60 @@ capture_managed_service_state() {
     done
 }
 
-restart_service_soft() {
-    local srv="$1"
-    abox_owns_service "$srv" || return 1
-    if [[ "${INIT_SYS:-}" == 'systemd' ]]; then
-        systemctl daemon-reload >/dev/null 2>&1 || true
-        systemctl restart "$srv" >/dev/null 2>&1 || return 1
-        sleep 2
-        systemctl is-active --quiet "$srv" || return 1
-        record_core_family_ownership "$srv"
-    else
-        rc-service "$srv" restart >/dev/null 2>&1 || return 1
-        sleep 2
-        rc-service "$srv" status >/dev/null 2>&1 || return 1
-        record_core_family_ownership "$srv"
-    fi
-}
 
 restore_managed_service_state() {
+    local state_file="${1:-}" line srv active enabled seen="|"
+    [[ -r "$state_file" && -f "$state_file" && ! -L "$state_file" ]] || return 1
+    [[ "$(stat -c %u:%g "$state_file" 2>/dev/null || true)" == 0:0 ]] || return 1
+    local mode
+    mode=$(stat -c %a "$state_file" 2>/dev/null) || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 8#077) == 0 )) || return 1
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" ]] && continue
+        IFS='|' read -r srv active enabled extra <<< "$line"
+        [[ -z "${extra:-}" ]] || return 1
+        case "$srv" in
+            xray|sing-box|hysteria) ;;
+            *) return 1 ;;
+        esac
+        [[ "$active" =~ ^[01]$ && "$enabled" =~ ^[01]$ ]] || return 1
+        case "$seen" in *"|$srv|"*) return 1 ;; esac
+        seen+="$srv|"
+        abox_owns_service "$srv" || return 1
+
+        if [[ "${INIT_SYS:-}" == systemd ]]; then
+            systemctl daemon-reload >/dev/null 2>&1 || return 1
+            if [[ "$enabled" == 1 ]]; then
+                systemctl enable "$srv" >/dev/null 2>&1 || return 1
+            else
+                systemctl disable "$srv" >/dev/null 2>&1 || return 1
+            fi
+            if [[ "$active" == 1 ]]; then
+                systemctl start "$srv" >/dev/null 2>&1 || systemctl restart "$srv" >/dev/null 2>&1 || return 1
+                systemctl is-active --quiet "$srv" || return 1
+            else
+                systemctl stop "$srv" >/dev/null 2>&1 || true
+                systemctl is-active --quiet "$srv" && return 1
+            fi
+        elif [[ "${INIT_SYS:-}" == openrc ]]; then
+            if [[ "$enabled" == 1 ]]; then
+                rc-update add "$srv" default >/dev/null 2>&1 || return 1
+            else
+                rc-update del "$srv" default >/dev/null 2>&1 || true
+            fi
+            if [[ "$active" == 1 ]]; then
+                rc-service "$srv" start >/dev/null 2>&1 || rc-service "$srv" restart >/dev/null 2>&1 || return 1
+                rc-service "$srv" status >/dev/null 2>&1 || return 1
+            else
+                rc-service "$srv" stop >/dev/null 2>&1 || true
+                rc-service "$srv" status >/dev/null 2>&1 && return 1
+            fi
+        else
+            return 1
+        fi
+    done < "$state_file"
+}
 
 extract_abox_iptables_rules() {
     local snapshot="$1" mode="${2:-all}"
@@ -10362,7 +10383,7 @@ ipv6: true
 
 dns:
   enable: true
-  listen: 0.0.0.0:1053
+  listen: 127.0.0.1:1053
   enhanced-mode: fake-ip
   fake-ip-range: 198.18.0.1/16
   nameserver:
@@ -10970,7 +10991,7 @@ upgrade_hysteria_core_only() {
     [[ -x /usr/local/bin/hysteria ]] && old_ver=$(/usr/local/bin/hysteria version 2>/dev/null | head -n 1 || true)
     tmp=$(mktemp -d /tmp/A-Box-core-hysteria.XXXXXX) || die 'Hysteria core upgrade temp directory failed.'
     hy2_bin="$tmp/hysteria_core"
-    fetch_github_release apernet/hysteria hysteria_core "$hy2_bin"
+    fetch_github_release HyNetworks/hysteria hysteria_core "$hy2_bin"
     chmod 755 "$hy2_bin" || { rm -rf "$tmp"; die 'Hysteria staged binary chmod failed.'; }
     new_ver=$("$hy2_bin" version 2>/dev/null | head -n 1 || true)
     [[ -n "$new_ver" ]] || { rm -rf "$tmp"; die 'Hysteria staged binary execution check failed.'; }
@@ -11497,6 +11518,9 @@ EOF_SELFTEST_IPT
     jq -e '.inbounds[] | select(.protocol=="shadowsocks" and .port==2053 and .settings.network=="tcp,udp")' "$tmp/xray/config.json" >/dev/null 2>&1 || { echo 'FAIL: Xray SS-2022 2053 tcp,udp'; failures=$((failures + 1)); }
     jq -e '.inbounds[] | select(.protocol=="vless" and .port==8443 and .streamSettings.realitySettings.serverNames[0]=="www.microsoft.com")' "$tmp/xray/config.json" >/dev/null 2>&1 || { echo 'FAIL: Xray Vision SNI split'; failures=$((failures + 1)); }
     jq -e '.inbounds[] | select(.protocol=="vless" and .port==9443 and .streamSettings.realitySettings.serverNames[0]=="www.microsoft.com")' "$tmp/xray/config.json" >/dev/null 2>&1 || { echo 'FAIL: Xray XHTTP SNI split'; failures=$((failures + 1)); }
+    jq -e 'all(.inbounds[] | select(.protocol=="vless"); .streamSettings.realitySettings.minClientVer == "1.8.2")' "$tmp/xray/config.json" >/dev/null 2>&1 || { echo 'FAIL: Xray REALITY minClientVer compatibility guard'; failures=$((failures + 1)); }
+    assert_ok valid_github_download_url HyNetworks/hysteria https://github.com/HyNetworks/hysteria/releases/download/app/v2.12.2/hysteria-linux-amd64
+    assert_bad valid_github_download_url HyNetworks/hysteria https://example.com/HyNetworks/hysteria/releases/download/app/v2.12.2/hysteria-linux-amd64
     SINGBOX_CONFIG_PATH="$tmp/sing-box/config.json" build_singbox_config ALL
     jq empty "$tmp/sing-box/config.json" >/dev/null 2>&1 || { echo 'FAIL: build_singbox_config JSON'; failures=$((failures + 1)); }
     jq -e '.inbounds[] | select(.type=="shadowsocks" and .listen_port==2053 and (.network|not))' "$tmp/sing-box/config.json" >/dev/null 2>&1 || { echo 'FAIL: Sing-box SS-2022 2053 default network'; failures=$((failures + 1)); }
@@ -11506,6 +11530,7 @@ EOF_SELFTEST_IPT
     ABOX_DIR="$tmp" ABOX_ENV="$tmp/.env" CORE=xray MODE=ALL PUBLIC_KEY=publickey LINK_IP=203.0.113.10 HY2_DOMAIN= HY2_HOP=false HY2_CERT_SHA256_FP=abcdef HY2_CERT_PUBKEY_SHA256_B64=abcdef CLASH_YAML_PATH="$tmp/A-Box-clash.yaml" write_clash_yaml >/dev/null
     grep -q '^proxy-groups:' "$tmp/A-Box-clash.yaml" || { echo 'FAIL: Clash YAML proxy-groups'; failures=$((failures + 1)); }
     grep -q '^dns:' "$tmp/A-Box-clash.yaml" || { echo 'FAIL: Clash YAML dns'; failures=$((failures + 1)); }
+    grep -q '^  listen: 127.0.0.1:1053$' "$tmp/A-Box-clash.yaml" || { echo 'FAIL: Clash DNS listener must stay loopback-only'; failures=$((failures + 1)); }
     grep -q 'host: "www.microsoft.com"' "$tmp/A-Box-clash.yaml" || { echo 'FAIL: Clash XHTTP host'; failures=$((failures + 1)); }
     CORE=xray HY2_DOMAIN=hy2.example.com HY2_CERT_PUBKEY_SHA256_B64= singbox_hy2_tls_json | grep -q '"server_name": "hy2.example.com"' || { echo 'FAIL: Sing-box HY2 ACME TLS sample'; failures=$((failures + 1)); }
     CORE=singbox HY2_DOMAIN=hy2.example.com HY2_CERT_PUBKEY_SHA256_B64=abcdef singbox_hy2_tls_json | grep -q 'certificate_public_key_sha256' || { echo 'FAIL: Sing-box HY2 self-signed TLS sample'; failures=$((failures + 1)); }
@@ -11576,7 +11601,7 @@ main_loop() {
             msg "${GREEN}1.${NC} VLESS-Vision-Reality               ${GREEN}6.${NC} VLESS-Vision-Reality"
             msg "${GREEN}2.${NC} VLESS-XHTTP-Reality                ${GREEN}7.${NC} Shadowsocks-2022"
             msg "${GREEN}3.${NC} Shadowsocks-2022                   ${GREEN}8.${NC} VLESS + SS-2022"
-            msg "${GREEN}4.${NC} Hysteria 2 (Native/Apernet)        ${GREEN}9.${NC} Hysteria 2 (Sing-box)"
+            msg "${GREEN}4.${NC} Hysteria 2 (Official)        ${GREEN}9.${NC} Hysteria 2 (Sing-box)"
             msg "${GREEN}5.${NC} All-in-one (Xray+Hy2)             ${GREEN}10.${NC} All-in-one (Sing-box)"
             msg "${BLUE}----------------------------------------------------------------------${NC}"
             msg "${GREEN}11.${NC} Toolbox"
@@ -11599,7 +11624,7 @@ main_loop() {
             msg "${GREEN}1.${NC} VLESS-Vision-Reality               ${GREEN}6.${NC} VLESS-Vision-Reality"
             msg "${GREEN}2.${NC} VLESS-XHTTP-Reality                ${GREEN}7.${NC} Shadowsocks-2022"
             msg "${GREEN}3.${NC} Shadowsocks-2022                   ${GREEN}8.${NC} VLESS + SS-2022"
-            msg "${GREEN}4.${NC} Hysteria 2 (官方/Apernet)          ${GREEN}9.${NC} Hysteria 2 (Sing-box)"
+            msg "${GREEN}4.${NC} Hysteria 2 (官方)          ${GREEN}9.${NC} Hysteria 2 (Sing-box)"
             msg "${GREEN}5.${NC} 全协议四合一 (Xray+Hy2)           ${GREEN}10.${NC} 全协议三合一 (Sing-box)"
             msg "${BLUE}----------------------------------------------------------------------${NC}"
             msg "${GREEN}11.${NC} 综合工具箱"
