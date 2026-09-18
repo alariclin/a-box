@@ -32,8 +32,8 @@ PUBLIC_IP_CACHE_TTL=600
 BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-10}
 LOCK_FALLBACK_DIR='/run/A-Box.lock.d'
 ABOX_LANG='zh'
-ABOX_BUILD='2026-09-19-final-v11'
-ABOX_BUILD_EPOCH=2026091902
+ABOX_BUILD='2026-09-19-final-v18'
+ABOX_BUILD_EPOCH=2026091909
 ABOX_DESIRED_STATE='/etc/ddr/.desired_state'
 ABOX_TRAFFIC_BLOCK_STATE='/etc/ddr/.traffic-block-state'
 PUBLIC_IP_CONNECT_TIMEOUT=${PUBLIC_IP_CONNECT_TIMEOUT:-3}
@@ -219,12 +219,13 @@ tr_msg() {
 }
 
 tprintf() {
-    local key="$1" fmt rest placeholder_count=0 i=0 len next
+    local key="$1" fmt placeholder_count=0 i=0 len next
     shift
     fmt=$(tr_msg "$key")
     # Translation strings are internal, but validate their printf grammar before
     # passing them to printf. Only %s and %% are supported, with %% treated as
     # a literal percent and never counted as a placeholder.
+    [[ "$fmt" != *\\* ]] || die "非法翻译格式串: ${key}"
     len=${#fmt}
     while (( i < len )); do
         if [[ "${fmt:i:1}" == '%' ]]; then
@@ -311,8 +312,23 @@ need_interactive_tty() {
         fi
     fi
 }
+valid_decimal_upto() {
+    local input="${1:-}" max="${2:-}" normalized
+    [[ "$input" =~ ^[0-9]+$ ]] || return 1
+    [[ "$max" =~ ^[1-9][0-9]*$ ]] || return 1
+    normalized="${input#"${input%%[!0]*}"}"
+    [[ -n "$normalized" ]] || normalized='0'
+    (( ${#normalized} < ${#max} )) && return 0
+    (( ${#normalized} > ${#max} )) && return 1
+    (( 10#$normalized <= 10#$max ))
+}
+
 valid_port() {
-    [[ "${1:-}" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+    local input="${1:-}" normalized
+    valid_decimal_upto "$input" 65535 || return 1
+    normalized="${input#"${input%%[!0]*}"}"
+    [[ -n "$normalized" ]] || return 1
+    (( 10#$normalized >= 1 ))
 }
 
 valid_port_range() {
@@ -351,7 +367,15 @@ port_spec_for_firewalld() {
 }
 
 valid_positive_int() {
-    [[ "${1:-}" =~ ^[1-9][0-9]*$ ]]
+    # Keep decimal integers within a range safe for Bash arithmetic on
+    # standard 64-bit Linux; callers may still impose a tighter domain limit.
+    [[ "${1:-}" =~ ^[1-9][0-9]{0,17}$ ]]
+}
+
+valid_traffic_limit_gb() {
+    local input="${1:-}"
+    [[ "$input" =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+    (( 10#$input <= 8589934591 ))
 }
 
 valid_domain() {
@@ -364,7 +388,8 @@ valid_sni() { valid_domain "$1"; }
 
 valid_single_line_secret() {
     local value="${1:-}" max_len="${2:-512}"
-    [[ -n "$value" && ${#value} -le $max_len && "$value" != *$'\n'* && "$value" != *$'\r'* ]]
+    [[ -n "$value" && ${#value} -le $max_len ]] || return 1
+    [[ "$value" != *[[:cntrl:]]* ]]
 }
 
 is_apple_like_sni() {
@@ -382,11 +407,11 @@ prompt_reality_sni() {
     local label="$1" port="$2" default_sni input answer prompt warned
     default_sni=$(default_sni_for_port "$port")
     while true; do
-        printf -v prompt "$(tr_msg reality_sni_prompt)" "$label" "$port" "$default_sni"
+        prompt=$(tprintf reality_sni_prompt "$label" "$port" "$default_sni")
         read -r -ep "$prompt" input
         input=${input:-$default_sni}
         if ! valid_sni "$input"; then
-            printf '%s\n' "${RED}[!] $(printf "$(tr_msg bad_sni)" "$input")${NC}" >&2
+            printf '%s\n' "${RED}[!] $(tprintf bad_sni "$input")${NC}" >&2
             continue
         fi
         warned=0
@@ -399,7 +424,7 @@ prompt_reality_sni() {
             warned=1
         fi
         if [[ "$warned" == 1 ]]; then
-            printf -v prompt "$(tr_msg continue_or_reset)" "$label"
+            prompt=$(tprintf continue_or_reset "$label")
             read -r -ep "$prompt" answer
             is_yes "$answer" && { printf '%s\n' "$input"; return 0; }
             continue
@@ -457,28 +482,28 @@ prompt_https_url() {
 prompt_port_input() {
     local label="$1" default_port="$2" input prompt
     while true; do
-        printf -v prompt "$(tr_msg port_prompt)" "$label" "$default_port"
+        prompt=$(tprintf port_prompt "$label" "$default_port")
         read -r -ep "$prompt" input
         input="${input:-$default_port}"
         if valid_port "$input"; then
             printf '%s\n' "$((10#$input))"
             return 0
         fi
-        printf '%s\n' "${RED}[!] $(printf "$(tr_msg bad_port)" "$input")${NC}" >&2
+        printf '%s\n' "${RED}[!] $(tprintf bad_port "$input")${NC}" >&2
     done
 }
 
 prompt_ss_port_input() {
     local label="$1" default_port="$2" input prompt
     while true; do
-        printf -v prompt "$(tr_msg ss_port_prompt)" "$label" "$default_port"
+        prompt=$(tprintf ss_port_prompt "$label" "$default_port")
         read -r -ep "$prompt" input
         input="${input:-$default_port}"
         if valid_port "$input"; then
             printf '%s\n' "$((10#$input))"
             return 0
         fi
-        printf '%s\n' "${RED}[!] $(printf "$(tr_msg bad_port)" "$input")${NC}" >&2
+        printf '%s\n' "${RED}[!] $(tprintf bad_port "$input")${NC}" >&2
     done
 }
 
@@ -500,16 +525,14 @@ valid_ipv4_cidr() {
     mask=''
     [[ "$input" == */* ]] && mask="${input#*/}"
     if [[ -n "$mask" ]]; then
-        [[ "$mask" =~ ^[0-9]+$ ]] || return 1
-        (( 10#$mask >= 0 && 10#$mask <= 32 )) || return 1
+        valid_decimal_upto "$mask" 32 || return 1
     fi
     [[ "$addr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
     local IFS=.
     local -a octets
     read -r -a octets <<< "$addr"
     for n in "${octets[@]}"; do
-        [[ "$n" =~ ^[0-9]+$ ]] || return 1
-        (( 10#$n >= 0 && 10#$n <= 255 )) || return 1
+        valid_decimal_upto "$n" 255 || return 1
     done
 }
 
@@ -519,8 +542,7 @@ valid_ipv6_cidr() {
     mask=''
     [[ "$input" == */* ]] && mask="${input#*/}"
     if [[ -n "$mask" ]]; then
-        [[ "$mask" =~ ^[0-9]+$ ]] || return 1
-        (( 10#$mask >= 0 && 10#$mask <= 128 )) || return 1
+        valid_decimal_upto "$mask" 128 || return 1
     fi
     [[ "$addr" == *:* ]] || return 1
     [[ "$addr" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
@@ -537,7 +559,9 @@ PY
 
 valid_interface_name() {
     local iface="${1:-}"
-    [[ "$iface" =~ ^[a-zA-Z0-9_.:-]+$ && ${#iface} -le 16 ]]
+    # Linux IFNAMSIZ is 16 bytes including the terminating NUL; the usable
+    # interface-name limit is therefore 15 characters.
+    [[ "$iface" =~ ^[a-zA-Z0-9_.:-]+$ && ${#iface} -le 15 ]]
 }
 
 shell_quote() { printf '%q' "${1:-}"; }
@@ -587,7 +611,7 @@ validate_abox_env_semantics() {
     [[ -z "${ENABLE_KEEPALIVE:-}" || "${ENABLE_KEEPALIVE:-}" =~ ^(true|false)$ ]] || return 1
     [[ -z "${INGRESS_IF:-}" ]] || valid_interface_name "$INGRESS_IF" || return 1
     if [[ -n "${TRAFFIC_LIMIT_GB:-}" ]]; then
-        valid_positive_int "$TRAFFIC_LIMIT_GB" || return 1
+        valid_traffic_limit_gb "$TRAFFIC_LIMIT_GB" || return 1
         [[ "${TRAFFIC_LIMIT_MODE:-total}" =~ ^(total|rx|tx)$ ]] || return 1
     else
         [[ -z "${TRAFFIC_LIMIT_MODE:-}" || "${TRAFFIC_LIMIT_MODE:-}" =~ ^(total|rx|tx)$ ]] || return 1
@@ -2629,13 +2653,31 @@ reset_protocol_vars() {
     unset HY2_URI_PORTS HY2_CLASH_PORTS HY2_SB_PORTS HY2_RANGE_START HY2_RANGE_END ENABLE_KEEPALIVE
 }
 
+path_parent_chain_safe() {
+    local target="$1" current
+    [[ "$target" == /* ]] || return 1
+    current=$(dirname -- "$target")
+    while :; do
+        [[ "$current" == '/' ]] && return 0
+        [[ ! -L "$current" ]] || return 1
+        if [[ -e "$current" && ! -d "$current" ]]; then
+            return 1
+        fi
+        current=$(dirname -- "$current")
+    done
+}
+
 write_file_atomically_from_stdin() {
     local dest="$1" mode="${2:-600}" dir tmp
     [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
     [[ ! -e "$dest" && ! -L "$dest" || -f "$dest" ]] || return 1
     [[ ! -L "$dest" && ! -d "$dest" ]] || return 1
+    path_parent_chain_safe "$dest" || return 1
     dir=$(dirname "$dest")
-    if [[ ! -d "$dir" ]]; then mkdir -p "$dir" || return 1; fi
+    if [[ -L "$dir" || ( -e "$dir" && ! -d "$dir" ) ]]; then
+        return 1
+    fi
+    [[ -d "$dir" ]] || mkdir -p "$dir" || return 1
     tmp=$(mktemp "${dest}.A-Box-new.XXXXXX") || return 1
     cat > "$tmp" || { rm -f -- "$tmp"; return 1; }
     chmod "$mode" "$tmp" || { rm -f -- "$tmp"; return 1; }
@@ -3293,9 +3335,12 @@ build_xray_config() {
         | if ($mode|contains("SS")) or ($mode|contains("ALL")) or $mode == "VLESS_SS" then . + [ss] else . end
     ') || die 'Xray inbounds JSON 构造失败。'
     out="${XRAY_CONFIG_PATH:-/usr/local/etc/xray/config.json}"
-    tmp_out="${out}.tmp.$$"
-    mkdir -p "$(dirname "$out")"
-    [[ ! -L "$(dirname "$out")" && ! -L "$out" ]] || die 'Xray 配置路径存在符号链接，拒绝写入。'
+    local out_dir
+    out_dir=$(dirname -- "$out")
+    [[ ! -L "$out_dir" && ! -L "$out" ]] || die 'Xray 配置路径存在符号链接，拒绝写入。'
+    [[ ! -e "$out_dir" || -d "$out_dir" ]] || die 'Xray 配置父路径不是目录，拒绝写入。'
+    [[ -d "$out_dir" ]] || install -d -m 755 -- "$out_dir" || die 'Xray 配置目录创建失败。'
+    tmp_out=$(mktemp "$out_dir/.A-Box-xray-config.XXXXXX") || die 'Xray 配置临时文件创建失败。'
     umask 077
     jq -n --argjson inbounds "$inbounds_json" '{
         log:{loglevel:"warning", access:"/var/log/A-Box-xray-access.log", error:"/var/log/A-Box-xray-error.log"},
@@ -3341,9 +3386,12 @@ build_singbox_config() {
         | if ($mode|contains("HY2")) or ($mode|contains("ALL")) then . + [hy2] else . end
         | if ($mode|contains("SS")) or ($mode|contains("ALL")) or $mode == "VLESS_SS" then . + [ss] else . end') || die 'Sing-box inbounds JSON 构造失败。'
     out="${SINGBOX_CONFIG_PATH:-/etc/sing-box/config.json}"
-    tmp_out="${out}.tmp.$$"
-    mkdir -p "$(dirname "$out")"
-    [[ ! -L "$(dirname "$out")" && ! -L "$out" ]] || die 'Sing-box 配置路径存在符号链接，拒绝写入。'
+    local out_dir
+    out_dir=$(dirname -- "$out")
+    [[ ! -L "$out_dir" && ! -L "$out" ]] || die 'Sing-box 配置路径存在符号链接，拒绝写入。'
+    [[ ! -e "$out_dir" || -d "$out_dir" ]] || die 'Sing-box 配置父路径不是目录，拒绝写入。'
+    [[ -d "$out_dir" ]] || install -d -m 755 -- "$out_dir" || die 'Sing-box 配置目录创建失败。'
+    tmp_out=$(mktemp "$out_dir/.A-Box-singbox-config.XXXXXX") || die 'Sing-box 配置临时文件创建失败。'
     umask 077
     jq -n --argjson inbounds "$inbounds_json" '{
         log:{level:"warn", output:"/var/log/A-Box-singbox.log"},
@@ -3360,8 +3408,12 @@ generate_self_signed_cert_atomically() {
     local key="$1" cert="$2" cn="$3" dir tmp key_tmp cert_tmp pub1 pub2 key_bak='' cert_bak=''
     dir=$(dirname "$key")
     [[ "$dir" == "$(dirname "$cert")" ]] || return 1
+    path_parent_chain_safe "$key" || return 1
+    path_parent_chain_safe "$cert" || return 1
     install -d -m 700 "$dir" || return 1
     [[ ! -L "$key" && ! -L "$cert" ]] || return 1
+    [[ ! -e "$key" || -f "$key" ]] || return 1
+    [[ ! -e "$cert" || -f "$cert" ]] || return 1
     tmp=$(mktemp -d "$dir/.A-Box-cert.XXXXXX") || return 1
     key_tmp="$tmp/key.pem"; cert_tmp="$tmp/cert.pem"
     openssl ecparam -genkey -name prime256v1 -out "$key_tmp" >/dev/null 2>&1 || { rm -rf "$tmp"; return 1; }
@@ -3393,6 +3445,7 @@ generate_self_signed_cert_atomically() {
 build_hysteria_config() {
     local out="$1" tls_config="$2" listen_spec="$3" tmp pass_yaml obfs_yaml masq_yaml
     [[ -n "$out" && -n "$listen_spec" ]] || return 1
+    path_parent_chain_safe "$out" || return 1
     [[ ! -L "$(dirname "$out")" && ! -L "$out" ]] || return 1
     install -d -m 700 "$(dirname "$out")" || return 1
     pass_yaml=$(json_escape "$HY2_PASS") || return 1
@@ -3557,8 +3610,12 @@ install_file_atomically() {
     [[ -f "$src" && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
     [[ ! -e "$dest" && ! -L "$dest" || -f "$dest" ]] || return 1
     [[ ! -L "$dest" && ! -d "$dest" ]] || return 1
+    path_parent_chain_safe "$dest" || return 1
     dir=$(dirname "$dest")
-    install -d -m 755 "$dir" || return 1
+    if [[ -L "$dir" || ( -e "$dir" && ! -d "$dir" ) ]]; then
+        return 1
+    fi
+    [[ -d "$dir" ]] || install -d -m 755 "$dir" || return 1
     staged=$(mktemp "${dest}.A-Box-new.XXXXXX") || return 1
     command install -m "$mode" "$src" "$staged" || { rm -f -- "$staged"; return 1; }
     sync -f "$staged" 2>/dev/null || true
@@ -3574,8 +3631,12 @@ rollback_binary_install() {
 }
 
 remove_core_family_force() {
-    local srv="$1" path
-    while IFS= read -r path; do rm -rf -- "$path"; done < <(core_family_paths "$srv")
+    local srv="$1" path failed=0
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        rm -rf -- "$path" || failed=1
+    done < <(core_family_paths "$srv")
+    (( failed == 0 ))
 }
 
 restore_saved_trap() {
@@ -3634,7 +3695,9 @@ deployment_transaction_rollback() {
     clean_nat_rules >/dev/null 2>&1 || true
     clean_input_rules >/dev/null 2>&1 || true
     remove_native_firewall_rules >/dev/null 2>&1 || true
-    for srv in $targets; do remove_core_family_force "$srv"; done
+    local remove_failed=0
+    for srv in $targets; do remove_core_family_force "$srv" || remove_failed=1; done
+    (( remove_failed == 0 )) || msg "${RED}[!] Rollback could not completely remove one or more managed core files before restore.${NC}"
     restore_latest_backup_silent "$ABOX_DIR/backups" "$backup" || msg "${RED}[!] Automatic rollback could not restore the exact pre-operation backup: ${backup:-missing}${NC}"
     [[ -n "$tx_tmp" ]] && rm -rf -- "$tx_tmp"
 }
@@ -3915,7 +3978,17 @@ get_month_total_bytes() {
         rx=$(jq -r '([.interfaces[0].traffic.month[]?, .interfaces[0].traffic.months[]?] | last | .rx) // empty' <<< "$json" 2>/dev/null)
         tx=$(jq -r '([.interfaces[0].traffic.month[]?, .interfaces[0].traffic.months[]?] | last | .tx) // empty' <<< "$json" 2>/dev/null)
         if [[ "$rx" =~ ^[0-9]+$ && "$tx" =~ ^[0-9]+$ ]]; then
-            case "$mode" in rx) printf '%s\n' "$rx" ;; tx) printf '%s\n' "$tx" ;; total) printf '%s\n' "$((rx+tx))" ;; *) return 1 ;; esac
+            case "$mode" in
+                rx) printf '%s\n' "$rx" ;;
+                tx) printf '%s\n' "$tx" ;;
+                total)
+                    python3 - "$rx" "$tx" <<'PY_VNSTAT_TOTAL_MAIN'
+import sys
+print(int(sys.argv[1]) + int(sys.argv[2]))
+PY_VNSTAT_TOTAL_MAIN
+                    ;;
+                *) return 1 ;;
+            esac
             return 0
         fi
     fi
@@ -3975,6 +4048,7 @@ PY_HELPER_ENV
 }
 write_private_line() {
     local dest="$1" value="$2" tmp
+    path_parent_chain_safe "$dest" || return 1
     [[ ! -L "$dest" ]] || return 1
     tmp=$(umask 077; mktemp "${dest}.A-Box-new.XXXXXX") || return 1
     printf '%s\n' "$value" > "$tmp" && chown root:root "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$dest" || { rm -f "$tmp"; return 1; }
@@ -4006,7 +4080,20 @@ month_bytes() {
     if command -v jq >/dev/null 2>&1 && json=$(vnstat -i "$i" --json m 1 2>/dev/null); then
         rx=$(jq -r '([.interfaces[0].traffic.month[]?, .interfaces[0].traffic.months[]?] | last | .rx) // empty' <<< "$json" 2>/dev/null)
         tx=$(jq -r '([.interfaces[0].traffic.month[]?, .interfaces[0].traffic.months[]?] | last | .tx) // empty' <<< "$json" 2>/dev/null)
-        if [[ "$rx" =~ ^[0-9]+$ && "$tx" =~ ^[0-9]+$ ]]; then case "$mode" in rx) echo "$rx";; tx) echo "$tx";; total) echo $((rx+tx));; *) return 1;; esac; return 0; fi
+        if [[ "$rx" =~ ^[0-9]+$ && "$tx" =~ ^[0-9]+$ ]]; then
+            case "$mode" in
+                rx) echo "$rx" ;;
+                tx) echo "$tx" ;;
+                total)
+                    python3 - "$rx" "$tx" <<'PY_VNSTAT_TOTAL_MONITOR'
+import sys
+print(int(sys.argv[1]) + int(sys.argv[2]))
+PY_VNSTAT_TOTAL_MONITOR
+                    ;;
+                *) return 1 ;;
+            esac
+            return 0
+        fi
     fi
     line=$(vnstat -i "$i" --oneline b 2>/dev/null) || return 1
     case "$mode" in rx) awk -F';' '{print $9}' <<< "$line";; tx) awk -F';' '{print $10}' <<< "$line";; total) awk -F';' '{print $11}' <<< "$line";; *) return 1;; esac
@@ -4038,7 +4125,12 @@ for_expected_services() {
 }
 traffic_error() { umask 077; printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" >> /var/log/A-Box-traffic.log 2>/dev/null || true; }
 load_state || exit 0
-[[ "${TRAFFIC_LIMIT_GB:-}" =~ ^[1-9][0-9]*$ ]] || exit 0
+valid_traffic_limit_gb() {
+    local input="${1:-}"
+    [[ "$input" =~ ^[1-9][0-9]{0,9}$ ]] || return 1
+    (( 10#$input <= 8589934591 ))
+}
+valid_traffic_limit_gb "${TRAFFIC_LIMIT_GB:-}" || exit 0
 desired=$(read_desired) || exit 1
 current_period=$(date +%Y-%m)
 blocked_period=$(read_block_period 2>/dev/null || true)
@@ -4070,9 +4162,21 @@ iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"
 [[ -n "$iface" ]] || iface=$(ip -o route show to default 2>/dev/null | awk '{print $5; exit}')
 [[ -n "$iface" ]] || exit 0
 used=$(month_bytes "$iface" "${TRAFFIC_LIMIT_MODE:-total}") || exit 0
-limit=$(awk -v g="$TRAFFIC_LIMIT_GB" 'BEGIN{printf "%.0f", g*1024*1024*1024}')
+limit=$(python3 - "$TRAFFIC_LIMIT_GB" <<'PY_TRAFFIC_LIMIT'
+import sys
+gb = int(sys.argv[1])
+limit = gb * 1024 * 1024 * 1024
+if limit > 9223372036854775807:
+    raise SystemExit(1)
+print(limit)
+PY_TRAFFIC_LIMIT
+) || { traffic_error 'traffic limit conversion failed'; exit 1; }
 [[ "$used" =~ ^[0-9]+$ && "$limit" =~ ^[0-9]+$ ]] || exit 0
-if (( used >= limit )); then
+if python3 - "$used" "$limit" <<'PY_TRAFFIC_COMPARE
+import sys
+raise SystemExit(0 if int(sys.argv[1]) >= int(sys.argv[2]) else 1)
+PY_TRAFFIC_COMPARE
+then
     write_private_line "$BLOCK_STATE" "$current_period" || exit 1
     write_private_line "$DESIRED" TRAFFIC_BLOCKED || exit 1
     for_expected_services stop_owned || { traffic_error 'traffic limit reached but at least one owned service could not be stopped'; exit 1; }
@@ -4312,7 +4416,12 @@ check_virgin_state() {
     remove_owned_auxiliary_path /etc/logrotate.d/A-Box || die '删除 A-Box logrotate 配置失败。'
     rm -f /var/log/A-Box-*.log 2>/dev/null || die '删除 A-Box 日志失败。'
     if [[ "${INIT_SYS:-}" == systemd ]]; then
+        if systemctl list-unit-files fail2ban.service >/dev/null 2>&1 && systemctl cat fail2ban.service >/dev/null 2>&1; then
+            systemctl restart fail2ban >/dev/null 2>&1 || die '环境初始化时 Fail2Ban 重启失败。'
+        fi
         systemctl daemon-reload >/dev/null 2>&1 || die '环境初始化后的 systemd daemon-reload 失败。'
+    elif [[ "${INIT_SYS:-}" == openrc ]] && [[ -x /etc/init.d/fail2ban ]]; then
+        rc-service fail2ban restart >/dev/null 2>&1 || die '环境初始化时 Fail2Ban 重启失败。'
     fi
     msg "${GREEN}环境初始化完成；非 A-Box 同名安装未被删除。${NC}"
     pause_return
@@ -4430,6 +4539,7 @@ import hashlib
 import os
 import stat
 import sys
+import tempfile
 from pathlib import Path
 
 base = Path(sys.argv[1]).resolve(strict=True)
@@ -4468,9 +4578,11 @@ for top_name in ("root", "meta"):
             entries.append((relative.as_posix(), candidate))
 
 entries.sort(key=lambda item: item[0].encode("utf-8"))
-tmp = out.with_name(out.name + ".tmp")
+out.parent.mkdir(parents=False, exist_ok=True)
+tmp_fd, tmp_name = tempfile.mkstemp(prefix=f".{out.name}.", suffix=".tmp", dir=str(out.parent))
+tmp = Path(tmp_name)
 try:
-    with tmp.open("w", encoding="utf-8", newline="\n") as handle:
+    with os.fdopen(tmp_fd, "w", encoding="utf-8", newline="\n") as handle:
         for relative, candidate in entries:
             digest = hashlib.sha256()
             with candidate.open("rb") as source:
@@ -9021,7 +9133,7 @@ run_local_sni_mini_benchmark() {
 
 
 run_warp_manager() {
-    if confirm_yes_no "$(printf "$(tr_msg confirm_remote)" 'fscarmen/warp Cloudflare WARP menu')"; then
+    if confirm_yes_no "$(tprintf confirm_remote 'fscarmen/warp Cloudflare WARP menu')"; then
         run_remote_bash_script 'fscarmen/warp Cloudflare WARP menu' 'https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh'
     fi
     pause_return
@@ -9889,7 +10001,7 @@ regenerate_runtime_assets_after_restore() {
     setup_shortcut || return 1
     setup_health_monitor || return 1
     setup_geo_cron || return 1
-    if valid_positive_int "${TRAFFIC_LIMIT_GB:-}"; then
+    if valid_traffic_limit_gb "${TRAFFIC_LIMIT_GB:-}"; then
         setup_traffic_monitor || return 1
     else
         disable_traffic_monitor || return 1
@@ -10123,8 +10235,12 @@ restore_from_backup() {
     for i in "${!backups[@]}"; do printf '%2d. %s\n' "$((i+1))" "${backups[$i]}"; done
     read -r -ep 'Select backup (0 back): ' choice
     [[ "$choice" == 0 ]] && return
-    [[ "$choice" =~ ^[0-9]+$ ]] && (( choice>=1 && choice<=${#backups[@]} )) || { msg "${RED}[!] Invalid selection.${NC}"; pause_return; return; }
-    selected="${backups[$((choice-1))]}"
+    if ! [[ "$choice" =~ ^[1-9][0-9]*$ ]] || ! valid_decimal_upto "$choice" "${#backups[@]}"; then
+        msg "${RED}[!] Invalid selection.${NC}"
+        pause_return
+        return
+    fi
+    selected="${backups[$((10#$choice-1))]}"
     backup_checksum_verify "$selected" "${selected}.sha256" || die 'Backup SHA256 is missing or invalid.'
     prepare_backup_auth_for_manual_restore "$selected" || die 'Backup HMAC/recovery-key authentication failed or was not authorized.'
     validate_backup_archive "$selected" || die 'Backup archive structure/link validation failed.'
@@ -10435,11 +10551,11 @@ vps_benchmark_menu() {
     read -r -ep 'Select [0-10]: ' bench_choice
     case "$bench_choice" in
         1)
-            confirm_yes_no "$(printf "$(tr_msg confirm_remote)" 'System benchmark and download speed')" && run_remote_bash_script 'System benchmark and download speed' 'https://bench.sh'
+            confirm_yes_no "$(tprintf confirm_remote 'System benchmark and download speed')" && run_remote_bash_script 'System benchmark and download speed' 'https://bench.sh'
             pause_return
             ;;
         2)
-            confirm_yes_no "$(printf "$(tr_msg confirm_remote)" 'IP quality, streaming unlock and route test')" && run_remote_bash_script 'IP quality, streaming unlock and route test' 'https://Check.Place' -I
+            confirm_yes_no "$(tprintf confirm_remote 'IP quality, streaming unlock and route test')" && run_remote_bash_script 'IP quality, streaming unlock and route test' 'https://Check.Place' -I
             pause_return
             ;;
         3) run_local_sni_benchmark ;;
@@ -11185,10 +11301,12 @@ core_upgrade_transaction_rollback() {
     restore_core_upgrade_transaction_traps
     msg "${YELLOW}[!] Core upgrade failed or was interrupted; restoring the exact pre-upgrade snapshot.${NC}"
     stop_all_managed_services >/dev/null 2>&1 || true
+    local remove_failed=0
     for srv in $targets; do
         case "$srv" in singbox) srv='sing-box' ;; esac
-        remove_core_family_force "$srv"
+        remove_core_family_force "$srv" || remove_failed=1
     done
+    (( remove_failed == 0 )) || msg "${RED}[!] Core-upgrade rollback could not completely remove one or more managed core files before restore.${NC}"
     restore_latest_backup_silent "$ABOX_DIR/backups" "$backup" || msg "${RED}[!] Core upgrade rollback failed: ${backup:-missing}${NC}"
 }
 
@@ -11524,9 +11642,22 @@ run_self_tests() {
 
     assert_ok valid_port 1
     assert_ok valid_port 65535
+    assert_ok valid_port 00065535
     assert_bad valid_port 0
+    assert_bad valid_port 000000
     assert_bad valid_port 65536
     assert_bad valid_port 08x
+    assert_bad valid_port 999999999999999999999999999999999999
+    assert_ok valid_positive_int 999999999999999999
+    assert_bad valid_positive_int 1000000000000000000
+    assert_ok valid_traffic_limit_gb 8589934591
+    assert_bad valid_traffic_limit_gb 8589934592
+    assert_bad valid_traffic_limit_gb 999999999999999999
+    assert_bad valid_single_line_secret $'secret\tvalue'
+    assert_bad valid_single_line_secret $'secret\nvalue'
+    assert_ok valid_single_line_secret 'normal-secret'
+    assert_ok valid_interface_name abcdefghijklmno
+    assert_bad valid_interface_name abcdefghijklmnop
     assert_ok valid_port_range 20000:25000
     assert_ok valid_port_range 20000-25000
     assert_bad valid_port_range 25000:20000
@@ -11557,8 +11688,11 @@ run_self_tests() {
     [[ "$(tr_msg confirm_local_sni_full)" != *'远程执行第三方脚本'* ]] || { echo 'FAIL: local SNI prompt still says remote third-party'; failures=$((failures + 1)); }
     assert_ok valid_ipv4_cidr 192.0.2.1/24
     assert_bad valid_ipv4_cidr 999.0.2.1/24
+    assert_bad valid_ipv4_cidr 192.0.2.1/999999999999999999999999999
+    assert_bad valid_ipv4_cidr 192.0.2.999999999999999999999999/24
     assert_ok valid_ipv6_cidr 2001:db8::1/64
     assert_bad valid_ipv6_cidr 2001:::1/64
+    assert_bad valid_ipv6_cidr 2001:db8::1/999999999999999999999999999
     declare -F backup_current_config >/dev/null 2>&1 || { echo 'FAIL: backup_current_config missing'; failures=$((failures + 1)); }
     declare -F export_diagnostic_bundle >/dev/null 2>&1 || { echo 'FAIL: export_diagnostic_bundle missing'; failures=$((failures + 1)); }
     declare -F preflight_check >/dev/null 2>&1 || { echo 'FAIL: preflight_check missing'; failures=$((failures + 1)); }
@@ -11585,7 +11719,16 @@ run_self_tests() {
     [[ "$(sni_domain_penalty apple.com)" == '2400' ]] || { echo 'FAIL: Apple apex SNI penalty'; failures=$((failures + 1)); }
     [[ "$(sni_domain_penalty github.com)" == '2400' ]] || { echo 'FAIL: GitHub apex SNI penalty'; failures=$((failures + 1)); }
     grep -q 'MAIN_LOCK=/run/A-Box.lock' "$0" || { echo 'FAIL: health probe must share main runtime lock'; failures=$((failures + 1)); }
+    grep -q "环境初始化时 Fail2Ban 重启失败" "$0" || { echo 'FAIL: environment reset must restart Fail2Ban after removing A-Box jail'; failures=$((failures + 1)); }
+    grep -Fq '[[ "$value" != *[[:cntrl:]]* ]]' "$0" || { echo 'FAIL: secret validator must reject control characters'; failures=$((failures + 1)); }
+    grep -Fq '[[ "$fmt" != *' "$0" || { echo 'FAIL: translation printf must reject backslash escapes'; failures=$((failures + 1)); }
+    ( tr_msg() { printf '%s' 'bad\q %s'; }; tprintf synthetic test ) >/dev/null 2>&1 && { echo 'FAIL: tprintf accepted a backslash escape in a translation'; failures=$((failures + 1)); }
+    ( tr_msg() { printf '%s' '%n'; }; tprintf synthetic ) >/dev/null 2>&1 && { echo 'FAIL: tprintf accepted an unsupported printf conversion'; failures=$((failures + 1)); }
+    ( tr_msg() { printf '%s' '%s %s'; }; tprintf synthetic only-one ) >/dev/null 2>&1 && { echo 'FAIL: tprintf accepted mismatched placeholder arguments'; failures=$((failures + 1)); }
     grep -q 'command -v ss >/dev/null 2>&1 || return 2' "$0" || { echo 'FAIL: health probe must not restart services when ss is unavailable'; failures=$((failures + 1)); }
+    grep -q 'PY_VNSTAT_TOTAL_MAIN' "$0" || { echo 'FAIL: main vnStat total must use exact integer arithmetic'; failures=$((failures + 1)); }
+    grep -q 'PY_VNSTAT_TOTAL_MONITOR' "$0" || { echo 'FAIL: traffic monitor vnStat total must use exact integer arithmetic'; failures=$((failures + 1)); }
+    grep -q 'PY_TRAFFIC_COMPARE' "$0" || { echo 'FAIL: traffic quota comparison must use exact integer arithmetic'; failures=$((failures + 1)); }
     ! grep -q '^    \[\[ -d /run/systemd/system \]\] && return 0$' "$0" || { echo 'FAIL: systemd detection must not trust /run/systemd/system alone'; failures=$((failures + 1)); }
     cron_guard_in=$(mktemp /tmp/A-Box-selftest-cron-in.XXXXXX) || { echo 'FAIL: cron regression temp creation'; failures=$((failures + 1)); return 1; }
     cron_guard_out=$(mktemp /tmp/A-Box-selftest-cron-out.XXXXXX) || { rm -f "$cron_guard_in"; echo 'FAIL: cron regression temp creation'; failures=$((failures + 1)); return 1; }
@@ -11638,6 +11781,17 @@ run_self_tests() {
     printf 'old-content
 ' > "$tmp/atomic.dest"
     assert_ok install_file_atomically "$tmp/atomic.src" "$tmp/atomic.dest" 600
+    mkdir -m 750 "$tmp/atomic-parent" || { echo 'FAIL: atomic parent setup'; failures=$((failures + 1)); }
+    assert_ok install_file_atomically "$tmp/atomic.src" "$tmp/atomic-parent/kept-mode" 600
+    [[ "$(stat -c %a "$tmp/atomic-parent" 2>/dev/null)" == 750 ]] || { echo 'FAIL: install_file_atomically changed an existing parent directory mode'; failures=$((failures + 1)); }
+    ln -s "$tmp/atomic-parent" "$tmp/atomic-parent-link"
+    assert_bad install_file_atomically "$tmp/atomic.src" "$tmp/atomic-parent-link/dest" 600
+    mkdir -p "$tmp/nested-real"
+    ln -s "$tmp/nested-real" "$tmp/nested-link"
+    assert_bad install_file_atomically "$tmp/atomic.src" "$tmp/nested-link/deeper/dest" 600
+    printf '%s\n' 'nested' | (write_file_atomically_from_stdin "$tmp/nested-link/deeper/state" 600 >/dev/null 2>&1) && { echo 'FAIL: atomic stdin writer traversed a nested parent symlink'; failures=$((failures + 1)); }
+    mkdir "$tmp/cert-key-dir"
+    assert_bad generate_self_signed_cert_atomically "$tmp/cert-key-dir" "$tmp/cert.crt" localhost
     cmp -s "$tmp/atomic.src" "$tmp/atomic.dest" || { echo 'FAIL: atomic file install content'; failures=$((failures + 1)); }
     rollback_binary_install "$tmp/atomic.dest" '' >/dev/null 2>&1 || true
     [[ ! -e "$tmp/atomic.dest" ]] || { echo 'FAIL: first-install rollback must remove destination'; failures=$((failures + 1)); }
@@ -11654,7 +11808,15 @@ run_self_tests() {
     : > "$tmp/archive-good/meta/iptables.snapshot"
     : > "$tmp/archive-good/meta/ip6tables.snapshot"
     : > "$tmp/archive-good/meta/cron.abox.txt"
-    create_backup_manifest "$tmp/archive-good" "$tmp/archive-good/meta/manifest.sha256"
+    printf '%s\n' 'sentinel' > "$tmp/archive-good/meta/manifest-sentinel.txt"
+    ln -s "$tmp/archive-good/meta/manifest-sentinel.txt" "$tmp/archive-good/meta/manifest.sha256.tmp"
+    if create_backup_manifest "$tmp/archive-good" "$tmp/archive-good/meta/manifest.sha256" >/dev/null 2>&1; then
+        echo 'FAIL: backup manifest generation accepted a predictable temp-file symlink'
+        failures=$((failures + 1))
+    fi
+    [[ "$(cat "$tmp/archive-good/meta/manifest-sentinel.txt" 2>/dev/null)" == 'sentinel' ]] || { echo 'FAIL: backup manifest generation followed predictable temp-file symlink'; failures=$((failures + 1)); }
+    rm -f "$tmp/archive-good/meta/manifest.sha256.tmp"
+    assert_ok create_backup_manifest "$tmp/archive-good" "$tmp/archive-good/meta/manifest.sha256"
     tar -C "$tmp/archive-good" -czf "$tmp/good.tar.gz" root meta
     assert_ok validate_backup_archive "$tmp/good.tar.gz"
     mkdir -p "$tmp/archive-bad/root/etc/ddr" "$tmp/archive-bad/meta"
@@ -11708,7 +11870,12 @@ EOF_SELFTEST_IPT
     ENABLE_KEEPALIVE=true
 
     mkdir -p "$tmp/xray" "$tmp/sing-box"
+    printf '%s\n' 'sentinel' > "$tmp/xray/sentinel.txt"
+    ln -s "$tmp/xray/sentinel.txt" "$tmp/xray/config.json.tmp.$$"
     XRAY_CONFIG_PATH="$tmp/xray/config.json" build_xray_config ALL
+    [[ "$(cat "$tmp/xray/sentinel.txt" 2>/dev/null)" == 'sentinel' ]] || { echo 'FAIL: Xray config generation followed a predictable temp-file symlink'; failures=$((failures + 1)); }
+    [[ -L "$tmp/xray/config.json.tmp.$$" ]] || { echo 'FAIL: Xray config generation touched the predictable temp symlink'; failures=$((failures + 1)); }
+    rm -f "$tmp/xray/config.json.tmp.$$"
     jq empty "$tmp/xray/config.json" >/dev/null 2>&1 || { echo 'FAIL: build_xray_config JSON'; failures=$((failures + 1)); }
     [[ "$(stat -c %a "$tmp/xray/config.json" 2>/dev/null)" == '600' ]] || { echo 'FAIL: Xray config permissions must be 0600'; failures=$((failures + 1)); }
     local saved_vision_sni="$VISION_SNI" saved_vless_sni="$VLESS_SNI"
@@ -11722,7 +11889,12 @@ EOF_SELFTEST_IPT
     jq -e 'all(.inbounds[] | select(.protocol=="vless"); .streamSettings.realitySettings.minClientVer == "1.8.2")' "$tmp/xray/config.json" >/dev/null 2>&1 || { echo 'FAIL: Xray REALITY minClientVer compatibility guard'; failures=$((failures + 1)); }
     assert_ok valid_github_download_url HyNetworks/hysteria https://github.com/HyNetworks/hysteria/releases/download/app/v2.12.2/hysteria-linux-amd64
     assert_bad valid_github_download_url HyNetworks/hysteria https://example.com/HyNetworks/hysteria/releases/download/app/v2.12.2/hysteria-linux-amd64
+    printf '%s\n' 'sentinel' > "$tmp/sing-box/sentinel.txt"
+    ln -s "$tmp/sing-box/sentinel.txt" "$tmp/sing-box/config.json.tmp.$$"
     SINGBOX_CONFIG_PATH="$tmp/sing-box/config.json" build_singbox_config ALL
+    [[ "$(cat "$tmp/sing-box/sentinel.txt" 2>/dev/null)" == 'sentinel' ]] || { echo 'FAIL: Sing-box config generation followed a predictable temp-file symlink'; failures=$((failures + 1)); }
+    [[ -L "$tmp/sing-box/config.json.tmp.$$" ]] || { echo 'FAIL: Sing-box config generation touched the predictable temp symlink'; failures=$((failures + 1)); }
+    rm -f "$tmp/sing-box/config.json.tmp.$$"
     jq empty "$tmp/sing-box/config.json" >/dev/null 2>&1 || { echo 'FAIL: build_singbox_config JSON'; failures=$((failures + 1)); }
     [[ "$(stat -c %a "$tmp/sing-box/config.json" 2>/dev/null)" == '600' ]] || { echo 'FAIL: Sing-box config permissions must be 0600'; failures=$((failures + 1)); }
     jq -e '.inbounds[] | select(.type=="shadowsocks" and .listen_port==2053 and (.network|not))' "$tmp/sing-box/config.json" >/dev/null 2>&1 || { echo 'FAIL: Sing-box SS-2022 2053 default network'; failures=$((failures + 1)); }
