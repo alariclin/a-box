@@ -10,14 +10,13 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 export LANG=${LANG:-en_US.UTF-8}
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;36m'
-CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
-NC='\033[0m'
-BOLD='\033[1m'
+RED=$'\033[0;31m'
+GREEN=$'\033[0;32m'
+YELLOW=$'\033[0;33m'
+BLUE=$'\033[0;36m'
+CYAN=$'\033[0;36m'
+NC=$'\033[0m'
+BOLD=$'\033[1m'
 
 DEPS_MARKER='/etc/ddr/.deps.v20260725'
 SCRIPT_URL='https://raw.githubusercontent.com/alariclin/a-box/main/install.sh'
@@ -33,8 +32,8 @@ PUBLIC_IP_CACHE_TTL=600
 BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-10}
 LOCK_FALLBACK_DIR='/run/A-Box.lock.d'
 ABOX_LANG='zh'
-ABOX_BUILD='2026-09-14-final-v9'
-ABOX_BUILD_EPOCH=2026091401
+ABOX_BUILD='2026-09-19-final-v11'
+ABOX_BUILD_EPOCH=2026091902
 ABOX_DESIRED_STATE='/etc/ddr/.desired_state'
 ABOX_TRAFFIC_BLOCK_STATE='/etc/ddr/.traffic-block-state'
 PUBLIC_IP_CONNECT_TIMEOUT=${PUBLIC_IP_CONNECT_TIMEOUT:-3}
@@ -56,9 +55,9 @@ ABOX_CORE_TX_PREV_TRAP_TERM=''
 ABOX_CORE_TX_PREV_TRAP_HUP=''
 ABOX_CORE_UPGRADE_TARGETS=''
 
-msg() { echo -e "$*"; }
+msg() { printf '%s\n' "$*"; }
 die() {
-    echo -e "${RED}[!] $*${NC}" >&2
+    printf '%s\n' "${RED}[!] $*${NC}" >&2
     if [[ -n "${ABOX_DIE_HOOK:-}" ]] && declare -F "$ABOX_DIE_HOOK" >/dev/null 2>&1; then
         "$ABOX_DIE_HOOK" "$*" || true
     fi
@@ -219,7 +218,30 @@ tr_msg() {
     esac
 }
 
-tprintf() { local key="$1"; shift; printf "$(tr_msg "$key")" "$@"; }
+tprintf() {
+    local key="$1" fmt rest placeholder_count=0 i=0 len next
+    shift
+    fmt=$(tr_msg "$key")
+    # Translation strings are internal, but validate their printf grammar before
+    # passing them to printf. Only %s and %% are supported, with %% treated as
+    # a literal percent and never counted as a placeholder.
+    len=${#fmt}
+    while (( i < len )); do
+        if [[ "${fmt:i:1}" == '%' ]]; then
+            (( i + 1 < len )) || die "非法翻译格式串: ${key}"
+            next=${fmt:i+1:1}
+            case "$next" in
+                '%') i=$((i + 2)) ;;
+                s) placeholder_count=$((placeholder_count + 1)); i=$((i + 2)) ;;
+                *) die "非法翻译格式串: ${key}" ;;
+            esac
+        else
+            i=$((i + 1))
+        fi
+    done
+    (( placeholder_count == $# )) || die "翻译参数数量不匹配: ${key} (${placeholder_count} != $#)"
+    printf "$fmt" "$@"
+}
 
 proto_label() {
     printf '%b[%s]%b' "${BOLD}${CYAN}" "$1" "${NC}"
@@ -351,9 +373,8 @@ is_apple_like_sni() {
 }
 
 default_sni_for_port() {
-    local port="${1:-443}"
-    # Avoid Apple/iCloud as a default target. Xray-core emits warnings for apple/icloud
-    # targets and for non-443 listeners; use toolbox SNI radar results for production.
+    # The current default target is intentionally port-independent. Avoid Apple/iCloud
+    # targets; use the SNI radar for a separately verified production target.
     printf 'www.microsoft.com'
 }
 
@@ -365,16 +386,16 @@ prompt_reality_sni() {
         read -r -ep "$prompt" input
         input=${input:-$default_sni}
         if ! valid_sni "$input"; then
-            echo -e "${RED}[!] $(printf "$(tr_msg bad_sni)" "$input")${NC}" >&2
+            printf '%s\n' "${RED}[!] $(printf "$(tr_msg bad_sni)" "$input")${NC}" >&2
             continue
         fi
         warned=0
         if [[ "$port" != '443' ]]; then
-            echo -e "${YELLOW}[!] REALITY/XHTTP 使用非 443 监听端口 (${port})。Xray 上游将其作为独立风险条件提示；请确认该端口符合你的网络环境。${NC}" >&2
+            printf '%s\n' "${YELLOW}[!] REALITY/XHTTP 使用非 443 监听端口 (${port})。Xray 上游将其作为独立风险条件提示；请确认该端口符合你的网络环境。${NC}" >&2
             warned=1
         fi
         if is_apple_like_sni "$input"; then
-            echo -e "${YELLOW}[!] Apple/iCloud 类 target (${input}) 被 Xray 上游作为独立风险条件提示；建议改用经过实测的非 Apple/iCloud 目标。${NC}" >&2
+            printf '%s\n' "${YELLOW}[!] Apple/iCloud 类 target (${input}) 被 Xray 上游作为独立风险条件提示；建议改用经过实测的非 Apple/iCloud 目标。${NC}" >&2
             warned=1
         fi
         if [[ "$warned" == 1 ]]; then
@@ -428,8 +449,8 @@ prompt_https_url() {
             printf '%s\n' "$normalized"
             return 0
         fi
-        echo -e "${RED}[!] HY2 伪装 URL 非法 / Invalid HY2 masquerade URL: ${input}${NC}" >&2
-        echo -e "${YELLOW}    正确示例 / Example: https://www.microsoft.com/${NC}" >&2
+        printf '%s\n' "${RED}[!] HY2 伪装 URL 非法 / Invalid HY2 masquerade URL: ${input}${NC}" >&2
+        printf '%s\n' "${YELLOW}    正确示例 / Example: https://www.microsoft.com/${NC}" >&2
     done
 }
 
@@ -440,10 +461,10 @@ prompt_port_input() {
         read -r -ep "$prompt" input
         input="${input:-$default_port}"
         if valid_port "$input"; then
-            printf '%s\n' "$input"
+            printf '%s\n' "$((10#$input))"
             return 0
         fi
-        echo -e "${RED}[!] $(printf "$(tr_msg bad_port)" "$input")${NC}" >&2
+        printf '%s\n' "${RED}[!] $(printf "$(tr_msg bad_port)" "$input")${NC}" >&2
     done
 }
 
@@ -454,10 +475,10 @@ prompt_ss_port_input() {
         read -r -ep "$prompt" input
         input="${input:-$default_port}"
         if valid_port "$input"; then
-            printf '%s\n' "$input"
+            printf '%s\n' "$((10#$input))"
             return 0
         fi
-        echo -e "${RED}[!] $(printf "$(tr_msg bad_port)" "$input")${NC}" >&2
+        printf '%s\n' "${RED}[!] $(printf "$(tr_msg bad_port)" "$input")${NC}" >&2
     done
 }
 
@@ -470,7 +491,7 @@ prompt_positive_int_input() {
             printf '%s\n' "$input"
             return 0
         fi
-        echo -e "${RED}[!] 请输入正整数 / Enter a positive integer: ${input}${NC}" >&2
+        printf '%s\n' "${RED}[!] 请输入正整数 / Enter a positive integer: ${input}${NC}" >&2
     done
 }
 valid_ipv4_cidr() {
@@ -550,6 +571,10 @@ validate_abox_env_semantics() {
         value=${!p:-}
         [[ -z "$value" ]] || valid_domain "$value" || return 1
     done
+    for p in HY2_UP HY2_DOWN; do
+        value=${!p:-}
+        [[ -z "$value" ]] || valid_positive_int "$value" || return 1
+    done
     [[ -z "${HY2_MASQ_URL:-}" ]] || valid_url_https "$HY2_MASQ_URL" || return 1
     [[ -z "${UUID:-}" || "${UUID:-}" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] || return 1
     [[ -z "${SHORT_ID:-}" || "${SHORT_ID:-}" =~ ^[0-9A-Fa-f]{2,32}$ ]] || return 1
@@ -585,7 +610,7 @@ load_abox_env() {
     (( (8#$mode & 8#077) == 0 )) || return 1
     command -v python3 >/dev/null 2>&1 || return 1
     parsed=$(umask 077; mktemp /tmp/A-Box-env.XXXXXX) || return 1
-    if ! python3 /dev/fd/3 "$file" > "$parsed" 3<<'PY_ABOX_ENV'; then
+    if ! python3 - "$file" > "$parsed" <<'PY_ABOX_ENV'; then
 import os
 import shlex
 import sys
@@ -777,7 +802,7 @@ verify_domain_points_to_self() {
     [[ -z "$resolved" ]] && die "域名无法解析: $domain"
     if [[ "$pub_ip" != 'N/A' ]] && ! grep -Fxq "$pub_ip" <<< "$resolved"; then
         msg "${YELLOW}[!] 域名已解析，但未发现解析到当前公网 IP: $pub_ip${NC}"
-        msg "${YELLOW}解析结果:${NC}\n$resolved"
+        printf '%s\n\n%s\n' "${YELLOW}解析结果:${NC}" "$resolved"
         read -r -ep '仍然继续？[Y/N]: ' continue_domain
         is_yes "$continue_domain" || die '已取消部署。'
     fi
@@ -786,7 +811,6 @@ verify_domain_points_to_self() {
 init_system_environment() {
     release=''
     local -a install_cmd=()
-    deps_initialized=0
     if [[ -f /etc/os-release ]]; then
         . /etc/os-release
         case "${ID:-}" in
@@ -842,7 +866,6 @@ init_system_environment() {
         "${install_cmd[@]}" "${deps[@]}" >/dev/null 2>&1 || die '基础依赖包安装失败。'
         ensure_abox_dir_owned "$ABOX_DIR"
         install -m 600 /dev/null "$DEPS_MARKER" || die '依赖标记写入失败。'
-        deps_initialized=1
     fi
 
     ensure_commands
@@ -959,9 +982,8 @@ get_architecture() {
 
 systemd_available() {
     command -v systemctl >/dev/null 2>&1 || return 1
-    [[ -d /run/systemd/system ]] && return 0
-    [[ "$(cat /proc/1/comm 2>/dev/null || true)" == 'systemd' ]] && return 0
-    systemctl is-system-running --quiet >/dev/null 2>&1
+    [[ -r /proc/1/comm ]] || return 1
+    [[ "$(cat /proc/1/comm 2>/dev/null || true)" == 'systemd' ]] || return 1
 }
 
 service_manager() {
@@ -1283,8 +1305,10 @@ auxiliary_content_is_abox_managed() {
     local file="$1" logical_path="$2"
     [[ -f "$file" && ! -L "$file" ]] || return 1
     if [[ "$logical_path" == /usr/local/bin/sb ]]; then
-        grep -Fxq '# Managed by A-Box' "$file" 2>/dev/null || grep -Fq '/etc/ddr/A-Box.sh' "$file" 2>/dev/null
-        return
+        grep -Fxq '# Managed by A-Box' "$file" 2>/dev/null && return 0
+        grep -Fq 'exec bash /etc/ddr/A-Box.sh "$@"' "$file" 2>/dev/null || return 1
+        grep -Fq 'exec sudo bash /etc/ddr/A-Box.sh "$@"' "$file" 2>/dev/null || return 1
+        return 0
     fi
     grep -Fxq '# Managed by A-Box' "$file" 2>/dev/null && return 0
     # Path-specific legacy fingerprints allow a one-time migration. New files
@@ -1340,7 +1364,9 @@ prune_owned_core_families_except() {
         stop_abox_service "$srv" || die "无法停止 A-Box 托管服务: $srv"
         remove_owned_core_family "$srv" || die "无法删除 A-Box 托管核心文件: $srv"
     done
-    [[ "${INIT_SYS:-}" == systemd ]] && systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ "${INIT_SYS:-}" == systemd ]]; then
+        systemctl daemon-reload >/dev/null 2>&1 || die '删除 A-Box 托管核心后 systemd daemon-reload 失败。'
+    fi
 }
 
 list_foreign_core_conflicts() {
@@ -1403,8 +1429,7 @@ remove_all_owned_core_families() {
 
 shortcut_is_abox_managed() {
     local path="${1:-/usr/local/bin/sb}"
-    [[ -f "$path" && ! -L "$path" ]] || return 1
-    grep -Fxq '# Managed by A-Box' "$path" 2>/dev/null || grep -Fq '/etc/ddr/A-Box.sh' "$path" 2>/dev/null
+    auxiliary_content_is_abox_managed "$path" /usr/local/bin/sb
 }
 
 assert_abox_shortcut_safe() {
@@ -1511,7 +1536,7 @@ build_status_str() {
         case "$srv" in xray) status_str+="${GREEN}Xray-Core${NC} ";; sing-box) status_str+="${CYAN}Sing-Box${NC} ";; hysteria) status_str+="${GREEN}Hy2(Native)${NC} ";; esac
     done
     [[ -z "$status_str" ]] && status_str="${RED}Stack Stopped${NC}"
-    printf '%b' "$status_str"
+    printf '%s' "$status_str"
 }
 
 managed_services_active() {
@@ -1575,12 +1600,14 @@ remove_abox_firewall_persistence() {
         fi
         rm -f /etc/systemd/system/A-Box-firewall.service || failed=1
         [[ ! -e /etc/systemd/system/A-Box-firewall.service && ! -L /etc/systemd/system/A-Box-firewall.service ]] || failed=1
-        systemd_available && systemctl daemon-reload >/dev/null 2>&1 || true
+        if systemd_available; then
+            systemctl daemon-reload >/dev/null 2>&1 || failed=1
+        fi
     fi
     if [[ -f /etc/init.d/A-Box-firewall ]] && grep -Fxq '# Managed by A-Box' /etc/init.d/A-Box-firewall 2>/dev/null; then
         if command -v rc-service >/dev/null 2>&1; then
             rc-service A-Box-firewall stop >/dev/null 2>&1 || { rc-service A-Box-firewall status >/dev/null 2>&1 && failed=1; }
-            rc-update del A-Box-firewall default >/dev/null 2>&1 || true
+            rc-update del A-Box-firewall default >/dev/null 2>&1 || failed=1
         fi
         rm -f /etc/init.d/A-Box-firewall || failed=1
         [[ ! -e /etc/init.d/A-Box-firewall && ! -L /etc/init.d/A-Box-firewall ]] || failed=1
@@ -1835,13 +1862,13 @@ ufw_global_rule_numbers() {
             continue
         fi
         rest="${rest# (v6)}"
-        rest="${rest#${rest%%[![:space:]]*}}"
+        rest="${rest#"${rest%%[![:space:]]*}"}"
         case "$rest" in
             'ALLOW IN '*) rest="${rest#ALLOW IN }" ;;
             'LIMIT IN '*) rest="${rest#LIMIT IN }" ;;
             *) continue ;;
         esac
-        rest="${rest#${rest%%[![:space:]]*}}"
+        rest="${rest#"${rest%%[![:space:]]*}"}"
         [[ "$rest" =~ ^Anywhere([[:space:]]+\(v6\))?([[:space:]]+#.*)?$ ]] || continue
         if [[ "$owned_only" == 1 ]]; then
             [[ "$rest" == *"$expected_comment" ]] || continue
@@ -2185,32 +2212,43 @@ check_selected_ports_free() {
     if [[ "${HY2_HOP:-}" == 'true' && -n "${HY2_RANGE_START:-}" && -n "${HY2_RANGE_END:-}" ]]; then
         for pair in $pairs; do
             proto=${pair%/*}; p=${pair#*/}
-            if [[ "$proto" == 'udp' ]] && (( p >= HY2_RANGE_START && p <= HY2_RANGE_END )); then
+            if [[ "$proto" == 'udp' ]] && (( 10#$p >= 10#$HY2_RANGE_START && 10#$p <= 10#$HY2_RANGE_END )); then
                 die "端口冲突：HY2 基础 UDP 端口 ($p) 不能落在跳跃区间 (${HY2_RANGE_START}-${HY2_RANGE_END}) 内。"
             fi
         done
     fi
 
+    command -v ss >/dev/null 2>&1 || die '系统缺少 ss，无法可靠检查端口占用。'
     for pair in $pairs; do
         proto=${pair%/*}; p=${pair#*/}
-        holder=$(ss -H -n -l -p -A "$proto" 2>/dev/null | grep -E "[:.]${p}([[:space:]]|$)" || true)
+        if ! holder=$(ss -H -n -l -p -A "$proto" 2>/dev/null); then
+            die "无法检查 ${p}/${proto} 端口占用；ss 查询失败。"
+        fi
+        holder=$(grep -E "[:.]${p}([[:space:]]|$)" <<< "$holder" || true)
         [[ -z "$holder" ]] && continue
         msg "${RED}[!] 新选择端口 ${p}/${proto} 仍被进程占用：${NC}"
-        echo "$holder"
+        printf '%s\n' "$holder"
         die "请先手动释放端口 ${p}/${proto}。"
     done
 
     if [[ "${HY2_HOP:-}" == 'true' && -n "${HY2_RANGE_START:-}" && -n "${HY2_RANGE_END:-}" ]]; then
-        holder=$(ss -H -n -l -p -A udp 2>/dev/null | while read -r line; do
-            p=$(awk '{print $4}' <<< "$line" | sed -nE 's/.*[:.]([0-9]+)$/\1/p')
-            [[ "$p" =~ ^[0-9]+$ ]] || continue
-            if (( p >= HY2_RANGE_START && p <= HY2_RANGE_END )); then
-                echo "$line"
-            fi
-        done || true)
+        local ss_udp_output
+        if ! ss_udp_output=$(ss -H -n -l -p -A udp 2>/dev/null); then
+            die '无法检查 HY2 UDP 跳跃区间占用；ss 查询失败。'
+        fi
+        holder=''
+        if [[ -n "$ss_udp_output" ]]; then
+            while IFS= read -r line; do
+                p=$(awk '{print $4}' <<< "$line" | sed -nE 's/.*[:.]([0-9]+)$/\1/p')
+                [[ "$p" =~ ^[0-9]+$ ]] || continue
+                if (( 10#$p >= 10#$HY2_RANGE_START && 10#$p <= 10#$HY2_RANGE_END )); then
+                    holder+="$line"$'\n'
+                fi
+            done <<< "$ss_udp_output"
+        fi
         if [[ -n "$holder" ]]; then
             msg "${RED}[!] HY2 UDP 跳跃区间 ${HY2_RANGE_START}-${HY2_RANGE_END} 仍被进程占用：${NC}"
-            echo "$holder"
+            printf '%s' "$holder"
             die '请先手动释放 HY2 UDP 跳跃区间内的占用端口。'
         fi
     fi
@@ -2222,12 +2260,16 @@ release_ports() {
     sleep 1
     local pairs pair proto p holder
     pairs=$(selected_port_pairs | awk 'NF' | sort -u)
+    command -v ss >/dev/null 2>&1 || die '系统缺少 ss，无法可靠检查端口占用。'
     for pair in $pairs; do
         proto=${pair%/*}; p=${pair#*/}
-        holder=$(ss -H -n -l -p -A "$proto" 2>/dev/null | grep -E "[:.]${p}([[:space:]]|$)" || true)
+        if ! holder=$(ss -H -n -l -p -A "$proto" 2>/dev/null); then
+            die "无法检查 ${p}/${proto} 端口占用；ss 查询失败。"
+        fi
+        holder=$(grep -E "[:.]${p}([[:space:]]|$)" <<< "$holder" || true)
         [[ -z "$holder" ]] && continue
         msg "${RED}[!] 端口 ${p}/${proto} 仍被进程占用：${NC}"
-        echo "$holder"
+        printf '%s\n' "$holder"
         die "请先手动释放端口 ${p}/${proto}。脚本不会自动 kill 非托管进程。"
     done
 }
@@ -2276,10 +2318,8 @@ install_remote_abox_script_guarded() {
 }
 
 setup_shortcut() {
-    mkdir -p "$ABOX_DIR"
-    if [[ "${1:-}" == 'update' ]]; then
-        install_remote_abox_script_guarded "$SCRIPT_URL" "$ABOX_DIR/A-Box.sh"
-    elif [[ -f "$0" && -r "$0" && "$0" != 'bash' && "$0" != '-bash' ]]; then
+    ensure_abox_dir_owned "$ABOX_DIR" || return 1
+    if [[ -f "$0" && -r "$0" && "$0" != 'bash' && "$0" != '-bash' ]]; then
         validate_abox_script_file "$0" '当前 A-Box 脚本'
         if [[ ! -f "$ABOX_DIR/A-Box.sh" ]] || ! cmp -s "$0" "$ABOX_DIR/A-Box.sh"; then
             install_binary_atomically "$0" "$ABOX_DIR/A-Box.sh" || die '持久化当前脚本失败。'
@@ -2439,13 +2479,8 @@ verify_github_asset_digest() {
 valid_github_download_url() {
     local repo="$1" url="$2"
     local repo_lower="${repo,,}" url_lower="${url,,}"
-    if [[ "$repo_lower" == 'hynetworks/hysteria' || "$repo_lower" == 'apernet/hysteria' ]]; then
-        [[ "$url_lower" == "https://github.com/hynetworks/hysteria/releases/download/"* || \
-           "$url_lower" == "https://github.com/apernet/hysteria/releases/download/"* || \
-           "$url_lower" == "https://github.com/hynetwork/hysteria/releases/download/"* ]]
-    else
-        [[ "$url_lower" == "https://github.com/${repo_lower}/releases/download/"* ]]
-    fi
+    [[ "$repo_lower" =~ ^[a-z0-9_.-]+/[a-z0-9_.-]+$ ]] || return 1
+    [[ "$url_lower" == "https://github.com/${repo_lower}/releases/download/"* ]]
 }
 
 fetch_github_release() {
@@ -2481,7 +2516,6 @@ fetch_github_release() {
         if curl -fLsS --connect-timeout 10 -m 180 "${mirror}${download_url}" -o "$tmp_file"; then
             if ( validate_downloaded_asset "$output_file" "$tmp_file" && verify_github_asset_digest "$tmp_file" "$digest" ); then
                 mv -f "$tmp_file" "$dest_file" || { rm -f "$tmp_file"; die '核心资产原子提交失败。'; }
-                FETCHED_ASSET_PATH="$dest_file"
                 msg "${GREEN}   核心资产提取成功。${NC}"
                 return 0
             fi
@@ -2531,7 +2565,6 @@ fetch_geo_data() {
         die "Geo 数据文件 ${file_name} 看起来是 HTML 错误页。"
     fi
     mv -f "$tmp_out" "$out"
-    FETCHED_GEO_PATH="$out"
 }
 
 desired_state_valid() { [[ "${1:-}" =~ ^(RUNNING|TRAFFIC_BLOCKED|MANUAL_STOPPED|MAINTENANCE)$ ]]; }
@@ -2599,7 +2632,8 @@ reset_protocol_vars() {
 write_file_atomically_from_stdin() {
     local dest="$1" mode="${2:-600}" dir tmp
     [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
-    [[ ! -L "$dest" ]] || return 1
+    [[ ! -e "$dest" && ! -L "$dest" || -f "$dest" ]] || return 1
+    [[ ! -L "$dest" && ! -d "$dest" ]] || return 1
     dir=$(dirname "$dest")
     if [[ ! -d "$dir" ]]; then mkdir -p "$dir" || return 1; fi
     tmp=$(mktemp "${dest}.A-Box-new.XXXXXX") || return 1
@@ -2778,10 +2812,10 @@ ENV=/etc/ddr/.env
 LOCK=/run/A-Box-socket-probe.lock
 STATE=/run/A-Box-socket-probe.fail
 DESIRED=/etc/ddr/.desired_state
-MAIN_LOCK=/etc/ddr/.runtime.lock
-exec 8>"$MAIN_LOCK" || exit 0
+MAIN_LOCK=/run/A-Box.lock
+exec 8>>"$MAIN_LOCK" || exit 0
 flock -n 8 || exit 0
-exec 9>"$LOCK" || exit 0
+exec 9>>"$LOCK" || exit 0
 flock -n 9 || exit 0
 load_state() {
     local parsed key value uid gid mode
@@ -2793,7 +2827,7 @@ load_state() {
     (( (8#$mode & 8#077) == 0 )) || return 1
     command -v python3 >/dev/null 2>&1 || return 1
     parsed=$(umask 077; mktemp /tmp/A-Box-helper-env.XXXXXX) || return 1
-    if ! python3 /dev/fd/3 "$ENV" > "$parsed" 3<<'PY_HELPER_ENV'; then
+    if ! python3 - "$ENV" > "$parsed" <<'PY_HELPER_ENV'; then
 import shlex,sys
 allowed={"CORE","MODE","VLESS_PORT","XHTTP_PORT","HY2_MONITOR_PORT","HY2_HOP","HY2_HOP_IMPL","HY2_RANGE_START","HY2_RANGE_END","INGRESS_IF","SS_PORT","TRAFFIC_LIMIT_GB","TRAFFIC_LIMIT_MODE"}
 seen=set()
@@ -2840,6 +2874,7 @@ service_active_owned() {
 }
 socket_owned_by_pid() {
     local proto="$1" port="$2" pid="$3" flags
+    command -v ss >/dev/null 2>&1 || return 2
     [[ "$port" =~ ^[0-9]+$ && "$pid" =~ ^[0-9]+$ ]] || return 1
     case "$proto" in tcp) flags='-H -nltp' ;; udp) flags='-H -nlup' ;; *) return 1 ;; esac
     # shellcheck disable=SC2086
@@ -2906,8 +2941,8 @@ EOF_PROBE
 
 setup_geo_cron() {
     if ! abox_owns_service xray; then
-        remove_abox_cron_block GEO 2>/dev/null || true
-        rm -f "$ABOX_DIR/geo_update.sh"
+        remove_abox_cron_block GEO || die '无法安全移除 A-Box Geo cron 任务；为避免留下指向不存在脚本的 cron，保留 geo_update.sh 并中止当前操作。'
+        rm -f -- "$ABOX_DIR/geo_update.sh" || die 'Geo 更新脚本删除失败。'
         return 0
     fi
     install -d -m 700 "$ABOX_DIR" || die '无法创建 Geo 更新目录。'
@@ -2918,9 +2953,9 @@ set -o pipefail
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 GEO_REPO='Loyalsoldier/v2ray-rules-dat'
 DESIRED=/etc/ddr/.desired_state
-exec 8>/run/A-Box.lock || exit 1
+exec 8>>/run/A-Box.lock || exit 1
 flock -n 8 || exit 0
-exec 9>/run/A-Box-geo-update.lock || exit 1
+exec 9>>/run/A-Box-geo-update.lock || exit 1
 flock -n 9 || exit 0
 is_systemd() { command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; }
 xray_owned() { local u; if is_systemd; then u=/etc/systemd/system/xray.service; else u=/etc/init.d/xray; fi; [[ -f "$u" && ! -L "$u" ]] && grep -Fxq '# Managed by A-Box' "$u"; }
@@ -2985,7 +3020,7 @@ pre_install_setup() {
     local CORE_IN=$1 MODE_IN=$2
     reset_protocol_vars
     local DEF_V_PORT=443 DEF_X_PORT=8443 DEF_H_PORT=443 DEF_S_PORT=2053
-    local INPUT_V_PORT INPUT_X_PORT INPUT_H_PORT INPUT_H_DOMAIN INPUT_H_HOP INPUT_H_DOWN INPUT_H_UP INPUT_H_MASQ INPUT_S_PORT INPUT_SS_WL INPUT_KA ip prompt
+    local INPUT_H_DOMAIN INPUT_H_HOP INPUT_SS_WL INPUT_KA ip prompt
     local HAS_VISION=false HAS_XHTTP=false HAS_HY2=false HAS_SS=false
     local L_VISION L_XHTTP L_HY2 L_SS L_GLOBAL
     L_VISION=$(proto_label 'VLESS-Vision')
@@ -3005,7 +3040,7 @@ pre_install_setup() {
     [[ -z "$INGRESS_IF" ]] && die '无法识别公网入接口。'
     GLOBAL_PUBLIC_IP=$(refresh_public_ip)
 
-    msg "\n${CYAN}======================================================================${NC}"
+    printf '\n%s\n' "${CYAN}======================================================================${NC}"
     if [[ "${ABOX_LANG:-zh}" == 'en' ]]; then
         msg "${BOLD}Parameter Wizard [Engine: $CORE_IN | Mode: $MODE_IN]${NC}"
     else
@@ -3144,11 +3179,14 @@ pre_install_setup() {
         read -r -ep "   ${L_GLOBAL} 是否开启 TCP KeepAlive (45s) 防治 NAT 空闲断连? [Y/N]: " INPUT_KA
     fi
     is_yes "$INPUT_KA" && ENABLE_KEEPALIVE='true' || ENABLE_KEEPALIVE='false'
-    msg "${CYAN}======================================================================${NC}\n"
+    printf '%s\n\n' "${CYAN}======================================================================${NC}"
 
     check_selected_ports_free
     if [[ "$HAS_HY2" == 'true' && -n "${HY2_DOMAIN:-}" && "${HY2_ACME_TYPE:-http}" == 'http' && ( "$CORE_IN" == 'hysteria' || ( "$CORE_IN" == 'xray' && "$MODE_IN" == *'ALL'* ) ) ]]; then
-        holder=$(ss -H -n -l -p -A tcp 2>/dev/null | grep -E '[:.]80\b' || true)
+        if ! holder=$(ss -H -n -l -p -A tcp 2>/dev/null); then
+            die '无法检查 80/tcp 端口占用；ss 查询失败。'
+        fi
+        holder=$(grep -E '[:.]80\b' <<< "$holder" || true)
         if [[ -n "$holder" ]]; then
             msg "${RED}[!] ACME HTTP-01 需要 80/tcp，但该端口仍被进程占用：${NC}"
             echo "$holder"
@@ -3253,10 +3291,12 @@ build_xray_config() {
         | if ($mode|contains("VISION")) or ($mode|contains("ALL")) or $mode == "VLESS_SS" then . + [vision] else . end
         | if ($mode|contains("XHTTP")) or ($mode|contains("ALL")) then . + [xhttp] else . end
         | if ($mode|contains("SS")) or ($mode|contains("ALL")) or $mode == "VLESS_SS" then . + [ss] else . end
-    ')
+    ') || die 'Xray inbounds JSON 构造失败。'
     out="${XRAY_CONFIG_PATH:-/usr/local/etc/xray/config.json}"
     tmp_out="${out}.tmp.$$"
     mkdir -p "$(dirname "$out")"
+    [[ ! -L "$(dirname "$out")" && ! -L "$out" ]] || die 'Xray 配置路径存在符号链接，拒绝写入。'
+    umask 077
     jq -n --argjson inbounds "$inbounds_json" '{
         log:{loglevel:"warning", access:"/var/log/A-Box-xray-access.log", error:"/var/log/A-Box-xray-error.log"},
         routing:{domainStrategy:"IPIfNonMatch", rules:[
@@ -3266,7 +3306,9 @@ build_xray_config() {
         inbounds:$inbounds,
         outbounds:[{protocol:"freedom", tag:"direct"}, {protocol:"blackhole", tag:"block"}]
     }' > "$tmp_out" || { rm -f "$tmp_out"; die 'Xray JSON 生成失败。'; }
-    mv -f "$tmp_out" "$out"
+    chmod 600 "$tmp_out" || { rm -f "$tmp_out"; die 'Xray 配置权限设置失败。'; }
+    [[ $EUID -eq 0 ]] && chown root:root "$tmp_out" || true
+    mv -f "$tmp_out" "$out" || { rm -f "$tmp_out"; die 'Xray 配置原子提交失败。'; }
 }
 
 build_singbox_config() {
@@ -3297,21 +3339,25 @@ build_singbox_config() {
         []
         | if ($mode|contains("VISION")) or ($mode|contains("ALL")) or $mode == "VLESS_SS" then . + [vision] else . end
         | if ($mode|contains("HY2")) or ($mode|contains("ALL")) then . + [hy2] else . end
-        | if ($mode|contains("SS")) or ($mode|contains("ALL")) or $mode == "VLESS_SS" then . + [ss] else . end')
+        | if ($mode|contains("SS")) or ($mode|contains("ALL")) or $mode == "VLESS_SS" then . + [ss] else . end') || die 'Sing-box inbounds JSON 构造失败。'
     out="${SINGBOX_CONFIG_PATH:-/etc/sing-box/config.json}"
     tmp_out="${out}.tmp.$$"
     mkdir -p "$(dirname "$out")"
+    [[ ! -L "$(dirname "$out")" && ! -L "$out" ]] || die 'Sing-box 配置路径存在符号链接，拒绝写入。'
+    umask 077
     jq -n --argjson inbounds "$inbounds_json" '{
         log:{level:"warn", output:"/var/log/A-Box-singbox.log"},
         route:{rules:[{action:"sniff"},{protocol:"bittorrent", action:"reject"}], auto_detect_interface:true},
         inbounds:$inbounds,
         outbounds:[{type:"direct", tag:"direct"}]
     }' > "$tmp_out" || { rm -f "$tmp_out"; die 'Sing-box JSON 生成失败。'; }
-    mv -f "$tmp_out" "$out"
+    chmod 600 "$tmp_out" || { rm -f "$tmp_out"; die 'Sing-box 配置权限设置失败。'; }
+    [[ $EUID -eq 0 ]] && chown root:root "$tmp_out" || true
+    mv -f "$tmp_out" "$out" || { rm -f "$tmp_out"; die 'Sing-box 配置原子提交失败。'; }
 }
 
 generate_self_signed_cert_atomically() {
-    local key="$1" cert="$2" cn="$3" dir tmp key_tmp cert_tmp pub1 pub2 key_bak='' cert_bak='' committed_key=0
+    local key="$1" cert="$2" cn="$3" dir tmp key_tmp cert_tmp pub1 pub2 key_bak='' cert_bak=''
     dir=$(dirname "$key")
     [[ "$dir" == "$(dirname "$cert")" ]] || return 1
     install -d -m 700 "$dir" || return 1
@@ -3329,7 +3375,6 @@ generate_self_signed_cert_atomically() {
     if [[ -e "$key" ]]; then key_bak="$tmp/key.old"; cp -a -- "$key" "$key_bak" || { rm -rf "$tmp"; return 1; }; fi
     if [[ -e "$cert" ]]; then cert_bak="$tmp/cert.old"; cp -a -- "$cert" "$cert_bak" || { rm -rf "$tmp"; return 1; }; fi
     mv -f -- "$key_tmp" "$key" || { rm -rf "$tmp"; return 1; }
-    committed_key=1
     if ! mv -f -- "$cert_tmp" "$cert"; then
         if [[ -n "$key_bak" ]]; then cp -a -- "$key_bak" "$key"; else rm -f -- "$key"; fi
         [[ -n "$cert_bak" ]] && cp -a -- "$cert_bak" "$cert"
@@ -3407,7 +3452,7 @@ deploy_official_hy2() {
 
     HY2_PASS=$(rand_alnum 20)
     HY2_OBFS=$(rand_alnum 16)
-    mkdir -p /etc/hysteria
+    install -d -m 700 /etc/hysteria || die 'Hysteria 配置目录创建失败。'
 
     if [[ -n "${HY2_DOMAIN:-}" ]]; then
         if [[ "${HY2_ACME_TYPE:-http}" == 'dns' ]]; then
@@ -3510,6 +3555,8 @@ EOF_SVC
 install_file_atomically() {
     local src="$1" dest="$2" mode="${3:-600}" staged dir
     [[ -f "$src" && "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    [[ ! -e "$dest" && ! -L "$dest" || -f "$dest" ]] || return 1
+    [[ ! -L "$dest" && ! -d "$dest" ]] || return 1
     dir=$(dirname "$dest")
     install -d -m 755 "$dir" || return 1
     staged=$(mktemp "${dest}.A-Box-new.XXXXXX") || return 1
@@ -3617,7 +3664,7 @@ commit_deployment_transaction() {
 }
 
 deploy_xray() {
-    local MODE_IN=$1 KEYPAIR PK_LOCAL
+    local MODE_IN=$1 KEYPAIR
     clear; msg "${BOLD}${GREEN}部署 Xray-core [$MODE_IN]${NC}"
     init_system_environment
     load_abox_env "$ABOX_ENV" 2>/dev/null || true
@@ -3655,8 +3702,8 @@ deploy_xray() {
     rm -rf "$xray_tmp"
 
     KEYPAIR=$(/usr/local/bin/xray x25519)
-    PK=$(awk '/Private/{print $NF}' <<< "$KEYPAIR")
-    PBK=$(awk '/Public/{print $NF}' <<< "$KEYPAIR")
+    PK=$(awk '/Private/{print $NF; found=1; exit} /Password/{fallback=$NF} END{if (!found && fallback != "") print fallback}' <<< "$KEYPAIR")
+    PBK=$(awk '/Public/{print $NF; exit}' <<< "$KEYPAIR")
     [[ -n "$PK" && -n "$PBK" ]] || die 'Xray REALITY 密钥生成失败。'
     UUID=$(generate_robust_uuid)
     SHORT_ID=$(openssl rand -hex 4 | tr -d '\n\r')
@@ -3757,8 +3804,8 @@ deploy_singbox() {
     mkdir -p /etc/sing-box
     chmod 700 /etc/sing-box
     KEYPAIR=$(/usr/local/bin/sing-box generate reality-keypair)
-    PK=$(awk '/Private/{print $NF}' <<< "$KEYPAIR")
-    PBK=$(awk '/Public/{print $NF}' <<< "$KEYPAIR")
+    PK=$(awk '/Private/{print $NF; found=1; exit} /Password/{fallback=$NF} END{if (!found && fallback != "") print fallback}' <<< "$KEYPAIR")
+    PBK=$(awk '/Public/{print $NF; exit}' <<< "$KEYPAIR")
     [[ -n "$PK" && -n "$PBK" ]] || die 'Sing-box REALITY 密钥生成失败。'
     UUID=$(generate_robust_uuid)
     SHORT_ID=$(openssl rand -hex 4 | tr -d '\n\r')
@@ -3888,9 +3935,9 @@ PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 ENV=/etc/ddr/.env
 DESIRED=/etc/ddr/.desired_state
 BLOCK_STATE=/etc/ddr/.traffic-block-state
-exec 8>/run/A-Box.lock || exit 1
+exec 8>>/run/A-Box.lock || exit 1
 flock -n 8 || exit 0
-exec 9>/run/A-Box-traffic-monitor.lock || exit 1
+exec 9>>/run/A-Box-traffic-monitor.lock || exit 1
 flock -n 9 || exit 0
 load_state() {
     local parsed key value uid gid mode
@@ -3902,7 +3949,7 @@ load_state() {
     (( (8#$mode & 8#077) == 0 )) || return 1
     command -v python3 >/dev/null 2>&1 || return 1
     parsed=$(umask 077; mktemp /tmp/A-Box-helper-env.XXXXXX) || return 1
-    if ! python3 /dev/fd/3 "$ENV" > "$parsed" 3<<'PY_HELPER_ENV'; then
+    if ! python3 - "$ENV" > "$parsed" <<'PY_HELPER_ENV'; then
 import shlex
 import sys
 allowed = {"CORE", "MODE", "VLESS_PORT", "XHTTP_PORT", "HY2_MONITOR_PORT", "HY2_HOP", "HY2_HOP_IMPL", "HY2_RANGE_START", "HY2_RANGE_END", "SS_PORT", "TRAFFIC_LIMIT_GB", "TRAFFIC_LIMIT_MODE"}
@@ -4039,13 +4086,13 @@ EOF_TRAFFIC
 }
 
 disable_traffic_monitor() {
-    remove_abox_cron_block TRAFFIC
-    rm -f "$ABOX_DIR/traffic_monitor.sh" "$ABOX_TRAFFIC_BLOCK_STATE"
+    remove_abox_cron_block TRAFFIC || return 1
+    rm -f -- "$ABOX_DIR/traffic_monitor.sh" "$ABOX_TRAFFIC_BLOCK_STATE" || return 1
 }
 
 traffic_management_menu() {
     clear
-    local INTERFACE USED_BYTES USED_GB limit_gb mode_choice
+    local INTERFACE limit_gb mode_choice
     INTERFACE=$(get_active_interface)
     msg "${CYAN}======================================================================${NC}"
     msg "${BOLD}${GREEN}每月流量管控限制 / Monthly Traffic Management Limit${NC}"
@@ -4226,7 +4273,14 @@ do_cleanup() {
     remove_owned_auxiliary_path /etc/fail2ban/filter.d/A-Box.conf || die '删除 A-Box Fail2Ban filter 失败。'
     remove_owned_auxiliary_path /etc/logrotate.d/A-Box || die '删除 A-Box logrotate 配置失败。'
     rm -f /var/log/A-Box-*.log 2>/dev/null || die '删除 A-Box 日志失败。'
-    if [[ "${INIT_SYS:-}" == systemd ]]; then systemctl restart fail2ban 2>/dev/null || true; systemctl daemon-reload 2>/dev/null || true; else rc-service fail2ban restart 2>/dev/null || true; fi
+    if [[ "${INIT_SYS:-}" == systemd ]]; then
+        if systemctl list-unit-files fail2ban.service >/dev/null 2>&1 && systemctl cat fail2ban.service >/dev/null 2>&1; then
+            systemctl restart fail2ban >/dev/null 2>&1 || die 'Fail2Ban 重启失败，清理未完成。'
+        fi
+        systemctl daemon-reload >/dev/null 2>&1 || die '清理后 systemd daemon-reload 失败。'
+    elif [[ "${INIT_SYS:-}" == openrc ]] && [[ -x /etc/init.d/fail2ban ]]; then
+        rc-service fail2ban restart >/dev/null 2>&1 || die 'Fail2Ban 重启失败，清理未完成。'
+    fi
     if [[ "${1:-}" == full ]]; then
         remove_abox_shortcut /usr/local/bin/sb
         rm -rf "$ABOX_DIR"
@@ -4257,7 +4311,9 @@ check_virgin_state() {
     remove_owned_auxiliary_path /etc/fail2ban/filter.d/A-Box.conf || die '删除 A-Box Fail2Ban filter 失败。'
     remove_owned_auxiliary_path /etc/logrotate.d/A-Box || die '删除 A-Box logrotate 配置失败。'
     rm -f /var/log/A-Box-*.log 2>/dev/null || die '删除 A-Box 日志失败。'
-    [[ "${INIT_SYS:-}" == systemd ]] && systemctl daemon-reload 2>/dev/null || true
+    if [[ "${INIT_SYS:-}" == systemd ]]; then
+        systemctl daemon-reload >/dev/null 2>&1 || die '环境初始化后的 systemd daemon-reload 失败。'
+    fi
     msg "${GREEN}环境初始化完成；非 A-Box 同名安装未被删除。${NC}"
     pause_return
 }
@@ -4479,7 +4535,7 @@ run_remote_bash_script() {
 
 
 write_sni_candidate_library() {
-    local profile="${1:-full}" out="$2" raw generated tmp remote_tmp max_count variant_count
+    local profile="${1:-full}" out="$2" raw generated tmp append_tmp max_count
     [[ -n "$out" ]] || die 'SNI candidate output path missing.'
     raw=$(mktemp /tmp/A-Box-sni-lib.XXXXXX) || die 'SNI library temporary file creation failed.'
     generated=$(mktemp /tmp/A-Box-sni-lib-generated.XXXXXX) || { rm -f "$raw"; die 'SNI generated library temporary file creation failed.'; }
@@ -8647,7 +8703,8 @@ EOF_SNI_PRIORITY
         grep -E '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$' | \
         awk '!seen[$0]++' > "$generated"
 
-    awk -F. 'NF>=2 {
+    append_tmp=$(mktemp /tmp/A-Box-sni-lib-append.XXXXXX) || { rm -f "$raw" "$generated" "$tmp"; die 'SNI candidate append temporary file creation failed.'; }
+    if ! awk -F. 'NF>=2 {
         base=$(NF-1); apex=base "." $NF
         if (base ~ /^(github|cloudflare|microsoft|google|apache|mozilla|docker|kubernetes|linuxfoundation|cncf|python|rust-lang|golang|go|oracle|ibm|redhat|ubuntu|debian|nginx|postgresql|mongodb|elastic|hashicorp|terraform|confluent|fastly|akamai|digitalocean|linode|vultr|hetzner|ovhcloud|scaleway|openai|anthropic|huggingface|pytorch|tensorflow|ietf|w3|rfc-editor|openssl|curl|gnu|kernel|freebsd|openbsd|netbsd|eclipse|jetbrains|npmjs|nodejs|typescriptlang|redis|sqlite|mysql|wikimedia|wikipedia|archive|stackoverflow|stackexchange|nasa|nist|cisa|stanford|mit|berkeley|cambridge|ox|ethz|epfl|unimelb|sydney|unsw|monash|auckland|cloudfront|amazonaws)$/) print apex
     }' "$generated" | awk '!seen[$0]++' | while IFS= read -r apex; do
@@ -8655,7 +8712,12 @@ EOF_SNI_PRIORITY
             printf '%s.%s\n' "$p" "$apex"
         done
         printf '%s\n' "$apex"
-    done >> "$generated"
+    done > "$append_tmp"; then
+        rm -f "$raw" "$generated" "$tmp" "$append_tmp"
+        die 'SNI candidate variant generation failed.'
+    fi
+    cat "$append_tmp" >> "$generated" || { rm -f "$raw" "$generated" "$tmp" "$append_tmp"; die 'SNI candidate merge failed.'; }
+    rm -f "$append_tmp"
 
     awk 'NF && $0 !~ /^#/ {print tolower($0)}' "$generated" | \
         sed -E 's#^https?://##; s#/.*$##; s/:443$//; s/[[:space:]]//g' | \
@@ -8684,9 +8746,9 @@ EOF_SNI_PRIORITY
 sni_domain_penalty() {
     local domain="${1,,}" penalty=0
     case "$domain" in
-        *.apple.com|*.icloud.com|www.apple.com|www.icloud.com) penalty=$((penalty + 1800)) ;;
+        www.apple.com|www.icloud.com) penalty=$((penalty + 1800)) ;;
         www.nike.com|www.adidas.com|www.amazon.com|www.google.com|www.youtube.com|www.netflix.com) penalty=$((penalty + 500)) ;;
-        *.google.com|*.gstatic.com|*.googleapis.com|*.youtube.com|*.facebook.com|*.instagram.com|*.twitter.com|*.x.com|*.tiktok.com|*.telegram.org|*.whatsapp.com|*.wikipedia.org|*.wikimedia.org|*.openai.com|*.anthropic.com|*.huggingface.co|*.torproject.org|*.nist.gov|*.cisa.gov|*.github.com|*.apple.com|*.icloud.com|*.doubleclick.net|*.googlesyndication.com|*.googleadservices.com) penalty=$((penalty + 2400)) ;;
+        *.google.com|*.gstatic.com|*.googleapis.com|*.youtube.com|*.facebook.com|*.instagram.com|*.twitter.com|*.x.com|*.tiktok.com|*.telegram.org|*.whatsapp.com|*.wikipedia.org|*.wikimedia.org|*.openai.com|*.anthropic.com|*.huggingface.co|*.torproject.org|*.nist.gov|*.cisa.gov|*.github.com|*.apple.com|*.icloud.com|apple.com|icloud.com|github.com|*.doubleclick.net|*.googlesyndication.com|*.googleadservices.com) penalty=$((penalty + 2400)) ;;
     esac
     case "$domain" in
         *.microsoft.com|*.bing.com|*.apache.org|*.ietf.org|*.rfc-editor.org|*.w3.org|*.unicode.org|*.icann.org|*.iana.org|*.iso.org|*.itu.int|*.nginx.org|*.openssl.org|*.curl.se|*.kernel.org|*.debian.org|*.ubuntu.com|*.linuxfoundation.org|*.cncf.io|*.cloudflare.com|*.akamai.com|*.fastly.com) penalty=$((penalty - 220)) ;;
@@ -8828,7 +8890,7 @@ sni_verify_raw_report() {
 }
 
 run_builtin_sni_radar() {
-    local profile="${1:-full}" title="${2:-Local SNI preference}" workdir candidates raw raw_sorted report total concurrency timeout_s running=0 domain topn verify_limit processed=0 valid_count=0 batch_start progress_every
+    local profile="${1:-full}" title="${2:-Local SNI preference}" workdir candidates raw raw_sorted report total concurrency timeout_s running=0 domain topn verify_limit processed=0 valid_count=0 progress_every
     workdir=$(mktemp -d /tmp/A-Box-sni-radar.XXXXXX) || die 'SNI radar temporary directory creation failed.'
     candidates="$workdir/candidates.txt"
     raw="$workdir/results.raw.tsv"
@@ -9003,12 +9065,13 @@ setup_swap_2g() {
 
 redact_secrets_stream() {
     if command -v python3 >/dev/null 2>&1; then
-        python3 /dev/fd/3 3<<'PY_REDACT'
+        python3 - 3<&0 <<'PY_REDACT'
 import json
+import os
 import re
 import sys
 
-text = sys.stdin.read()
+text = os.fdopen(3, "r", encoding="utf-8", errors="strict").read()
 secret = re.compile(
     r"(uuid|private.?key|password|passwd|token|secret|api.?key|authorization|cookie|ss_pass|hy2_pass|hy2_obfs)",
     re.I,
@@ -9105,35 +9168,99 @@ collect_abox_cron() {
     rm -f "$all" "$err" "$extracted"
 }
 
+read_crontab_to_file() {
+    local out="$1" err
+    [[ -n "$out" ]] || return 1
+    err=$(umask 077; mktemp /tmp/A-Box-crontab-error.XXXXXX) || return 1
+    if LC_ALL=C crontab -l > "$out" 2> "$err"; then
+        rm -f -- "$err"
+        return 0
+    elif grep -Eqi 'no crontab|no crontab for' "$err"; then
+        : > "$out"
+        rm -f -- "$err"
+        return 0
+    fi
+    rm -f -- "$err"
+    return 1
+}
+
+strip_abox_cron_blocks_from_file() {
+    local input="$1" output="$2" name="${3:-}"
+    [[ -f "$input" && ! -L "$input" && -n "$output" ]] || return 1
+    awk -v wanted="$name" '
+      BEGIN { skip=0; seen_wanted=0 }
+      {
+        if (wanted != "" && $0 == "# A-Box " wanted " BEGIN") { skip=1; seen_wanted=seen_wanted+1; next }
+        if (wanted != "" && $0 == "# A-Box " wanted " END") { if (!skip) exit 1; skip=0; next }
+        if (wanted == "" && $0 ~ /^# A-Box (PROBE|GEO|TRAFFIC) BEGIN$/) { skip=1; next }
+        if (wanted == "" && $0 ~ /^# A-Box (PROBE|GEO|TRAFFIC) END$/) { if (!skip) exit 1; skip=0; next }
+        if (skip) next
+        if ($0 == "* * * * * /usr/bin/flock -n /run/A-Box-probe-cron.lock /bin/bash /etc/ddr/socket_probe.sh >/dev/null 2>&1") next
+        if ($0 == "0 3 * * 1 /usr/bin/flock -n /run/A-Box-geo-cron.lock /bin/bash /etc/ddr/geo_update.sh >/dev/null 2>&1") next
+        if ($0 == "* * * * * /bin/bash /etc/ddr/traffic_monitor.sh >/dev/null 2>&1") next
+        print
+      }
+      END { if (skip) exit 1; if (wanted != "" && seen_wanted > 1) exit 1 }
+    ' "$input" > "$output" || return 1
+}
+
 install_abox_cron_block() {
-    local name="$1" line="$2" tmp
+    local name="$1" line="$2" current tmp
     [[ -n "$name" && -n "$line" ]] || return 1
-    tmp=$(mktemp) || die 'crontab 临时文件创建失败。'
-    crontab -l 2>/dev/null | sed "/^# A-Box ${name} BEGIN$/,/^# A-Box ${name} END$/d" > "$tmp" || true
+    current=$(mktemp) || die 'crontab 当前内容临时文件创建失败。'
+    tmp=$(mktemp) || { rm -f -- "$current"; die 'crontab 临时文件创建失败。'; }
+    if ! read_crontab_to_file "$current"; then
+        rm -f -- "$current" "$tmp"
+        die '无法读取现有 crontab；为避免覆盖用户任务，已中止。'
+    fi
+    if ! strip_abox_cron_blocks_from_file "$current" "$tmp" "$name"; then
+        rm -f -- "$current" "$tmp"
+        die "现有 crontab 中的 A-Box ${name} 区块格式异常；为避免破坏计划任务，已中止。"
+    fi
     {
-        echo "# A-Box ${name} BEGIN"
-        echo "$line"
-        echo "# A-Box ${name} END"
-    } >> "$tmp"
-    crontab "$tmp" 2>/dev/null || die 'crontab 写入失败。'
-    rm -f "$tmp"
+        printf '%s\n' "# A-Box ${name} BEGIN"
+        printf '%s\n' "$line"
+        printf '%s\n' "# A-Box ${name} END"
+    } >> "$tmp" || { rm -f -- "$current" "$tmp"; die 'crontab 临时内容写入失败。'; }
+    if ! crontab "$tmp" >/dev/null 2>&1; then
+        rm -f -- "$current" "$tmp"
+        die 'crontab 写入失败；原有 crontab 未被覆盖。'
+    fi
+    rm -f -- "$current" "$tmp"
 }
 
 remove_abox_cron_block() {
-    local name="$1" tmp rc=0
-    tmp=$(mktemp) || die 'crontab 临时文件创建失败。'
-    crontab -l 2>/dev/null | sed "/^# A-Box ${name} BEGIN$/,/^# A-Box ${name} END$/d" | grep -vE "/etc/ddr/(traffic_monitor|geo_update|socket_probe)\.sh" > "$tmp" || true
-    crontab "$tmp" 2>/dev/null || rc=1
-    rm -f "$tmp"
+    local name="$1" current tmp rc=0
+    [[ -n "$name" ]] || return 1
+    current=$(mktemp) || die 'crontab 当前内容临时文件创建失败。'
+    tmp=$(mktemp) || { rm -f -- "$current"; die 'crontab 临时文件创建失败。'; }
+    if ! read_crontab_to_file "$current"; then
+        rm -f -- "$current" "$tmp"
+        return 1
+    fi
+    if ! strip_abox_cron_blocks_from_file "$current" "$tmp" "$name"; then
+        rm -f -- "$current" "$tmp"
+        return 1
+    fi
+    crontab "$tmp" >/dev/null 2>&1 || rc=1
+    rm -f -- "$current" "$tmp"
     return "$rc"
 }
 
 remove_all_abox_cron_blocks() {
-    local tmp rc=0
-    tmp=$(mktemp) || die 'crontab 临时文件创建失败。'
-    crontab -l 2>/dev/null | sed '/^# A-Box .* BEGIN$/,/^# A-Box .* END$/d' | grep -vE "/etc/ddr/(traffic_monitor|geo_update|socket_probe)\.sh" > "$tmp" || true
-    crontab "$tmp" 2>/dev/null || rc=1
-    rm -f "$tmp"
+    local current tmp rc=0
+    current=$(mktemp) || die 'crontab 当前内容临时文件创建失败。'
+    tmp=$(mktemp) || { rm -f -- "$current"; die 'crontab 临时文件创建失败。'; }
+    if ! read_crontab_to_file "$current"; then
+        rm -f -- "$current" "$tmp"
+        return 1
+    fi
+    if ! strip_abox_cron_blocks_from_file "$current" "$tmp"; then
+        rm -f -- "$current" "$tmp"
+        return 1
+    fi
+    crontab "$tmp" >/dev/null 2>&1 || rc=1
+    rm -f -- "$current" "$tmp"
     return "$rc"
 }
 
@@ -9371,7 +9498,8 @@ install_recovery_backup_key() {
 }
 
 prepare_backup_auth_for_manual_restore() {
-    local archive="$1" hmac="${archive}.hmac" recovery="${archive}.key" rc fingerprint answer
+    local archive="$1" rc fingerprint answer
+    local hmac="${archive}.hmac" recovery="${archive}.key"
     if backup_auth_verify "$archive" "$hmac"; then return 0; else rc=$?; fi
     # Never replace an existing trust key automatically. A mismatch may mean
     # the user selected a foreign or malicious backup.
@@ -9839,7 +9967,7 @@ restore_cron_from_file() {
     elif grep -Eqi 'no crontab|no crontab for' "$err"; then : > "$current"
     else rm -f "$tmp" "$current" "$err"; return 1
     fi
-    sed '/^# A-Box .* BEGIN$/,/^# A-Box .* END$/d' "$current" | grep -vE '/etc/ddr/(traffic_monitor|geo_update|socket_probe)\.sh' > "$tmp" || true
+    strip_abox_cron_blocks_from_file "$current" "$tmp" || { rm -f "$tmp" "$current" "$err"; return 1; }
     cat "$f" >> "$tmp" || { rm -f "$tmp" "$current" "$err"; return 1; }
     crontab "$tmp"
     local rc=$?
@@ -9848,7 +9976,7 @@ restore_cron_from_file() {
 }
 
 backup_current_config() {
-    local ts unique backup_dir work root tarball backup_failed=0 backend srv path
+    local ts unique backup_dir work root tarball backup_failed=0 backend srv path _abox_links _old_backups
     ts=$(date +%Y%m%d-%H%M%S); unique=$(openssl rand -hex 3 2>/dev/null || printf '%s' "$$")
     backup_dir="${1:-$ABOX_DIR/backups}"
     work=$(mktemp -d /tmp/A-Box-backup.XXXXXX) || die 'Backup temp directory creation failed.'
@@ -10098,7 +10226,7 @@ backup_restore_menu() {
 }
 
 export_diagnostic_bundle() {
-    local ts diag_dir work bundle checksum safe_mode
+    local ts diag_dir work bundle checksum
     ts=$(date +%Y%m%d-%H%M%S)
     diag_dir="$ABOX_DIR/diagnostics"
     work=$(mktemp -d /tmp/A-Box-diagnostic.XXXXXX) || die 'Diagnostic temp directory creation failed.'
@@ -10220,23 +10348,32 @@ preflight_check() {
     fi
 
     load_abox_env "$ABOX_ENV" 2>/dev/null || true
-    for proto in tcp udp; do
-        for port in 443 8443 2053 ${VLESS_PORT:-} ${XHTTP_PORT:-} ${HY2_BASE_PORT:-} ${SS_PORT:-}; do
-            [[ "$port" =~ ^[0-9]+$ ]] || continue
-            holder=$(ss -H -n -l -p -A "$proto" 2>/dev/null | grep -E "[:.]${port}\b" || true)
-            if [[ -n "$holder" ]]; then
-                local managed_owner
-                managed_owner=$(managed_socket_owner_for_port "$proto" "$port" 2>/dev/null || true)
-                if [[ -n "$managed_owner" ]]; then
-                    pf_pass "${port}/${proto} occupied by managed A-Box service: ${managed_owner}"
-                else
-                    pf_warn "${port}/${proto} occupied by foreign or unresolved process: $(head -n 1 <<< "$holder")"
-                fi
-            else
-                pf_pass "${port}/${proto} available"
+    if ! command -v ss >/dev/null 2>&1; then
+        pf_warn 'ss is unavailable; port occupancy audit skipped'
+    else
+        for proto in tcp udp; do
+            local preflight_ss_output
+            if ! preflight_ss_output=$(ss -H -n -l -p -A "$proto" 2>/dev/null); then
+                pf_warn "ss failed for ${proto}; port occupancy audit skipped for ${proto}"
+                continue
             fi
+            for port in 443 8443 2053 ${VLESS_PORT:-} ${XHTTP_PORT:-} ${HY2_BASE_PORT:-} ${SS_PORT:-}; do
+                [[ "$port" =~ ^[0-9]+$ ]] || continue
+                local holder managed_owner
+                holder=$(grep -E "[:.]${port}([[:space:]]|$)" <<< "$preflight_ss_output" || true)
+                if [[ -n "$holder" ]]; then
+                    managed_owner=$(managed_socket_owner_for_port "$proto" "$port" 2>/dev/null || true)
+                    if [[ -n "$managed_owner" ]]; then
+                        pf_pass "${port}/${proto} occupied by managed A-Box service: ${managed_owner}"
+                    else
+                        pf_warn "${port}/${proto} occupied by foreign or unresolved process: $(head -n 1 <<< "$holder")"
+                    fi
+                else
+                    pf_pass "${port}/${proto} available"
+                fi
+            done
         done
-    done
+    fi
 
     managed_services_active && pf_warn 'existing A-Box managed service is active' || pf_pass 'no active A-Box managed service detected'
     if [[ -L "$ABOX_DIR" ]]; then
@@ -10369,10 +10506,29 @@ EOF_TLS
 }
 
 write_clash_yaml() {
-    local out="${CLASH_YAML_PATH:-$ABOX_DIR/A-Box-clash.yaml}" S_IP="$LINK_IP" hy2_name="A-Box-Hy2-Self"
+    local out="${CLASH_YAML_PATH:-$ABOX_DIR/A-Box-clash.yaml}" S_IP="$LINK_IP" hy2_name="A-Box-Hy2-Self" tmp_out out_real base_real
+    local hy2_pass_yaml hy2_obfs_yaml ss_pass_yaml
+    [[ -n "$out" && "$out" == /* ]] || return 1
     [[ -n "${HY2_DOMAIN:-}" ]] && S_IP="$HY2_DOMAIN"
     [[ -n "${HY2_DOMAIN:-}" && "${CORE:-}" != 'singbox' ]] && hy2_name='A-Box-Hy2-ACME'
-    mkdir -p "$ABOX_DIR"
+    ensure_abox_dir_owned "$ABOX_DIR" || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    base_real=$(python3 - "$ABOX_DIR" <<'PY_CLASH_REALPATH'
+import os, sys
+print(os.path.realpath(sys.argv[1]))
+PY_CLASH_REALPATH
+) || return 1
+    out_real=$(python3 - "$out" <<'PY_CLASH_REALPATH'
+import os, sys
+print(os.path.realpath(sys.argv[1]))
+PY_CLASH_REALPATH
+) || return 1
+    [[ "$out_real" == "$base_real"/* ]] || return 1
+    [[ ! -L "$out" ]] || return 1
+    tmp_out=$(mktemp "$base_real/.A-Box-clash-new.XXXXXX") || return 1
+    hy2_pass_yaml=$(json_escape "${HY2_PASS:-}") || return 1
+    hy2_obfs_yaml=$(json_escape "${HY2_OBFS:-}") || return 1
+    ss_pass_yaml=$(json_escape "${SS_PASS:-}") || return 1
     {
         cat <<EOF_CLASH
 mixed-port: 7890
@@ -10452,12 +10608,12 @@ EOF_CLASH
     server: "$HY2_DOMAIN"
     ports: ${HY2_CLASH_PORTS}
     hop-interval: 30
-    password: "$HY2_PASS"
+    password: ${hy2_pass_yaml}
     alpn:
       - h3
     sni: "$HY2_DOMAIN"
     obfs: salamander
-    obfs-password: "$HY2_OBFS"
+    obfs-password: ${hy2_obfs_yaml}
 EOF_CLASH
                 else
                     cat <<EOF_CLASH
@@ -10465,12 +10621,12 @@ EOF_CLASH
     type: hysteria2
     server: "$HY2_DOMAIN"
     port: $HY2_BASE_PORT
-    password: "$HY2_PASS"
+    password: ${hy2_pass_yaml}
     alpn:
       - h3
     sni: "$HY2_DOMAIN"
     obfs: salamander
-    obfs-password: "$HY2_OBFS"
+    obfs-password: ${hy2_obfs_yaml}
 EOF_CLASH
                 fi
             else
@@ -10481,13 +10637,13 @@ EOF_CLASH
     server: "$S_IP"
     ports: ${HY2_CLASH_PORTS}
     hop-interval: 30
-    password: "$HY2_PASS"
+    password: ${hy2_pass_yaml}
     alpn:
       - h3
     skip-cert-verify: true
     fingerprint: "$HY2_CERT_SHA256_FP"
     obfs: salamander
-    obfs-password: "$HY2_OBFS"
+    obfs-password: ${hy2_obfs_yaml}
 EOF_CLASH
                 else
                     cat <<EOF_CLASH
@@ -10495,13 +10651,13 @@ EOF_CLASH
     type: hysteria2
     server: "$S_IP"
     port: $HY2_BASE_PORT
-    password: "$HY2_PASS"
+    password: ${hy2_pass_yaml}
     alpn:
       - h3
     skip-cert-verify: true
     fingerprint: "$HY2_CERT_SHA256_FP"
     obfs: salamander
-    obfs-password: "$HY2_OBFS"
+    obfs-password: ${hy2_obfs_yaml}
 EOF_CLASH
                 fi
             fi
@@ -10513,7 +10669,7 @@ EOF_CLASH
     server: "$LINK_IP"
     port: $SS_PORT
     cipher: 2022-blake3-aes-128-gcm
-    password: "$SS_PASS"
+    password: ${ss_pass_yaml}
     udp: true
     smux:
       enabled: false
@@ -10536,17 +10692,20 @@ EOF_CLASH
 rules:
   - MATCH,PROXY
 EOF_CLASH
-    } > "$out"
-    chmod 600 "$out"
+    } > "$tmp_out" || { rm -f -- "$tmp_out"; return 1; }
+    chmod 600 "$tmp_out" || { rm -f -- "$tmp_out"; return 1; }
+    [[ $EUID -eq 0 ]] && chown root:root "$tmp_out" || true
+    mv -f -- "$tmp_out" "$out" || { rm -f -- "$tmp_out"; return 1; }
+    chmod 600 "$out" || return 1
     printf '%s\n' "$out"
 }
 
 generate_qr() {
     local url=$1
     if command -v qrencode >/dev/null 2>&1; then
-        msg "\n${CYAN}================ 扫码导入 / Scan QR Code =================${NC}"
+        printf '\n%s\n' "${CYAN}================ 扫码导入 / Scan QR Code =================${NC}"
         printf '%s' "$url" | qrencode -s 1 -m 2 -t UTF8
-        msg "${CYAN}==========================================================${NC}\n"
+        printf '%s\n\n' "${CYAN}==========================================================${NC}"
     fi
 }
 
@@ -10603,7 +10762,7 @@ view_config() {
         generate_qr "$SS_URL"
     fi
 
-    CLASH_FILE=$(write_clash_yaml)
+    CLASH_FILE=$(write_clash_yaml) || die 'Clash/Mihomo YAML 配置生成失败。'
     CLASH_SUB_URL="${ABOX_CLASH_SUB_URL:-${CLASH_SUB_URL:-}}"
     msg "${BLUE}----------------------------------------------------------------------${NC}"
     msg "${YELLOW}[ Clash / Mihomo 完整配置 ]${NC}"
@@ -10624,7 +10783,7 @@ view_config() {
     msg "${YELLOW}[ Clash / Mihomo YAML 预览 ]${NC}"
     sed -n '1,220p' "$CLASH_FILE" 2>/dev/null || true
 
-    msg "\n${YELLOW}--- Sing-box 出站示例 ---${NC}"
+    printf '\n%s\n' "${YELLOW}--- Sing-box 出站示例 ---${NC}"
     if [[ "$MODE" == *'HY2'* || "$MODE" == *'ALL'* ]]; then
         S_IP="$LINK_IP"
         [[ -n "${HY2_DOMAIN:-}" ]] && S_IP="$HY2_DOMAIN"
@@ -10671,7 +10830,7 @@ EOF_SB
 EOF_SB
     fi
     if [[ "$CORE" == 'xray' && ( "$MODE" == *'XHTTP'* || "$MODE" == *'ALL'* ) ]]; then
-        msg "\n${YELLOW}--- v2rayN / v2rayNG XHTTP JSON ---${NC}"
+        printf '\n%s\n' "${YELLOW}--- v2rayN / v2rayNG XHTTP JSON ---${NC}"
         cat <<EOF_V2N
 {
   "v": "2",
@@ -10908,7 +11067,7 @@ restart_service_soft() {
     local srv="$1"
     abox_owns_service "$srv" || return 1
     if [[ "${INIT_SYS:-}" == 'systemd' ]]; then
-        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl daemon-reload >/dev/null 2>&1 || return 1
         systemctl restart "$srv" >/dev/null 2>&1 || return 1
         sleep 2
         systemctl is-active --quiet "$srv" || return 1
@@ -11418,13 +11577,54 @@ run_self_tests() {
     declare -F install_remote_abox_script_guarded >/dev/null 2>&1 || { echo 'FAIL: guarded remote shortcut installer missing'; failures=$((failures + 1)); }
     declare -F validate_fail2ban_config_or_die >/dev/null 2>&1 || { echo 'FAIL: fail2ban validation gate missing'; failures=$((failures + 1)); }
     ( verify_github_asset_digest /dev/null '' ) >/dev/null 2>&1 && { echo 'FAIL: missing GitHub digest must be rejected'; failures=$((failures + 1)); }
-    grep -q "GitHub Release asset digest missing; by"'passed' "$0" && { echo 'FAIL: unsigned GitHub asset bypass must not exist'; failures=$((failures + 1)); }
     ( ABOX_ASSUME_YES_OTA=1 confirm_ota_script_hash 0000000000000000000000000000000000000000000000000000000000000000 https://example.com/script.sh ) >/dev/null 2>&1 && { echo 'FAIL: ABOX_ASSUME_YES_OTA must be rejected without allowlist'; failures=$((failures + 1)); }
 
     [[ "$(normalize_port_spec 020000-025000)" == '20000:25000' ]] || { echo 'FAIL: normalize port range'; failures=$((failures + 1)); }
+    [[ "$(sni_domain_penalty www.apple.com)" == '1800' ]] || { echo 'FAIL: Apple www SNI penalty'; failures=$((failures + 1)); }
+    [[ "$(sni_domain_penalty maps.apple.com)" == '2400' ]] || { echo 'FAIL: Apple subdomain SNI penalty'; failures=$((failures + 1)); }
+    [[ "$(sni_domain_penalty apple.com)" == '2400' ]] || { echo 'FAIL: Apple apex SNI penalty'; failures=$((failures + 1)); }
+    [[ "$(sni_domain_penalty github.com)" == '2400' ]] || { echo 'FAIL: GitHub apex SNI penalty'; failures=$((failures + 1)); }
+    grep -q 'MAIN_LOCK=/run/A-Box.lock' "$0" || { echo 'FAIL: health probe must share main runtime lock'; failures=$((failures + 1)); }
+    grep -q 'command -v ss >/dev/null 2>&1 || return 2' "$0" || { echo 'FAIL: health probe must not restart services when ss is unavailable'; failures=$((failures + 1)); }
+    ! grep -q '^    \[\[ -d /run/systemd/system \]\] && return 0$' "$0" || { echo 'FAIL: systemd detection must not trust /run/systemd/system alone'; failures=$((failures + 1)); }
+    cron_guard_in=$(mktemp /tmp/A-Box-selftest-cron-in.XXXXXX) || { echo 'FAIL: cron regression temp creation'; failures=$((failures + 1)); return 1; }
+    cron_guard_out=$(mktemp /tmp/A-Box-selftest-cron-out.XXXXXX) || { rm -f "$cron_guard_in"; echo 'FAIL: cron regression temp creation'; failures=$((failures + 1)); return 1; }
+    printf '%s\n' '*/5 * * * * /usr/local/bin/user-job /etc/ddr/geo_update.sh --keep-this' '* * * * * /usr/bin/flock -n /run/A-Box-geo-cron.lock /bin/bash /etc/ddr/geo_update.sh >/dev/null 2>&1' '# A-Box GEO BEGIN' '0 3 * * 1 /usr/bin/flock -n /run/A-Box-geo-cron.lock /bin/bash /etc/ddr/geo_update.sh >/dev/null 2>&1' '# A-Box GEO END' > "$cron_guard_in"
+    strip_abox_cron_blocks_from_file "$cron_guard_in" "$cron_guard_out" GEO || { rm -f "$cron_guard_in" "$cron_guard_out"; echo 'FAIL: cron exact-command cleanup'; failures=$((failures + 1)); }
+    grep -Fxq '*/5 * * * * /usr/local/bin/user-job /etc/ddr/geo_update.sh --keep-this' "$cron_guard_out" || { echo 'FAIL: cron cleanup removed a user-owned command containing an A-Box path'; failures=$((failures + 1)); }
+    ! grep -Fxq '0 3 * * 1 /usr/bin/flock -n /run/A-Box-geo-cron.lock /bin/bash /etc/ddr/geo_update.sh >/dev/null 2>&1' "$cron_guard_out" || { echo 'FAIL: A-Box legacy GEO cron was not removed'; failures=$((failures + 1)); }
+    rm -f "$cron_guard_in" "$cron_guard_out"
+    static_body=$(mktemp /tmp/A-Box-selftest-static.XXXXXX) || { echo 'FAIL: self-test static filter temp creation'; failures=$((failures + 1)); return 1; }
+    awk '
+      /^run_self_tests\(\)/ {skip=1}
+      /^main\(\) \{/ {skip=0}
+      !skip {print}
+    ' "$0" > "$static_body" || { rm -f "$static_body"; echo 'FAIL: self-test static filter'; failures=$((failures + 1)); return 1; }
+    grep -Eq 'crontab -l[^\n]*\|.*\|\| true' "$static_body" && { rm -f "$static_body"; echo 'FAIL: crontab read failure must not be swallowed'; failures=$((failures + 1)); return 1; }
+    grep -Eq 'remove_abox_cron_block GEO 2>/dev/null \|\| true' "$static_body" && { rm -f "$static_body"; echo 'FAIL: Geo cron removal failure must not be swallowed'; failures=$((failures + 1)); return 1; }
+    rm -f "$static_body"
+    _devfd_pattern='/dev/''fd/3'; ! grep -q "python3 ${_devfd_pattern}" "$0" || { echo 'FAIL: /dev/fd/3 portability dependency remains'; failures=$((failures + 1)); }
+    unset _devfd_pattern
     [[ "$(port_spec_for_firewalld 20000:25000)" == '20000-25000' ]] || { echo 'FAIL: firewalld range conversion'; failures=$((failures + 1)); }
+    mkdir -p "$tmp/atomic-dest-dir"
+    printf '%s\n' 'payload' > "$tmp/atomic.src2"
+    assert_bad install_file_atomically "$tmp/atomic.src2" "$tmp/atomic-dest-dir" 600
+    printf '%s\n' 'payload' | (write_file_atomically_from_stdin "$tmp/atomic-dest-dir" 600 >/dev/null 2>&1) && { echo 'FAIL: atomic stdin writer accepted destination directory'; failures=$((failures + 1)); }
+    printf '%s\n' '#!/usr/bin/env bash' 'echo /etc/ddr/A-Box.sh' > "$tmp/foreign-shortcut.sh"
+    ! auxiliary_content_is_abox_managed "$tmp/foreign-shortcut.sh" /usr/local/bin/sb || { echo 'FAIL: arbitrary shortcut mentioning A-Box path was treated as managed'; failures=$((failures + 1)); }
+    printf '%s\n' '#!/usr/bin/env bash' 'exec bash /etc/ddr/A-Box.sh "$@"' 'exec sudo bash /etc/ddr/A-Box.sh "$@"' > "$tmp/legacy-shortcut.sh"
+    auxiliary_content_is_abox_managed "$tmp/legacy-shortcut.sh" /usr/local/bin/sb || { echo 'FAIL: valid legacy shortcut fingerprint was rejected'; failures=$((failures + 1)); }
     assert_ok valid_port_spec 20000:25000
     assert_bad valid_port_spec 25000:20000
+    CORE=singbox MODE=HY2 HY2_BASE_PORT=443 HY2_UP=100 HY2_DOWN=1000 HY2_HOP=false HY2_HOP_IMPL=none
+    validate_abox_env_semantics >/dev/null 2>&1 || { echo 'FAIL: valid HY2 bandwidth state'; failures=$((failures + 1)); }
+    HY2_UP='not-a-number'
+    validate_abox_env_semantics >/dev/null 2>&1 && { echo 'FAIL: invalid HY2 bandwidth state accepted'; failures=$((failures + 1)); }
+    unset CORE MODE HY2_BASE_PORT HY2_UP HY2_DOWN HY2_HOP HY2_HOP_IMPL
+    assert_ok valid_github_download_url XTLS/Xray-core https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip
+    assert_bad valid_github_download_url XTLS/Xray-core https://github.com/SagerNet/sing-box/releases/download/v1.14.1/Xray-linux-64.zip
+    [[ "$(msg 'literal\nbackslash\ttext')" == $'literal\\nbackslash\\ttext' ]] || { echo 'FAIL: msg must not reinterpret backslash escapes'; failures=$((failures + 1)); }
+    [[ "$(msg "${RED}X${NC}")" == $'\033[0;31mX\033[0m' ]] || { echo 'FAIL: ANSI color escapes must remain functional'; failures=$((failures + 1)); }
 
     local redacted
     redacted=$(printf '%s
@@ -11510,6 +11710,7 @@ EOF_SELFTEST_IPT
     mkdir -p "$tmp/xray" "$tmp/sing-box"
     XRAY_CONFIG_PATH="$tmp/xray/config.json" build_xray_config ALL
     jq empty "$tmp/xray/config.json" >/dev/null 2>&1 || { echo 'FAIL: build_xray_config JSON'; failures=$((failures + 1)); }
+    [[ "$(stat -c %a "$tmp/xray/config.json" 2>/dev/null)" == '600' ]] || { echo 'FAIL: Xray config permissions must be 0600'; failures=$((failures + 1)); }
     local saved_vision_sni="$VISION_SNI" saved_vless_sni="$VLESS_SNI"
     unset VISION_SNI VLESS_SNI
     XRAY_CONFIG_PATH="$tmp/xray/default-sni.json" build_xray_config VISION
@@ -11523,15 +11724,33 @@ EOF_SELFTEST_IPT
     assert_bad valid_github_download_url HyNetworks/hysteria https://example.com/HyNetworks/hysteria/releases/download/app/v2.12.2/hysteria-linux-amd64
     SINGBOX_CONFIG_PATH="$tmp/sing-box/config.json" build_singbox_config ALL
     jq empty "$tmp/sing-box/config.json" >/dev/null 2>&1 || { echo 'FAIL: build_singbox_config JSON'; failures=$((failures + 1)); }
+    [[ "$(stat -c %a "$tmp/sing-box/config.json" 2>/dev/null)" == '600' ]] || { echo 'FAIL: Sing-box config permissions must be 0600'; failures=$((failures + 1)); }
     jq -e '.inbounds[] | select(.type=="shadowsocks" and .listen_port==2053 and (.network|not))' "$tmp/sing-box/config.json" >/dev/null 2>&1 || { echo 'FAIL: Sing-box SS-2022 2053 default network'; failures=$((failures + 1)); }
     jq -e 'all(.inbounds[]; .type != "xhttp")' "$tmp/sing-box/config.json" >/dev/null 2>&1 || { echo 'FAIL: Sing-box ALL must not include XHTTP'; failures=$((failures + 1)); }
     jq -e '(.route.rules[] | select(.action=="sniff")) and (.route.rules[] | select(.protocol=="bittorrent" and .action=="reject"))' "$tmp/sing-box/config.json" >/dev/null 2>&1 || { echo 'FAIL: Sing-box sniff/reject route action'; failures=$((failures + 1)); }
     jq -e 'all(.outbounds[]; .type != "block")' "$tmp/sing-box/config.json" >/dev/null 2>&1 || { echo 'FAIL: Sing-box legacy block outbound remains'; failures=$((failures + 1)); }
-    ABOX_DIR="$tmp" ABOX_ENV="$tmp/.env" CORE=xray MODE=ALL PUBLIC_KEY=publickey LINK_IP=203.0.113.10 HY2_DOMAIN= HY2_HOP=false HY2_CERT_SHA256_FP=abcdef HY2_CERT_PUBKEY_SHA256_B64=abcdef CLASH_YAML_PATH="$tmp/A-Box-clash.yaml" write_clash_yaml >/dev/null
-    grep -q '^proxy-groups:' "$tmp/A-Box-clash.yaml" || { echo 'FAIL: Clash YAML proxy-groups'; failures=$((failures + 1)); }
-    grep -q '^dns:' "$tmp/A-Box-clash.yaml" || { echo 'FAIL: Clash YAML dns'; failures=$((failures + 1)); }
-    grep -q '^  listen: 127.0.0.1:1053$' "$tmp/A-Box-clash.yaml" || { echo 'FAIL: Clash DNS listener must stay loopback-only'; failures=$((failures + 1)); }
-    grep -q 'host: "www.microsoft.com"' "$tmp/A-Box-clash.yaml" || { echo 'FAIL: Clash XHTTP host'; failures=$((failures + 1)); }
+    local clash_dir="$tmp/abox"
+    mkdir -m 700 "$clash_dir" || { echo 'FAIL: self-test A-Box temp directory'; failures=$((failures + 1)); }
+    ensure_abox_dir_owned "$clash_dir" || { echo 'FAIL: self-test A-Box temp ownership setup'; failures=$((failures + 1)); }
+    ABOX_DIR="$clash_dir" ABOX_ENV="$clash_dir/.env" CORE=xray MODE=ALL PUBLIC_KEY=publickey LINK_IP=203.0.113.10 HY2_DOMAIN= HY2_HOP=false HY2_CERT_SHA256_FP=abcdef HY2_CERT_PUBKEY_SHA256_B64=abcdef CLASH_YAML_PATH="$clash_dir/A-Box-clash.yaml" write_clash_yaml >/dev/null 2>&1 || { echo 'FAIL: Clash YAML generation'; failures=$((failures + 1)); }
+    [[ "$(stat -c %a "$clash_dir/A-Box-clash.yaml" 2>/dev/null)" == '600' ]] || { echo 'FAIL: Clash YAML permissions must be 0600'; failures=$((failures + 1)); }
+    grep -q '^proxy-groups:' "$clash_dir/A-Box-clash.yaml" || { echo 'FAIL: Clash YAML proxy-groups'; failures=$((failures + 1)); }
+    grep -q '^dns:' "$clash_dir/A-Box-clash.yaml" || { echo 'FAIL: Clash YAML dns'; failures=$((failures + 1)); }
+    grep -q '^  listen: 127.0.0.1:1053$' "$clash_dir/A-Box-clash.yaml" || { echo 'FAIL: Clash DNS listener must stay loopback-only'; failures=$((failures + 1)); }
+    grep -q 'host: "www.microsoft.com"' "$clash_dir/A-Box-clash.yaml" || { echo 'FAIL: Clash XHTTP host'; failures=$((failures + 1)); }
+    ABOX_DIR="$clash_dir" CORE=xray MODE=SS LINK_IP=203.0.113.10 SS_PORT=2053 SS_PASS='a"b\c' HY2_PASS='h"p' HY2_OBFS='o\b' CLASH_YAML_PATH="$clash_dir/A-Box-clash-escaped.yaml" write_clash_yaml >/dev/null 2>&1 || { echo 'FAIL: Clash YAML escaped secret generation'; failures=$((failures + 1)); }
+    python3 - "$clash_dir/A-Box-clash-escaped.yaml" <<'PY_SELFTEST_YAML' >/dev/null 2>&1 || { echo 'FAIL: Clash YAML secret escaping'; failures=$((failures + 1)); }
+import json, sys
+from pathlib import Path
+text=Path(sys.argv[1]).read_text()
+values=[]
+for line in text.splitlines():
+    stripped=line.strip()
+    if stripped.startswith('password:'):
+        values.append(json.loads(stripped.split(':',1)[1].strip()))
+if values != ['a"b\\c']:
+    raise SystemExit(1)
+PY_SELFTEST_YAML
     CORE=xray HY2_DOMAIN=hy2.example.com HY2_CERT_PUBKEY_SHA256_B64= singbox_hy2_tls_json | grep -q '"server_name": "hy2.example.com"' || { echo 'FAIL: Sing-box HY2 ACME TLS sample'; failures=$((failures + 1)); }
     CORE=singbox HY2_DOMAIN=hy2.example.com HY2_CERT_PUBKEY_SHA256_B64=abcdef singbox_hy2_tls_json | grep -q 'certificate_public_key_sha256' || { echo 'FAIL: Sing-box HY2 self-signed TLS sample'; failures=$((failures + 1)); }
 
@@ -11568,7 +11787,7 @@ main() {
             main_loop "$@"
             ;;
         '') enter_runtime "$@"; main_loop "$@" ;;
-        *) enter_runtime "$@"; main_loop "$@" ;;
+        *) show_cli_help >&2; exit 2 ;;
     esac
 }
 
