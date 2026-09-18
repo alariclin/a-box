@@ -32,8 +32,8 @@ PUBLIC_IP_CACHE_TTL=600
 BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-10}
 LOCK_FALLBACK_DIR='/run/A-Box.lock.d'
 ABOX_LANG='zh'
-ABOX_BUILD='2026-09-19-final-v18'
-ABOX_BUILD_EPOCH=2026091909
+ABOX_BUILD='2026-09-19-final-v20'
+ABOX_BUILD_EPOCH=2026091912
 ABOX_DESIRED_STATE='/etc/ddr/.desired_state'
 ABOX_TRAFFIC_BLOCK_STATE='/etc/ddr/.traffic-block-state'
 PUBLIC_IP_CONNECT_TIMEOUT=${PUBLIC_IP_CONNECT_TIMEOUT:-3}
@@ -2507,12 +2507,20 @@ valid_github_download_url() {
     [[ "$url_lower" == "https://github.com/${repo_lower}/releases/download/"* ]]
 }
 
+singbox_asset_regex() {
+    if [[ "${release:-}" == 'alpine' ]]; then
+        printf '%s\n' "^sing-box-.*-linux-${SB_ARCH}-musl\.tar\.gz$"
+    else
+        printf '%s\n' "^sing-box-.*-linux-${SB_ARCH}-glibc\.tar\.gz$"
+    fi
+}
+
 fetch_github_release() {
     local repo=$1 output_file=$2 dest_file="${3:-}" api_url asset_re release_json asset_json download_url digest mirror tmp_file tmp_dir
     api_url="https://api.github.com/repos/${repo}/releases/latest"
     case "${repo}:${output_file}" in
         XTLS/Xray-core:xray_core.zip) asset_re="^Xray-linux-${XRAY_ARCH//+/\\+}\\.zip$" ;;
-        SagerNet/sing-box:singbox_core.tar.gz) asset_re="^sing-box-.*-linux-${SB_ARCH}\\.tar\\.gz$" ;;
+        SagerNet/sing-box:singbox_core.tar.gz) asset_re="$(singbox_asset_regex)" ;;
         HyNetworks/hysteria:hysteria_core) asset_re="^hysteria-linux-${HY2_ARCH}$" ;;
         *) die "未定义的资产匹配规则: ${repo}:${output_file}" ;;
     esac
@@ -10722,6 +10730,7 @@ EOF_CLASH
   - name: "$hy2_name"
     type: hysteria2
     server: "$HY2_DOMAIN"
+    port: $HY2_BASE_PORT
     ports: ${HY2_CLASH_PORTS}
     hop-interval: 30
     password: ${hy2_pass_yaml}
@@ -10751,6 +10760,7 @@ EOF_CLASH
   - name: "$hy2_name"
     type: hysteria2
     server: "$S_IP"
+    port: $HY2_BASE_PORT
     ports: ${HY2_CLASH_PORTS}
     hop-interval: 30
     password: ${hy2_pass_yaml}
@@ -11887,7 +11897,7 @@ EOF_SELFTEST_IPT
     jq -e '.inbounds[] | select(.protocol=="vless" and .port==8443 and .streamSettings.realitySettings.serverNames[0]=="www.microsoft.com")' "$tmp/xray/config.json" >/dev/null 2>&1 || { echo 'FAIL: Xray Vision SNI split'; failures=$((failures + 1)); }
     jq -e '.inbounds[] | select(.protocol=="vless" and .port==9443 and .streamSettings.realitySettings.serverNames[0]=="www.microsoft.com")' "$tmp/xray/config.json" >/dev/null 2>&1 || { echo 'FAIL: Xray XHTTP SNI split'; failures=$((failures + 1)); }
     jq -e 'all(.inbounds[] | select(.protocol=="vless"); .streamSettings.realitySettings.minClientVer == "1.8.2")' "$tmp/xray/config.json" >/dev/null 2>&1 || { echo 'FAIL: Xray REALITY minClientVer compatibility guard'; failures=$((failures + 1)); }
-    assert_ok valid_github_download_url HyNetworks/hysteria https://github.com/HyNetworks/hysteria/releases/download/app/v2.12.2/hysteria-linux-amd64
+    assert_ok valid_github_download_url HyNetworks/hysteria https://github.com/HyNetworks/hysteria/releases/download/app/v2.12.3/hysteria-linux-amd64
     assert_bad valid_github_download_url HyNetworks/hysteria https://example.com/HyNetworks/hysteria/releases/download/app/v2.12.2/hysteria-linux-amd64
     printf '%s\n' 'sentinel' > "$tmp/sing-box/sentinel.txt"
     ln -s "$tmp/sing-box/sentinel.txt" "$tmp/sing-box/config.json.tmp.$$"
@@ -11906,6 +11916,9 @@ EOF_SELFTEST_IPT
     ensure_abox_dir_owned "$clash_dir" || { echo 'FAIL: self-test A-Box temp ownership setup'; failures=$((failures + 1)); }
     ABOX_DIR="$clash_dir" ABOX_ENV="$clash_dir/.env" CORE=xray MODE=ALL PUBLIC_KEY=publickey LINK_IP=203.0.113.10 HY2_DOMAIN= HY2_HOP=false HY2_CERT_SHA256_FP=abcdef HY2_CERT_PUBKEY_SHA256_B64=abcdef CLASH_YAML_PATH="$clash_dir/A-Box-clash.yaml" write_clash_yaml >/dev/null 2>&1 || { echo 'FAIL: Clash YAML generation'; failures=$((failures + 1)); }
     [[ "$(stat -c %a "$clash_dir/A-Box-clash.yaml" 2>/dev/null)" == '600' ]] || { echo 'FAIL: Clash YAML permissions must be 0600'; failures=$((failures + 1)); }
+    ABOX_DIR="$clash_dir" ABOX_ENV="$clash_dir/.env" CORE=xray MODE=HY2 PUBLIC_KEY=publickey LINK_IP=203.0.113.10 HY2_DOMAIN=hy2.example.com HY2_HOP=true HY2_BASE_PORT=443 HY2_CLASH_PORTS=20000-25000 HY2_CERT_SHA256_FP=abcdef CLASH_YAML_PATH="$clash_dir/A-Box-clash-hop.yaml" write_clash_yaml >/dev/null 2>&1 || { echo 'FAIL: Clash Hysteria2 hop YAML generation'; failures=$((failures + 1)); }
+    grep -q '^    port: 443$' "$clash_dir/A-Box-clash-hop.yaml" || { echo 'FAIL: Clash Hysteria2 hop YAML baseline port missing'; failures=$((failures + 1)); }
+    grep -q '^    ports: 20000-25000$' "$clash_dir/A-Box-clash-hop.yaml" || { echo 'FAIL: Clash Hysteria2 hop YAML ports missing'; failures=$((failures + 1)); }
     grep -q '^proxy-groups:' "$clash_dir/A-Box-clash.yaml" || { echo 'FAIL: Clash YAML proxy-groups'; failures=$((failures + 1)); }
     grep -q '^dns:' "$clash_dir/A-Box-clash.yaml" || { echo 'FAIL: Clash YAML dns'; failures=$((failures + 1)); }
     grep -q '^  listen: 127.0.0.1:1053$' "$clash_dir/A-Box-clash.yaml" || { echo 'FAIL: Clash DNS listener must stay loopback-only'; failures=$((failures + 1)); }
@@ -11925,6 +11938,16 @@ if values != ['a"b\\c']:
 PY_SELFTEST_YAML
     CORE=xray HY2_DOMAIN=hy2.example.com HY2_CERT_PUBKEY_SHA256_B64= singbox_hy2_tls_json | grep -q '"server_name": "hy2.example.com"' || { echo 'FAIL: Sing-box HY2 ACME TLS sample'; failures=$((failures + 1)); }
     CORE=singbox HY2_DOMAIN=hy2.example.com HY2_CERT_PUBKEY_SHA256_B64=abcdef singbox_hy2_tls_json | grep -q 'certificate_public_key_sha256' || { echo 'FAIL: Sing-box HY2 self-signed TLS sample'; failures=$((failures + 1)); }
+    local _saved_release="${release:-}" _saved_sb_arch="${SB_ARCH:-}" _regex
+    SB_ARCH=amd64
+    release=alpine
+    _regex=$(singbox_asset_regex)
+    [[ "$_regex" == '^sing-box-.*-linux-amd64-musl\.tar\.gz$' ]] || { echo 'FAIL: sing-box Alpine musl asset selector'; failures=$((failures + 1)); }
+    release=debian
+    _regex=$(singbox_asset_regex)
+    [[ "$_regex" == '^sing-box-.*-linux-amd64-glibc\.tar\.gz$' ]] || { echo 'FAIL: sing-box glibc asset selector'; failures=$((failures + 1)); }
+    release="$_saved_release"
+    SB_ARCH="$_saved_sb_arch"
 
     if (( failures > 0 )); then
         echo "SELF_TEST_FAILED=$failures"
