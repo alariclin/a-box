@@ -33,8 +33,8 @@ PUBLIC_IP_CACHE_TTL=600
 BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-10}
 LOCK_FALLBACK_DIR='/run/A-Box.lock.d'
 ABOX_LANG='zh'
-ABOX_BUILD='2026-10-06-bugfix-v136'
-ABOX_BUILD_EPOCH=20261006136
+ABOX_BUILD='2026-10-06-bugfix-v137'
+ABOX_BUILD_EPOCH=20261006137
 # Current Xray compatibility pin for iOS Shadowrocket + XHTTP/REALITY as of 2026-10-05.
 # This pin is a prerelease upstream build; newer prereleases remain opt-in via ABOX_XRAY_VERSION.
 ABOX_XRAY_DEFAULT_VERSION='v26.6.27'
@@ -3659,7 +3659,6 @@ selected_port_pairs() {
     # actually use Hysteria/CertMagic HTTP-01.
     if hy2_http01_enabled; then
         add_port_pair pairs tcp 80
-    fi
     fi
     # Native Hysteria official range mode listens on the first range port; the
     # separate base port is only real for non-hopping/manual redirect modes.
@@ -7402,6 +7401,13 @@ run_remote_bash_script() {
         -u AWS_ACCESS_KEY_ID \
         -u AWS_SECRET_ACCESS_KEY \
         -u AWS_SESSION_TOKEN \
+        -u AWS_SECURITY_TOKEN \
+        -u AZURE_CLIENT_ID \
+        -u AZURE_CLIENT_SECRET \
+        -u AZURE_TENANT_ID \
+        -u GCP_ACCESS_TOKEN \
+        -u GOOGLE_APPLICATION_CREDENTIALS \
+        -u KUBECONFIG \
         bash "$tmp" "$@"
     local rc=$?
     rm -f "$tmp"
@@ -11689,6 +11695,16 @@ sni_org_cdn_penalty() {
     printf '%s\n' "$penalty"
 }
 
+sni_domain_public_dns() {
+    local domain="$1" ip found=0
+    while IFS= read -r ip; do
+        [[ -n "$ip" ]] || continue
+        valid_public_ip "$ip" || return 1
+        found=1
+    done < <(getent ahosts "$domain" 2>/dev/null | awk '{print $1}' | sort -u)
+    (( found == 1 ))
+}
+
 sni_probe_domain() {
     local domain="$1" raw="$2" timeout_s="${3:-6}" metrics code t_connect t_app t_start t_total http_version remote_ip penalty score tls_args=()
     [[ "$domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]] || return 0
@@ -11698,7 +11714,8 @@ sni_probe_domain() {
     if [[ "${ABOX_CURL_TLS13_SUPPORTED:-0}" == '1' ]]; then
         tls_args=(--tlsv1.3)
     fi
-    metrics=$(curl -sSIL "${tls_args[@]}" --connect-timeout "$timeout_s" --max-time "$((timeout_s + 4))" \
+    sni_domain_public_dns "$domain" || return 0
+    metrics=$(curl -sSI --proto '=https' --proto-redir '=https' --max-redirs 0 "${tls_args[@]}" --connect-timeout "$timeout_s" --max-time "$((timeout_s + 4))" \
         -o /dev/null \
         -w '%{http_code}\t%{time_connect}\t%{time_appconnect}\t%{time_starttransfer}\t%{time_total}\t%{http_version}\t%{remote_ip}' \
         "https://${domain}/" 2>/dev/null) || return 0
@@ -11811,6 +11828,10 @@ run_builtin_sni_radar() {
         topn=35
         verify_limit="${ABOX_SNI_FULL_VERIFY:-420}"
     fi
+    [[ "$concurrency" =~ ^[0-9]+$ ]] && (( concurrency >= 1 && concurrency <= 128 )) || die 'SNI concurrency must be an integer in 1..128.'
+    [[ "$verify_limit" =~ ^[0-9]+$ ]] && (( verify_limit >= 1 && verify_limit <= 2000 )) || die 'SNI verify limit must be an integer in 1..2000.'
+    [[ "$timeout_s" =~ ^[0-9]+([.][0-9]+)?$ ]] || die 'SNI timeout must be a positive number.'
+    awk -v t="$timeout_s" 'BEGIN{exit !(t>0 && t<=30)}' || die 'SNI timeout must be >0 and <=30 seconds.'
     progress_every=$(( concurrency * 2 ))
     (( progress_every < 20 )) && progress_every=20
     msg "${CYAN}======================================================================${NC}"
@@ -11847,8 +11868,11 @@ run_builtin_sni_radar() {
     if [[ ! -s "$report" ]]; then
         cp -f "$raw_sorted" "$report"
     fi
-    mkdir -p "$ABOX_DIR" 2>/dev/null || true
-    cp -f "$report" "$ABOX_DIR/A-Box-sni-${profile}.tsv" 2>/dev/null || true
+    ensure_abox_dir_owned "$ABOX_DIR"
+    local saved_sni="$ABOX_DIR/A-Box-sni-${profile}.tsv"
+    cp -f "$report" "$saved_sni" 2>/dev/null || die 'SNI report persistence failed.'
+    [[ -s "$saved_sni" && ! -L "$saved_sni" ]] || die 'SNI report persistence verification failed.'
+    chmod 600 "$saved_sni" 2>/dev/null || die 'SNI report permission hardening failed.'
     msg "${BLUE}----------------------------------------------------------------------${NC}"
     msg "${YELLOW}[ Top SNI Candidates / 优选 SNI 候选 ]${NC}"
     awk -F'\t' -v n="$topn" 'NR<=n {printf "%2d. %-42s %s %s %s %s %s %s %s %s %s\n", NR, $2, $3, $4, $5, $6, $7, $9, $10, $11, $12}' "$report"
@@ -13580,7 +13604,7 @@ export_diagnostic_bundle() {
     diag_dir="$ABOX_DIR/diagnostics"
     work=$(mktemp -d /tmp/A-Box-diagnostic.XXXXXX) || die 'Diagnostic temp directory creation failed.'
     mkdir -p "$diag_dir" "$work/logs" || { rm -rf -- "$work"; die '诊断目录创建失败。'; }
-    chmod 700 "$diag_dir" 2>/dev/null || true
+    chmod 700 "$diag_dir" || { rm -rf -- "$work"; die 'Diagnostic directory permission setup failed.'; }
 
     msg "${YELLOW}[*] Collecting diagnostic information with secret redaction...${NC}"
     {
@@ -13613,10 +13637,11 @@ export_diagnostic_bundle() {
 
     bundle="$diag_dir/A-Box-diagnostic-${ts}.tar.gz"
     tar -C "$work" -czf "$bundle" . || { rm -rf "$work"; die 'Diagnostic bundle creation failed.'; }
-    chmod 600 "$bundle" 2>/dev/null || true
+    chmod 600 "$bundle" || { rm -rf -- "$work"; die 'Diagnostic bundle permission setup failed.'; }
     checksum="${bundle}.sha256"
-    sha256sum "$bundle" > "$checksum" 2>/dev/null || true
-    chmod 600 "$checksum" 2>/dev/null || true
+    sha256sum "$bundle" > "$checksum" || { rm -rf -- "$work"; die 'Diagnostic bundle checksum creation failed.'; }
+    chmod 600 "$checksum" || { rm -rf -- "$work"; die 'Diagnostic checksum permission setup failed.'; }
+    [[ -s "$checksum" && ! -L "$checksum" ]] || { rm -rf -- "$work"; die 'Diagnostic checksum verification failed.'; }
     rm -rf "$work"
     msg "${GREEN}[*] Diagnostic bundle:${NC} $bundle"
     [[ -f "$checksum" ]] && msg "${GREEN}[*] SHA256:${NC} $checksum"
@@ -13627,7 +13652,7 @@ export_diagnostic_bundle() {
 default_route_uses_warp() {
     local dev=''
     dev=$(ip -o route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)
-    [[ "$dev" =~ ^(wg|warp|tun)[0-9A-Za-z_.-]*$ ]]
+    [[ "$dev" =~ ^(wg|warp|tun|CloudflareWARP)[0-9A-Za-z_.-]*$ ]]
 }
 
 
@@ -13721,17 +13746,25 @@ preflight_check() {
         pf_warn 'GitHub API unreachable from this host now; official release metadata/digest cannot be verified and core installation may fail'
     fi
 
-    load_abox_env "$ABOX_ENV" 2>/dev/null || true
+    if [[ -e "$ABOX_ENV" || -L "$ABOX_ENV" ]]; then
+        if ! load_abox_env "$ABOX_ENV" >/dev/null 2>&1; then
+            pf_fail 'A-Box .env exists but is invalid, unreadable, symlinked, or semantically inconsistent'
+        fi
+    else
+        clear_abox_env_vars
+    fi
     if ! command -v ss >/dev/null 2>&1; then
         pf_warn 'ss is unavailable; port occupancy audit skipped'
     else
+        local preflight_extra_ports=''
+        hy2_http01_enabled && preflight_extra_ports=' 80'
         for proto in tcp udp; do
             local preflight_ss_output
             if ! preflight_ss_output=$(ss -H -n -l -p -A "$proto" 2>/dev/null); then
                 pf_warn "ss failed for ${proto}; port occupancy audit skipped for ${proto}"
                 continue
             fi
-            for port in 443 8443 2053 ${VLESS_PORT:-} ${XHTTP_PORT:-} ${HY2_BASE_PORT:-} ${SS_PORT:-}; do
+            for port in 443 8443 2053 ${VLESS_PORT:-} ${XHTTP_PORT:-} ${HY2_BASE_PORT:-} ${SS_PORT:-}${preflight_extra_ports}; do
                 [[ "$port" =~ ^[0-9]+$ ]] || continue
                 local holder managed_owner
                 holder=$(grep -E "[:.]${port}([[:space:]]|$)" <<< "$preflight_ss_output" || true)
@@ -15316,6 +15349,12 @@ run_self_tests() {
     legacy_remote_token=$(printf '%s%s' 'YES-RUN-' 'UNTRUSTED')
     grep -Fq "$legacy_remote_token" <<< "$remote_confirm_block" && { echo 'FAIL: long remote-script confirmation token remains'; failures=$((failures + 1)); }
     sed -n '/^confirm_remote_script_hash()/,/^}/p' "$0" | grep -Fq 'confirm_yes_no' || { echo 'FAIL: remote script execution must use simple Y/N confirmation'; failures=$((failures + 1)); }
+    grep -Fq 'A-Box .env exists but is invalid' "$0" || { echo 'FAIL: preflight must block invalid existing .env'; failures=$((failures + 1)); }
+    grep -Fq 'preflight_extra_ports' "$0" || { echo 'FAIL: preflight must include HTTP-01 listener reservation'; failures=$((failures + 1)); }
+    grep -Fq 'sni_domain_public_dns' "$0" || { echo 'FAIL: SNI probe must validate public DNS targets'; failures=$((failures + 1)); }
+    grep -Fq 'max-redirs 0' "$0" || { echo 'FAIL: SNI probe must not follow redirects'; failures=$((failures + 1)); }
+    grep -Fq 'Diagnostic bundle checksum creation failed' "$0" || { echo 'FAIL: diagnostic checksum failure must be blocking'; failures=$((failures + 1)); }
+    grep -Fq 'CloudflareWARP' "$0" || { echo 'FAIL: WARP interface detection must include CloudflareWARP'; failures=$((failures + 1)); }
     grep -Fq "ABOX_XRAY_DEFAULT_VERSION='v26.6.27'" "$0" || { echo 'FAIL: Xray iOS/XHTTP compatibility pin missing'; failures=$((failures + 1)); }
     [[ "$(xray_version_compare v26.6.27 v26.3.27)" == '1' ]] || { echo 'FAIL: Xray version comparison'; failures=$((failures + 1)); }
     [[ "$(xray_version_compare v26.6.27 v26.6.27)" == '0' ]] || { echo 'FAIL: Xray compatibility pin comparison'; failures=$((failures + 1)); }
@@ -15339,7 +15378,7 @@ run_self_tests() {
     HY2_DOMAIN=example.com HY2_ACME_TYPE=http CORE_IN=hysteria MODE_IN=HY2 VLESS_PORT=80 XHTTP_PORT=9443 SS_PORT=2053 HY2_BASE_PORT=443 HY2_HOP=false HY2_HOP_IMPL=none
     [[ "$(selected_port_pairs | grep -Fx 'tcp/80')" == 'tcp/80' ]] || { echo 'FAIL: Hysteria HTTP-01 must reserve TCP/80'; failures=$((failures + 1)); }
     [[ "$(selected_port_pairs | awk 'NF' | sort | uniq -d)" == 'tcp/80' ]] || { echo 'FAIL: Hysteria HTTP-01 TCP/80 conflict was not detected'; failures=$((failures + 1)); }
-    CORE_IN=singbox MODE_IN=HY2
+    CORE_IN=singbox MODE_IN=HY2 VLESS_PORT=8443 XHTTP_PORT=9443 SS_PORT=2053 HY2_BASE_PORT=443
     [[ "$(selected_port_pairs | grep -Fx 'tcp/80')" != 'tcp/80' ]] || { echo 'FAIL: Sing-box HY2 domain must not reserve TCP/80'; failures=$((failures + 1)); }
     CORE_IN=xray MODE_IN=ALL HY2_ACME_TYPE=http
     [[ "$(selected_port_pairs | grep -Fx 'tcp/80')" == 'tcp/80' ]] || { echo 'FAIL: Xray ALL HTTP-01 must reserve TCP/80'; failures=$((failures + 1)); }
