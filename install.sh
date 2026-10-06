@@ -11695,6 +11695,16 @@ sni_org_cdn_penalty() {
     printf '%s\n' "$penalty"
 }
 
+sni_domain_public_dns() {
+    local domain="$1" ip found=0
+    while IFS= read -r ip; do
+        [[ -n "$ip" ]] || continue
+        valid_public_ip "$ip" || return 1
+        found=1
+    done < <(getent ahosts "$domain" 2>/dev/null | awk '{print $1}' | sort -u)
+    (( found == 1 ))
+}
+
 sni_probe_domain() {
     local domain="$1" raw="$2" timeout_s="${3:-6}" metrics code t_connect t_app t_start t_total http_version remote_ip penalty score tls_args=()
     [[ "$domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]] || return 0
@@ -11704,7 +11714,8 @@ sni_probe_domain() {
     if [[ "${ABOX_CURL_TLS13_SUPPORTED:-0}" == '1' ]]; then
         tls_args=(--tlsv1.3)
     fi
-    metrics=$(curl -sSIL "${tls_args[@]}" --connect-timeout "$timeout_s" --max-time "$((timeout_s + 4))" \
+    sni_domain_public_dns "$domain" || return 0
+    metrics=$(curl -sSI --proto '=https' --proto-redir '=https' --max-redirs 0 "${tls_args[@]}" --connect-timeout "$timeout_s" --max-time "$((timeout_s + 4))" \
         -o /dev/null \
         -w '%{http_code}\t%{time_connect}\t%{time_appconnect}\t%{time_starttransfer}\t%{time_total}\t%{http_version}\t%{remote_ip}' \
         "https://${domain}/" 2>/dev/null) || return 0
@@ -11817,6 +11828,10 @@ run_builtin_sni_radar() {
         topn=35
         verify_limit="${ABOX_SNI_FULL_VERIFY:-420}"
     fi
+    [[ "$concurrency" =~ ^[0-9]+$ ]] && (( concurrency >= 1 && concurrency <= 128 )) || die 'SNI concurrency must be an integer in 1..128.'
+    [[ "$verify_limit" =~ ^[0-9]+$ ]] && (( verify_limit >= 1 && verify_limit <= 2000 )) || die 'SNI verify limit must be an integer in 1..2000.'
+    [[ "$timeout_s" =~ ^[0-9]+([.][0-9]+)?$ ]] || die 'SNI timeout must be a positive number.'
+    awk -v t="$timeout_s" 'BEGIN{exit !(t>0 && t<=30)}' || die 'SNI timeout must be >0 and <=30 seconds.'
     progress_every=$(( concurrency * 2 ))
     (( progress_every < 20 )) && progress_every=20
     msg "${CYAN}======================================================================${NC}"
