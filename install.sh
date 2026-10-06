@@ -13756,13 +13756,15 @@ preflight_check() {
     if ! command -v ss >/dev/null 2>&1; then
         pf_warn 'ss is unavailable; port occupancy audit skipped'
     else
+        local preflight_extra_ports=''
+        hy2_http01_enabled && preflight_extra_ports=' 80'
         for proto in tcp udp; do
             local preflight_ss_output
             if ! preflight_ss_output=$(ss -H -n -l -p -A "$proto" 2>/dev/null); then
                 pf_warn "ss failed for ${proto}; port occupancy audit skipped for ${proto}"
                 continue
             fi
-            for port in 443 8443 2053 ${VLESS_PORT:-} ${XHTTP_PORT:-} ${HY2_BASE_PORT:-} ${SS_PORT:-}; do
+            for port in 443 8443 2053 ${VLESS_PORT:-} ${XHTTP_PORT:-} ${HY2_BASE_PORT:-} ${SS_PORT:-}${preflight_extra_ports}; do
                 [[ "$port" =~ ^[0-9]+$ ]] || continue
                 local holder managed_owner
                 holder=$(grep -E "[:.]${port}([[:space:]]|$)" <<< "$preflight_ss_output" || true)
