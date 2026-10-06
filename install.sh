@@ -3660,7 +3660,6 @@ selected_port_pairs() {
     if hy2_http01_enabled; then
         add_port_pair pairs tcp 80
     fi
-    fi
     # Native Hysteria official range mode listens on the first range port; the
     # separate base port is only real for non-hopping/manual redirect modes.
     if [[ "${HY2_HOP:-}" != true || "${HY2_HOP_IMPL:-none}" != official ]]; then
@@ -13627,7 +13626,7 @@ export_diagnostic_bundle() {
 default_route_uses_warp() {
     local dev=''
     dev=$(ip -o route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)
-    [[ "$dev" =~ ^(wg|warp|tun)[0-9A-Za-z_.-]*$ ]]
+    [[ "$dev" =~ ^(wg|warp|tun|CloudflareWARP)[0-9A-Za-z_.-]*$ ]]
 }
 
 
@@ -13721,7 +13720,13 @@ preflight_check() {
         pf_warn 'GitHub API unreachable from this host now; official release metadata/digest cannot be verified and core installation may fail'
     fi
 
-    load_abox_env "$ABOX_ENV" 2>/dev/null || true
+    if [[ -e "$ABOX_ENV" || -L "$ABOX_ENV" ]]; then
+        if ! load_abox_env "$ABOX_ENV" >/dev/null 2>&1; then
+            pf_fail 'A-Box .env exists but is invalid, unreadable, symlinked, or semantically inconsistent'
+        fi
+    else
+        clear_abox_env_vars
+    fi
     if ! command -v ss >/dev/null 2>&1; then
         pf_warn 'ss is unavailable; port occupancy audit skipped'
     else
