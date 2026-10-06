@@ -21,5 +21,5 @@ jobs:
         run: |
           test "$(grep -Fc "ABOX_BUILD='2026-10-06-bugfix-v137'" install.sh)" -eq 1
           grep -Fq "ABOX_XRAY_DEFAULT_VERSION='v26.6.27'" install.sh
-          grep -Fq 'ABOX_XRAY_REALITY_MLKEM_MIN_VERSION=v26.9.8' install.sh
+          grep -Fq "ABOX_XRAY_REALITY_MLKEM_MIN_VERSION='v26.9.8'" install.sh
           grep -Fq 'v2.13.0' install.sh
