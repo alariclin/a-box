@@ -70,6 +70,7 @@ ABOX_CORE_TX_PREV_TRAP_TERM=''
 ABOX_CORE_TX_PREV_TRAP_HUP=''
 ABOX_CORE_UPGRADE_TARGETS=''
 ABOX_CORE_UPGRADE_TMP=''
+ABOX_TRAFFIC_TX_DIR=''
 
 msg() { printf '%s\n' "$*"; }
 die() {
@@ -454,7 +455,7 @@ language_menu() {
 need_interactive_tty() {
     if [[ ! -t 0 ]]; then
         if [[ -r /dev/tty ]]; then
-            exec < /dev/tty
+            exec < /dev/tty || die '当前环境无可交互 TTY，无法打开控制终端。'
         else
             die '当前环境无可交互 TTY，无法运行交互式菜单。'
         fi
@@ -2419,101 +2420,194 @@ restore_iptables_saved_snapshot() {
     "$restore_cmd" -w < "$snapshot" >/dev/null 2>&1 || "$restore_cmd" < "$snapshot" >/dev/null 2>&1
 }
 reorder_one() {
-    local cmd="$1" port="$2" proto="$3" wl_suffix="$4" drop_suffix="$5" line i j n current_line line_no
-    local wl_comment="A-Box-${port}-${proto}-${wl_suffix}" drop_comment="A-Box-${port}-${proto}-${drop_suffix}" rules_output='' snapshot=''
+    local cmd="$1" port="$2" proto="$3" wl_suffix="$4" drop_suffix="$5"
+    local wl_comment="A-Box-${port}-${proto}-${wl_suffix}" drop_comment="A-Box-${port}-${proto}-${drop_suffix}"
     local wl_re="--comment[[:space:]]+\"?${wl_comment}\"?([[:space:]]|$)" drop_re="--comment[[:space:]]+\"?${drop_comment}\"?([[:space:]]|$)"
-    local save_cmd="${cmd}-save" restore_cmd="${cmd}-restore"
-    local -a rules=() argv=() inserted_lines=() current_lines=() delete_lines=()
+    local save_cmd="${cmd}-save" rules_output='' recovery_snapshot='' lock_file=/run/A-Box-firewall-reorder.lock lock_fd=''
+    local original_rules_output='' current_rules_output='' current_line line line_no i j n wl_seen rule_no target_idx del_idx check_rc=0 mutated=0
+    local -a rules=() argv=() current_lines=() delete_lines=() delete_target_indices=() delete_rule_numbers=()
+    local -a original_target_lines=() original_target_positions=() expected_target_lines=()
+    local -a current_target_lines=() current_foreign_lines=() original_foreign_rules=()
+
     command -v "$cmd" >/dev/null 2>&1 || return 0
     command -v "$save_cmd" >/dev/null 2>&1 || return 1
-    command -v "$restore_cmd" >/dev/null 2>&1 || return 1
     "$cmd" -w -S INPUT >/dev/null 2>&1 || return 0
-    local check_rc=0
     if iptables_rule_check "$cmd" INPUT -p "$proto" --dport "$port" -m comment --comment "$drop_comment" -j DROP; then check_rc=0; else check_rc=$?; fi
     case "$check_rc" in 0) ;; 1) return 0 ;; *) return 1 ;; esac
 
-    snapshot=$(mktemp /tmp/A-Box-iptables-reorder.XXXXXX) || return 1
-    if ! "$save_cmd" -t filter > "$snapshot" 2>/dev/null; then
-        rm -f -- "$snapshot"
-        return 1
-    fi
-    firewall_rollback() {
-        local rc=0
-        if [[ -n "$snapshot" ]]; then
-            restore_iptables_saved_snapshot "$restore_cmd" "$snapshot" || rc=1
-            rm -f -- "$snapshot" || rc=1
-            snapshot=''
+    [[ -d /run && ! -L /run ]] || return 1
+    if [[ -e "$lock_file" || -L "$lock_file" ]]; then
+        [[ -f "$lock_file" && ! -L "$lock_file" ]] || return 1
+        [[ "$(stat -c %u:%g "$lock_file" 2>/dev/null || true)" == 0:0 ]] || return 1
+        local lock_mode
+        lock_mode=$(stat -c %a "$lock_file" 2>/dev/null) || return 1
+        if [[ "$lock_mode" =~ ^[0-7]{3,4}$ ]]; then
+            (( (8#$lock_mode & 8#077) == 0 )) || return 1
+        else
+            return 1
         fi
-        return "$rc"
-    }
-    rules_output=$("$cmd" -w -S INPUT 2>/dev/null) || {
-        firewall_rollback >/dev/null 2>&1 || true
-        return 1
-    }
-    if [[ -n "$rules_output" ]]; then
-        local filtered_rules='' grep_rc=0
-        filtered_rules=$(grep -E -- "--comment \"?${wl_comment}\"?([[:space:]]|$)" <<< "$rules_output"); grep_rc=$?
-        case "$grep_rc" in
-            0) mapfile -t rules <<< "$filtered_rules" ;;
-            1) rules=() ;;
-            *) firewall_rollback >/dev/null 2>&1 || true; return 1 ;;
-        esac
+    else
+        (umask 077; set -o noclobber; : > "$lock_file") 2>/dev/null || return 1
+        chown root:root "$lock_file" 2>/dev/null || { rm -f -- "$lock_file"; return 1; }
+        chmod 600 "$lock_file" 2>/dev/null || { rm -f -- "$lock_file"; return 1; }
     fi
+    exec {lock_fd}>>"$lock_file" || return 1
+    flock -n "$lock_fd" || { eval "exec ${lock_fd}>&-"; return 1; }
+    firewall_unlock() { eval "exec ${lock_fd}>&-" 2>/dev/null || true; lock_fd=''; }
+
+    capture_firewall_views() {
+        local item
+        current_rules_output=$("$cmd" -w -S INPUT 2>/dev/null) || return 1
+        current_target_lines=()
+        current_foreign_lines=()
+        while IFS= read -r item; do
+            [[ "$item" =~ ^-A[[:space:]]+INPUT[[:space:]] ]] || continue
+            if [[ "$item" =~ $wl_re || "$item" =~ $drop_re ]]; then
+                current_target_lines+=("$item")
+            else
+                current_foreign_lines+=("$item")
+            fi
+        done <<< "$current_rules_output"
+    }
+    firewall_state_matches_expected() {
+        capture_firewall_views || return 1
+        [[ "$(printf '%s\n' "${current_target_lines[@]}")" == "$(printf '%s\n' "${expected_target_lines[@]}")" ]] || return 1
+        [[ "$(printf '%s\n' "${current_foreign_lines[@]}")" == "$(printf '%s\n' "${original_foreign_rules[@]}")" ]]
+    }
+    firewall_rollback() {
+        local rollback_line current_pos rollback_argv
+        local -a rollback_lines=() rollback_positions=() rollback_argv_arr=()
+        [[ -n "$recovery_snapshot" && -s "$recovery_snapshot" ]] || return 1
+        capture_firewall_views || return 1
+        [[ "$(printf '%s\n' "${current_target_lines[@]}")" == "$(printf '%s\n' "${expected_target_lines[@]}")" ]] || {
+            printf '%s\n' "A-Box firewall rollback conflict: target rules changed outside this transaction; recovery snapshot preserved at $recovery_snapshot" >&2
+            return 2
+        }
+        [[ "$(printf '%s\n' "${current_foreign_lines[@]}")" == "$(printf '%s\n' "${original_foreign_rules[@]}")" ]] || {
+            printf '%s\n' "A-Box firewall rollback conflict: non-A-Box INPUT rules changed outside this transaction; recovery snapshot preserved at $recovery_snapshot" >&2
+            return 2
+        }
+        rollback_lines=("${current_target_lines[@]}")
+        for rollback_line in "${rollback_lines[@]}"; do
+            rollback_line=${rollback_line//\"/}
+            read -r -a rollback_argv_arr <<< "$rollback_line"
+            [[ "${rollback_argv_arr[0]:-}" == -A && "${rollback_argv_arr[1]:-}" == INPUT ]] || return 1
+            "${cmd}" -w -D INPUT "${rollback_argv_arr[@]:2}" >/dev/null 2>&1 || return 1
+        done
+        for ((i=${#original_target_lines[@]}-1; i>=0; i--)); do
+            rollback_line=${original_target_lines[i]//\"/}
+            read -r -a rollback_argv_arr <<< "$rollback_line"
+            [[ "${rollback_argv_arr[0]:-}" == -A && "${rollback_argv_arr[1]:-}" == INPUT ]] || return 1
+            "${cmd}" -w -I INPUT "${original_target_positions[i]}" "${rollback_argv_arr[@]:2}" >/dev/null 2>&1 || return 1
+        done
+        capture_firewall_views || return 1
+        [[ "$current_rules_output" == "$original_rules_output" ]] || return 1
+        rm -f -- "$recovery_snapshot" || return 1
+        recovery_snapshot=''
+        return 0
+    }
+
+    recovery_snapshot=$(mktemp /run/A-Box-firewall-recovery.XXXXXX) || { firewall_unlock; return 1; }
+    if ! "$save_cmd" -t filter > "$recovery_snapshot" 2>/dev/null; then
+        rm -f -- "$recovery_snapshot"
+        firewall_unlock
+        return 1
+    fi
+    original_rules_output=$("$cmd" -w -S INPUT 2>/dev/null) || { rm -f -- "$recovery_snapshot"; firewall_unlock; return 1; }
+    capture_firewall_views || { rm -f -- "$recovery_snapshot"; firewall_unlock; return 1; }
+    original_target_lines=("${current_target_lines[@]}")
+    original_foreign_rules=("${current_foreign_lines[@]}")
+    expected_target_lines=("${original_target_lines[@]}")
+    for line in "${original_target_lines[@]}"; do
+        if [[ "$line" =~ $wl_re ]]; then rules+=("$line"); fi
+    done
+    rule_no=0
+    while IFS= read -r line; do
+        [[ "$line" =~ ^-A[[:space:]]+INPUT[[:space:]] ]] || continue
+        rule_no=$((rule_no + 1))
+        if [[ "$line" =~ $wl_re || "$line" =~ $drop_re ]]; then
+            original_target_positions+=("$rule_no")
+        fi
+    done <<< "$original_rules_output"
     n=${#rules[@]}
-    # Snapshot the filter table before any mutation. Any failure after a
-    # mutation restores the exact pre-operation firewall state.
+
     for ((i=n-1; i>=0; i--)); do
+        local expected_line="${rules[i]}"
         line=${rules[i]//\"/}
         read -r -a argv <<< "$line"
-        if [[ "${argv[0]:-}" != -A || "${argv[1]:-}" != INPUT ]]; then
-            firewall_rollback >/dev/null 2>&1 || true
+        [[ "${argv[0]:-}" == -A && "${argv[1]:-}" == INPUT ]] || { firewall_rollback >/dev/null 2>&1 || printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; firewall_unlock; return 1; }
+        firewall_state_matches_expected || {
+            if (( mutated )); then
+                if ! firewall_rollback; then
+                    printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2
+                fi
+            else
+                rm -f -- "$recovery_snapshot" || true
+            fi
+            firewall_unlock
             return 1
-        fi
+        }
         if ! "$cmd" -w -I INPUT 1 "${argv[@]:2}" >/dev/null 2>&1; then
-            firewall_rollback >/dev/null 2>&1 || true
+            if ! firewall_rollback >/dev/null 2>&1; then printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; fi
+            firewall_unlock
             return 1
         fi
-        inserted_lines+=("$line")
+        mutated=1
+        expected_target_lines=("$expected_line" "${expected_target_lines[@]}")
     done
+    local expected_drop_line="-A INPUT -p ${proto} --dport ${port} -m comment --comment \"${drop_comment}\" -j DROP"
+    firewall_state_matches_expected || { if ! firewall_rollback >/dev/null 2>&1; then printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; fi; firewall_unlock; return 1; }
     if ! "$cmd" -w -I INPUT "$((n + 1))" -p "$proto" --dport "$port" -m comment --comment "$drop_comment" -j DROP >/dev/null 2>&1; then
-        firewall_rollback >/dev/null 2>&1 || true
+        if ! firewall_rollback >/dev/null 2>&1; then printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; fi
+        firewall_unlock
         return 1
     fi
-    rules_output=$("$cmd" -w -S INPUT 2>/dev/null) || {
-        firewall_rollback >/dev/null 2>&1 || true
-        return 1
-    }
-    current_lines=()
-    mapfile -t current_lines <<< "$rules_output"
-    local wl_seen=0 rule_no=0
+    expected_target_lines=("${expected_target_lines[@]:0:n}" "$expected_drop_line" "${expected_target_lines[@]:n}")
+
+    rules_output=$("$cmd" -w -S INPUT 2>/dev/null) || { if ! firewall_rollback >/dev/null 2>&1; then printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; fi; firewall_unlock; return 1; }
+    current_lines=(); mapfile -t current_lines <<< "$rules_output"
+    delete_lines=(); delete_target_indices=(); target_idx=0; rule_no=0
     for i in "${!current_lines[@]}"; do
         current_line="${current_lines[i]}"
-        if [[ "$current_line" =~ ^-A[[:space:]]+INPUT[[:space:]] ]]; then
-            rule_no=$((rule_no + 1))
-        else
-            continue
-        fi
-        line_no="$rule_no"
-        if [[ "$current_line" =~ $wl_re ]]; then
-            wl_seen=$((wl_seen + 1))
-            (( wl_seen > n )) && delete_lines+=("$line_no")
-        elif [[ "$current_line" =~ $drop_re ]]; then
-            (( line_no != n + 1 )) && delete_lines+=("$line_no")
+        [[ "$current_line" =~ ^-A[[:space:]]+INPUT[[:space:]] ]] || continue
+        rule_no=$((rule_no + 1))
+        if [[ "$current_line" =~ $wl_re || "$current_line" =~ $drop_re ]]; then
+            if (( target_idx > n )); then
+                delete_lines+=("$current_line")
+                delete_target_indices+=("$target_idx")
+                delete_rule_numbers+=("$rule_no")
+            fi
+            target_idx=$((target_idx + 1))
         fi
     done
     for ((j=${#delete_lines[@]}-1; j>=0; j--)); do
-        line_no="${delete_lines[j]}"
-        if ! "$cmd" -w -D INPUT "$line_no" >/dev/null 2>&1; then
-            firewall_rollback >/dev/null 2>&1 || true
+        firewall_state_matches_expected || { if ! firewall_rollback >/dev/null 2>&1; then printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; fi; firewall_unlock; return 1; }
+        line=${delete_lines[j]//\"/}
+        read -r -a argv <<< "$line"
+        [[ "${argv[0]:-}" == -A && "${argv[1]:-}" == INPUT ]] || { if ! firewall_rollback >/dev/null 2>&1; then printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; fi; firewall_unlock; return 1; }
+        if ! "$cmd" -w -D INPUT "${delete_rule_numbers[j]}" >/dev/null 2>&1; then
+            if ! firewall_rollback >/dev/null 2>&1; then printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; fi
+            firewall_unlock
             return 1
         fi
+        del_idx="${delete_target_indices[j]}"
+        expected_target_lines=("${expected_target_lines[@]:0:del_idx}" "${expected_target_lines[@]:del_idx+1}")
     done
-    if ! rm -f -- "$snapshot"; then
-        firewall_rollback >/dev/null 2>&1 || true
+    if ! firewall_state_matches_expected; then
+        if ! firewall_rollback >/dev/null 2>&1; then printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; fi
+        firewall_unlock
         return 1
     fi
-    snapshot=''
+    if ! rm -f -- "$recovery_snapshot"; then
+        printf '%s\n' "A-Box firewall change completed, but recovery snapshot cleanup failed; snapshot retained at $recovery_snapshot" >&2
+        firewall_unlock
+        return 1
+    fi
+    recovery_snapshot=''
+    firewall_unlock
+    return 0
 }
+
 reorder_policy() {
     local cmd="$1" wl_suffix="$2" drop_suffix="$3" line key port proto rules_output=''
     local -A seen=()
@@ -3277,100 +3371,192 @@ remove_ss_open_accept_rules() {
 }
 
 reorder_ss_whitelist_rules_one() {
-    local cmd="$1" port="$2" proto="$3" wl_suffix="$4" drop_suffix="$5" line i j n current_line line_no
-    local wl_comment="A-Box-${port}-${proto}-${wl_suffix}" drop_comment="A-Box-${port}-${proto}-${drop_suffix}" rules_output='' snapshot=''
+    local cmd="$1" port="$2" proto="$3" wl_suffix="$4" drop_suffix="$5"
+    local wl_comment="A-Box-${port}-${proto}-${wl_suffix}" drop_comment="A-Box-${port}-${proto}-${drop_suffix}"
     local wl_re="--comment[[:space:]]+\"?${wl_comment}\"?([[:space:]]|$)" drop_re="--comment[[:space:]]+\"?${drop_comment}\"?([[:space:]]|$)"
-    local save_cmd="${cmd}-save" restore_cmd="${cmd}-restore"
-    local -a rules=() argv=() inserted_lines=() current_lines=() delete_lines=()
+    local save_cmd="${cmd}-save" rules_output='' recovery_snapshot='' lock_file=/run/A-Box-firewall-reorder.lock lock_fd=''
+    local original_rules_output='' current_rules_output='' current_line line line_no i j n wl_seen rule_no target_idx del_idx check_rc=0 mutated=0
+    local -a rules=() argv=() current_lines=() delete_lines=() delete_target_indices=() delete_rule_numbers=()
+    local -a original_target_lines=() original_target_positions=() expected_target_lines=()
+    local -a current_target_lines=() current_foreign_lines=() original_foreign_rules=()
+
     command -v "$cmd" >/dev/null 2>&1 || return 0
     command -v "$save_cmd" >/dev/null 2>&1 || return 1
-    command -v "$restore_cmd" >/dev/null 2>&1 || return 1
     "$cmd" -w -S INPUT >/dev/null 2>&1 || return 0
-    local check_rc=0
     if iptables_rule_check "$cmd" INPUT -p "$proto" --dport "$port" -m comment --comment "$drop_comment" -j DROP; then check_rc=0; else check_rc=$?; fi
     case "$check_rc" in 0) ;; 1) return 0 ;; *) return 1 ;; esac
 
-    snapshot=$(mktemp /tmp/A-Box-iptables-reorder.XXXXXX) || return 1
-    if ! "$save_cmd" -t filter > "$snapshot" 2>/dev/null; then
-        rm -f -- "$snapshot"
-        return 1
-    fi
-    firewall_rollback() {
-        local rc=0
-        if [[ -n "$snapshot" ]]; then
-            restore_iptables_saved_snapshot "$restore_cmd" "$snapshot" || rc=1
-            rm -f -- "$snapshot" || rc=1
-            snapshot=''
+    [[ -d /run && ! -L /run ]] || return 1
+    if [[ -e "$lock_file" || -L "$lock_file" ]]; then
+        [[ -f "$lock_file" && ! -L "$lock_file" ]] || return 1
+        [[ "$(stat -c %u:%g "$lock_file" 2>/dev/null || true)" == 0:0 ]] || return 1
+        local lock_mode
+        lock_mode=$(stat -c %a "$lock_file" 2>/dev/null) || return 1
+        if [[ "$lock_mode" =~ ^[0-7]{3,4}$ ]]; then
+            (( (8#$lock_mode & 8#077) == 0 )) || return 1
+        else
+            return 1
         fi
-        return "$rc"
-    }
-    rules_output=$("$cmd" -w -S INPUT 2>/dev/null) || {
-        firewall_rollback >/dev/null 2>&1 || true
-        return 1
-    }
-    if [[ -n "$rules_output" ]]; then
-        local filtered_rules='' grep_rc=0
-        filtered_rules=$(grep -E -- "--comment \"?${wl_comment}\"?([[:space:]]|$)" <<< "$rules_output"); grep_rc=$?
-        case "$grep_rc" in
-            0) mapfile -t rules <<< "$filtered_rules" ;;
-            1) rules=() ;;
-            *) firewall_rollback >/dev/null 2>&1 || true; return 1 ;;
-        esac
+    else
+        (umask 077; set -o noclobber; : > "$lock_file") 2>/dev/null || return 1
+        chown root:root "$lock_file" 2>/dev/null || { rm -f -- "$lock_file"; return 1; }
+        chmod 600 "$lock_file" 2>/dev/null || { rm -f -- "$lock_file"; return 1; }
     fi
+    exec {lock_fd}>>"$lock_file" || return 1
+    flock -n "$lock_fd" || { eval "exec ${lock_fd}>&-"; return 1; }
+    firewall_unlock() { eval "exec ${lock_fd}>&-" 2>/dev/null || true; lock_fd=''; }
+
+    capture_firewall_views() {
+        local item
+        current_rules_output=$("$cmd" -w -S INPUT 2>/dev/null) || return 1
+        current_target_lines=()
+        current_foreign_lines=()
+        while IFS= read -r item; do
+            [[ "$item" =~ ^-A[[:space:]]+INPUT[[:space:]] ]] || continue
+            if [[ "$item" =~ $wl_re || "$item" =~ $drop_re ]]; then
+                current_target_lines+=("$item")
+            else
+                current_foreign_lines+=("$item")
+            fi
+        done <<< "$current_rules_output"
+    }
+    firewall_state_matches_expected() {
+        capture_firewall_views || return 1
+        [[ "$(printf '%s\n' "${current_target_lines[@]}")" == "$(printf '%s\n' "${expected_target_lines[@]}")" ]] || return 1
+        [[ "$(printf '%s\n' "${current_foreign_lines[@]}")" == "$(printf '%s\n' "${original_foreign_rules[@]}")" ]]
+    }
+    firewall_rollback() {
+        local rollback_line current_pos rollback_argv
+        local -a rollback_lines=() rollback_positions=() rollback_argv_arr=()
+        [[ -n "$recovery_snapshot" && -s "$recovery_snapshot" ]] || return 1
+        capture_firewall_views || return 1
+        [[ "$(printf '%s\n' "${current_target_lines[@]}")" == "$(printf '%s\n' "${expected_target_lines[@]}")" ]] || {
+            printf '%s\n' "A-Box firewall rollback conflict: target rules changed outside this transaction; recovery snapshot preserved at $recovery_snapshot" >&2
+            return 2
+        }
+        [[ "$(printf '%s\n' "${current_foreign_lines[@]}")" == "$(printf '%s\n' "${original_foreign_rules[@]}")" ]] || {
+            printf '%s\n' "A-Box firewall rollback conflict: non-A-Box INPUT rules changed outside this transaction; recovery snapshot preserved at $recovery_snapshot" >&2
+            return 2
+        }
+        rollback_lines=("${current_target_lines[@]}")
+        for rollback_line in "${rollback_lines[@]}"; do
+            rollback_line=${rollback_line//\"/}
+            read -r -a rollback_argv_arr <<< "$rollback_line"
+            [[ "${rollback_argv_arr[0]:-}" == -A && "${rollback_argv_arr[1]:-}" == INPUT ]] || return 1
+            "${cmd}" -w -D INPUT "${rollback_argv_arr[@]:2}" >/dev/null 2>&1 || return 1
+        done
+        for ((i=${#original_target_lines[@]}-1; i>=0; i--)); do
+            rollback_line=${original_target_lines[i]//\"/}
+            read -r -a rollback_argv_arr <<< "$rollback_line"
+            [[ "${rollback_argv_arr[0]:-}" == -A && "${rollback_argv_arr[1]:-}" == INPUT ]] || return 1
+            "${cmd}" -w -I INPUT "${original_target_positions[i]}" "${rollback_argv_arr[@]:2}" >/dev/null 2>&1 || return 1
+        done
+        capture_firewall_views || return 1
+        [[ "$current_rules_output" == "$original_rules_output" ]] || return 1
+        rm -f -- "$recovery_snapshot" || return 1
+        recovery_snapshot=''
+        return 0
+    }
+
+    recovery_snapshot=$(mktemp /run/A-Box-firewall-recovery.XXXXXX) || { firewall_unlock; return 1; }
+    if ! "$save_cmd" -t filter > "$recovery_snapshot" 2>/dev/null; then
+        rm -f -- "$recovery_snapshot"
+        firewall_unlock
+        return 1
+    fi
+    original_rules_output=$("$cmd" -w -S INPUT 2>/dev/null) || { rm -f -- "$recovery_snapshot"; firewall_unlock; return 1; }
+    capture_firewall_views || { rm -f -- "$recovery_snapshot"; firewall_unlock; return 1; }
+    original_target_lines=("${current_target_lines[@]}")
+    original_foreign_rules=("${current_foreign_lines[@]}")
+    expected_target_lines=("${original_target_lines[@]}")
+    for line in "${original_target_lines[@]}"; do
+        if [[ "$line" =~ $wl_re ]]; then rules+=("$line"); fi
+    done
+    rule_no=0
+    while IFS= read -r line; do
+        [[ "$line" =~ ^-A[[:space:]]+INPUT[[:space:]] ]] || continue
+        rule_no=$((rule_no + 1))
+        if [[ "$line" =~ $wl_re || "$line" =~ $drop_re ]]; then
+            original_target_positions+=("$rule_no")
+        fi
+    done <<< "$original_rules_output"
     n=${#rules[@]}
-    # Snapshot the filter table before any mutation. Any failure after a
-    # mutation restores the exact pre-operation firewall state.
+
     for ((i=n-1; i>=0; i--)); do
+        local expected_line="${rules[i]}"
         line=${rules[i]//\"/}
         read -r -a argv <<< "$line"
-        if [[ "${argv[0]:-}" != -A || "${argv[1]:-}" != INPUT ]]; then
-            firewall_rollback >/dev/null 2>&1 || true
+        [[ "${argv[0]:-}" == -A && "${argv[1]:-}" == INPUT ]] || { firewall_rollback >/dev/null 2>&1 || printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; firewall_unlock; return 1; }
+        firewall_state_matches_expected || {
+            if (( mutated )); then
+                if ! firewall_rollback; then
+                    printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2
+                fi
+            else
+                rm -f -- "$recovery_snapshot" || true
+            fi
+            firewall_unlock
             return 1
-        fi
+        }
         if ! "$cmd" -w -I INPUT 1 "${argv[@]:2}" >/dev/null 2>&1; then
-            firewall_rollback >/dev/null 2>&1 || true
+            if ! firewall_rollback >/dev/null 2>&1; then printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; fi
+            firewall_unlock
             return 1
         fi
-        inserted_lines+=("$line")
+        mutated=1
+        expected_target_lines=("$expected_line" "${expected_target_lines[@]}")
     done
+    local expected_drop_line="-A INPUT -p ${proto} --dport ${port} -m comment --comment \"${drop_comment}\" -j DROP"
+    firewall_state_matches_expected || { if ! firewall_rollback >/dev/null 2>&1; then printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; fi; firewall_unlock; return 1; }
     if ! "$cmd" -w -I INPUT "$((n + 1))" -p "$proto" --dport "$port" -m comment --comment "$drop_comment" -j DROP >/dev/null 2>&1; then
-        firewall_rollback >/dev/null 2>&1 || true
+        if ! firewall_rollback >/dev/null 2>&1; then printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; fi
+        firewall_unlock
         return 1
     fi
-    rules_output=$("$cmd" -w -S INPUT 2>/dev/null) || {
-        firewall_rollback >/dev/null 2>&1 || true
-        return 1
-    }
-    current_lines=()
-    mapfile -t current_lines <<< "$rules_output"
-    local wl_seen=0 rule_no=0
+    expected_target_lines=("${expected_target_lines[@]:0:n}" "$expected_drop_line" "${expected_target_lines[@]:n}")
+
+    rules_output=$("$cmd" -w -S INPUT 2>/dev/null) || { if ! firewall_rollback >/dev/null 2>&1; then printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; fi; firewall_unlock; return 1; }
+    current_lines=(); mapfile -t current_lines <<< "$rules_output"
+    delete_lines=(); delete_target_indices=(); target_idx=0; rule_no=0
     for i in "${!current_lines[@]}"; do
         current_line="${current_lines[i]}"
-        if [[ "$current_line" =~ ^-A[[:space:]]+INPUT[[:space:]] ]]; then
-            rule_no=$((rule_no + 1))
-        else
-            continue
-        fi
-        line_no="$rule_no"
-        if [[ "$current_line" =~ $wl_re ]]; then
-            wl_seen=$((wl_seen + 1))
-            (( wl_seen > n )) && delete_lines+=("$line_no")
-        elif [[ "$current_line" =~ $drop_re ]]; then
-            (( line_no != n + 1 )) && delete_lines+=("$line_no")
+        [[ "$current_line" =~ ^-A[[:space:]]+INPUT[[:space:]] ]] || continue
+        rule_no=$((rule_no + 1))
+        if [[ "$current_line" =~ $wl_re || "$current_line" =~ $drop_re ]]; then
+            if (( target_idx > n )); then
+                delete_lines+=("$current_line")
+                delete_target_indices+=("$target_idx")
+                delete_rule_numbers+=("$rule_no")
+            fi
+            target_idx=$((target_idx + 1))
         fi
     done
     for ((j=${#delete_lines[@]}-1; j>=0; j--)); do
-        line_no="${delete_lines[j]}"
-        if ! "$cmd" -w -D INPUT "$line_no" >/dev/null 2>&1; then
-            firewall_rollback >/dev/null 2>&1 || true
+        firewall_state_matches_expected || { if ! firewall_rollback >/dev/null 2>&1; then printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; fi; firewall_unlock; return 1; }
+        line=${delete_lines[j]//\"/}
+        read -r -a argv <<< "$line"
+        [[ "${argv[0]:-}" == -A && "${argv[1]:-}" == INPUT ]] || { if ! firewall_rollback >/dev/null 2>&1; then printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; fi; firewall_unlock; return 1; }
+        if ! "$cmd" -w -D INPUT "${delete_rule_numbers[j]}" >/dev/null 2>&1; then
+            if ! firewall_rollback >/dev/null 2>&1; then printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; fi
+            firewall_unlock
             return 1
         fi
+        del_idx="${delete_target_indices[j]}"
+        expected_target_lines=("${expected_target_lines[@]:0:del_idx}" "${expected_target_lines[@]:del_idx+1}")
     done
-    if ! rm -f -- "$snapshot"; then
-        firewall_rollback >/dev/null 2>&1 || true
+    if ! firewall_state_matches_expected; then
+        if ! firewall_rollback >/dev/null 2>&1; then printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; fi
+        firewall_unlock
         return 1
     fi
-    snapshot=''
+    if ! rm -f -- "$recovery_snapshot"; then
+        printf '%s\n' "A-Box firewall change completed, but recovery snapshot cleanup failed; snapshot retained at $recovery_snapshot" >&2
+        firewall_unlock
+        return 1
+    fi
+    recovery_snapshot=''
+    firewall_unlock
+    return 0
 }
 
 enforce_ss_whitelist_order() {
@@ -3739,19 +3925,52 @@ PY_TAR_EXTRACT
 }
 
 github_api_get() {
-    local url="$1" rc
-    local -a args=(-fLsS --connect-timeout 10 -m 60 -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10')
-    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-        # Feed the bearer token through curl's stdin config. No persistent secret
-        # file is created and the token is not present in curl's argument list.
-        [[ "${GITHUB_TOKEN}" != *[$'\r\n"\\']* ]] || return 1
-        printf 'header = "Authorization: Bearer %s"\n' "$GITHUB_TOKEN" | curl "${args[@]}" --config - "$url"
-        rc=$?
-    else
-        curl "${args[@]}" "$url"
-        rc=$?
+    local url="$1" attempt=1 max_attempts=3 delay=1 rc http_code tmp
+    local -a args=(-sS -L --connect-timeout 10 -m 60 -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' -o)
+    [[ -n "$url" ]] || return 1
+    if [[ "${GITHUB_API_RETRY_DELAY:-1}" =~ ^[0-9]+$ ]]; then
+        delay="${GITHUB_API_RETRY_DELAY:-1}"
+    elif [[ -n "${GITHUB_API_RETRY_DELAY:-}" ]]; then
+        return 1
     fi
-    return "$rc"
+    tmp=$(umask 077; mktemp /tmp/A-Box-github-api.XXXXXX) || return 1
+    while (( attempt <= max_attempts )); do
+        if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+            [[ "${GITHUB_TOKEN}" != *[$'\r\n"\\']* ]] || { rm -f -- "$tmp"; return 1; }
+            http_code=$(printf 'header = "Authorization: Bearer %s"\n' "$GITHUB_TOKEN" | curl "${args[@]}" "$tmp" -w '%{http_code}' --config - "$url" 2>/dev/null)
+            rc=$?
+        else
+            http_code=$(curl "${args[@]}" "$tmp" -w '%{http_code}' "$url" 2>/dev/null)
+            rc=$?
+        fi
+        if (( rc == 0 )) && [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+            cat -- "$tmp"
+            rc=$?
+            rm -f -- "$tmp"
+            return "$rc"
+        fi
+        if (( rc == 0 )) && [[ "$http_code" =~ ^5[0-9][0-9]$ ]]; then
+            :
+        elif (( rc == 5 || rc == 6 || rc == 7 || rc == 18 || rc == 28 || rc == 35 || rc == 52 || rc == 56 )); then
+            :
+        else
+            if [[ "$http_code" == 403 && -z "${GITHUB_TOKEN:-}" ]]; then
+                printf '%s\n' 'GitHub API 返回 403；共享出口可能触发匿名限流，请设置 GITHUB_TOKEN 后重试。' >&2
+            fi
+            rm -f -- "$tmp"
+            return 1
+        fi
+        if (( attempt == max_attempts )); then
+            break
+        fi
+        if (( delay > 0 )); then sleep "$delay"; fi
+        if (( delay < 30 )); then
+            delay=$(( delay * 2 ))
+        fi
+        attempt=$((attempt + 1))
+    done
+    rm -f -- "$tmp"
+    return 1
 }
 
 verify_github_asset_digest() {
@@ -5922,6 +6141,7 @@ ensure_vnstat_runtime() {
 
 setup_traffic_monitor() {
     ensure_vnstat_runtime
+    [[ -z "${ABOX_TRAFFIC_TX_DIR:-}" ]] || capture_traffic_quota_expected_state "$ABOX_TRAFFIC_TX_DIR" || die '流量限制事务状态快照失败。'
     install -d -m 700 "$ABOX_DIR" || die '无法创建流量监控目录。'
     write_file_atomically_from_stdin "$ABOX_DIR/traffic_monitor.sh" 700 <<'EOF_TRAFFIC' || die '流量监控脚本原子写入失败。'
 #!/usr/bin/env bash
@@ -6204,7 +6424,9 @@ fi
 EOF_TRAFFIC
     if [[ "${INIT_SYS:-}" == systemd ]]; then sed -i "s|^INIT_SYS_EXPECTED=.*|INIT_SYS_EXPECTED='systemd'|" "$ABOX_DIR/traffic_monitor.sh"; else sed -i "s|^INIT_SYS_EXPECTED=.*|INIT_SYS_EXPECTED='openrc'|" "$ABOX_DIR/traffic_monitor.sh"; fi
     chmod 700 "$ABOX_DIR/traffic_monitor.sh" || die '流量监控脚本权限设置失败。'
+    [[ -z "${ABOX_TRAFFIC_TX_DIR:-}" ]] || capture_traffic_quota_expected_state "$ABOX_TRAFFIC_TX_DIR" || die '流量限制监控脚本事务快照失败。'
     install_abox_cron_block TRAFFIC '* * * * * /bin/bash /etc/ddr/traffic_monitor.sh >/dev/null 2>&1'
+    [[ -z "${ABOX_TRAFFIC_TX_DIR:-}" ]] || capture_traffic_quota_expected_state "$ABOX_TRAFFIC_TX_DIR" || die '流量限制 cron 事务快照失败。'
 }
 
 disable_traffic_monitor() {
@@ -6212,6 +6434,293 @@ disable_traffic_monitor() {
     remove_owned_runtime_helper "$ABOX_DIR/traffic_monitor.sh" || return 1
     clear_traffic_block_period || return 1
 }
+
+traffic_snapshot_file_hash() {
+    local file="$1"
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    sha256sum "$file" 2>/dev/null | awk '{print $1}'
+}
+
+capture_traffic_env_state_file() {
+    local source_file="$1" out="$2"
+    [[ -f "$source_file" && ! -L "$source_file" ]] || return 1
+    awk '/^TRAFFIC_LIMIT_(GB|MODE)=/{print}' "$source_file" | LC_ALL=C sort > "$out"
+}
+
+capture_traffic_optional_state() {
+    local source_file="$1" out="$2" hash
+    [[ "$out" == /* || "$out" == */* ]] || return 1
+    if [[ -e "$source_file" || -L "$source_file" ]]; then
+        [[ -f "$source_file" && ! -L "$source_file" ]] || return 1
+        hash=$(traffic_snapshot_file_hash "$source_file") || return 1
+        printf 'present|%s\n' "$hash" > "$out"
+    else
+        printf '%s\n' 'absent' > "$out"
+    fi
+}
+
+traffic_optional_state_matches_expected() {
+    local source_file="$1" expected_file="$2" expected='' actual=''
+    [[ -f "$expected_file" && ! -L "$expected_file" ]] || return 1
+    IFS= read -r expected < "$expected_file" || return 1
+    if [[ "$expected" == absent ]]; then
+        [[ ! -e "$source_file" && ! -L "$source_file" ]]
+        return $?
+    fi
+    [[ "$expected" == present\|* ]] || return 1
+    [[ -f "$source_file" && ! -L "$source_file" ]] || return 2
+    actual=$(traffic_snapshot_file_hash "$source_file" 2>/dev/null || true)
+    [[ "$actual" == "${expected#present|}" ]]
+}
+
+capture_vnstat_runtime_state() {
+    local name='' active enabled
+    if [[ "${INIT_SYS:-}" == systemd ]]; then
+        if systemctl list-unit-files vnstat.service >/dev/null 2>&1; then
+            name=vnstat
+        elif systemctl list-unit-files vnstatd.service >/dev/null 2>&1; then
+            name=vnstatd
+        else
+            printf '%s\n' 'absent'
+            return 0
+        fi
+        systemctl is-active --quiet "$name" && active=1 || active=0
+        systemctl is-enabled --quiet "$name" && enabled=1 || enabled=0
+        printf 'systemd|%s|%s|%s\n' "$name" "$active" "$enabled"
+    elif [[ "${INIT_SYS:-}" == openrc ]] && command -v rc-service >/dev/null 2>&1; then
+        [[ -x /etc/init.d/vnstatd ]] || { printf '%s\n' 'absent'; return 0; }
+        rc-service vnstatd status >/dev/null 2>&1 && active=1 || active=0
+        rc-update show default 2>/dev/null | grep -Eq '(^|[[:space:]])vnstatd([[:space:]]|$)' && enabled=1 || enabled=0
+        printf 'openrc|vnstatd|%s|%s\n' "$active" "$enabled"
+    else
+        return 1
+    fi
+}
+
+restore_vnstat_runtime_state() {
+    local state="$1" kind name active enabled cur_active cur_enabled
+    IFS='|' read -r kind name active enabled <<< "$state"
+    case "$kind" in
+        absent) return 0 ;;
+        systemd)
+            cur_active=0; cur_enabled=0
+            systemctl is-active --quiet "$name" && cur_active=1 || cur_active=0
+            systemctl is-enabled --quiet "$name" && cur_enabled=1 || cur_enabled=0
+            [[ "$cur_active|$cur_enabled" == '1|1' ]] || return 2
+            if [[ "$enabled" == 1 ]]; then systemctl enable "$name" >/dev/null 2>&1 || return 1; else systemctl disable "$name" >/dev/null 2>&1 || return 1; fi
+            if [[ "$active" == 1 ]]; then systemctl start "$name" >/dev/null 2>&1 || systemctl restart "$name" >/dev/null 2>&1 || return 1; else systemctl stop "$name" >/dev/null 2>&1 || return 1; fi
+            ;;
+        openrc)
+            cur_active=0; cur_enabled=0
+            rc-service "$name" status >/dev/null 2>&1 && cur_active=1 || cur_active=0
+            rc-update show default 2>/dev/null | grep -Eq '(^|[[:space:]])vnstatd([[:space:]]|$)' && cur_enabled=1 || cur_enabled=0
+            [[ "$cur_active|$cur_enabled" == '1|1' ]] || return 2
+            if [[ "$enabled" == 1 ]]; then rc-update add "$name" default >/dev/null 2>&1 || return 1; else rc-update del "$name" default >/dev/null 2>&1 || return 1; fi
+            if [[ "$active" == 1 ]]; then rc-service "$name" start >/dev/null 2>&1 || rc-service "$name" restart >/dev/null 2>&1 || return 1; else rc-service "$name" stop >/dev/null 2>&1 || return 1; fi
+            ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+traffic_restore_cron_block() {
+    local pre_file="$1" expected_block="$2" current tmp stripped
+    current=$(umask 077; mktemp /tmp/A-Box-traffic-cron-current.XXXXXX) || return 1
+    tmp=$(umask 077; mktemp /tmp/A-Box-traffic-cron-restore.XXXXXX) || { rm -f -- "$current"; return 1; }
+    if ! read_crontab_to_file "$current"; then rm -f -- "$current" "$tmp"; return 1; fi
+    stripped=$(umask 077; mktemp /tmp/A-Box-traffic-cron-stripped.XXXXXX) || { rm -f -- "$current" "$tmp"; return 1; }
+    if ! strip_abox_cron_blocks_from_file "$current" "$stripped" TRAFFIC; then rm -f -- "$current" "$tmp" "$stripped"; return 1; fi
+    local current_block
+    current_block=$(awk 'BEGIN{p=0} $0=="# A-Box TRAFFIC BEGIN"{p=1} p{print} $0=="# A-Box TRAFFIC END"{exit}' "$current")
+    if [[ -n "$expected_block" ]]; then
+        [[ "$current_block" == "$expected_block" ]] || { rm -f -- "$current" "$tmp" "$stripped"; return 2; }
+    else
+        [[ -z "$current_block" ]] || { rm -f -- "$current" "$tmp" "$stripped"; return 2; }
+    fi
+    cat "$stripped" > "$tmp" || { rm -f -- "$current" "$tmp" "$stripped"; return 1; }
+    if [[ -s "$pre_file" ]]; then cat "$pre_file" >> "$tmp" || { rm -f -- "$current" "$tmp" "$stripped"; return 1; }; fi
+    crontab "$tmp" >/dev/null 2>&1 || { rm -f -- "$current" "$tmp" "$stripped"; return 1; }
+    rm -f -- "$current" "$tmp" "$stripped"
+}
+
+capture_traffic_quota_expected_state() {
+    local tx_dir="$1" current monitor_hash
+    [[ -d "$tx_dir" && ! -L "$tx_dir" ]] || return 1
+    capture_traffic_env_state_file "$ABOX_ENV" "$tx_dir/post-traffic.env" || return 1
+    capture_traffic_optional_state "$ABOX_DESIRED_STATE" "$tx_dir/post.desired" || return 1
+    capture_traffic_optional_state "$ABOX_TRAFFIC_BLOCK_STATE" "$tx_dir/post.block" || return 1
+    current=$(umask 077; mktemp /tmp/A-Box-traffic-postcron.XXXXXX) || return 1
+    read_crontab_to_file "$current" || { rm -f -- "$current"; return 1; }
+    awk 'BEGIN{p=0} $0=="# A-Box TRAFFIC BEGIN"{p=1} p{print} $0=="# A-Box TRAFFIC END"{exit}' "$current" > "$tx_dir/post.cron.traffic" || { rm -f -- "$current"; return 1; }
+    rm -f -- "$current"
+    if [[ -e "$ABOX_DIR/traffic_monitor.sh" || -L "$ABOX_DIR/traffic_monitor.sh" ]]; then
+        [[ -f "$ABOX_DIR/traffic_monitor.sh" && ! -L "$ABOX_DIR/traffic_monitor.sh" ]] || return 1
+        auxiliary_content_is_abox_managed "$ABOX_DIR/traffic_monitor.sh" /etc/ddr/traffic_monitor.sh || return 1
+        monitor_hash=$(traffic_snapshot_file_hash "$ABOX_DIR/traffic_monitor.sh") || return 1
+        printf '%s\n' "$monitor_hash" > "$tx_dir/post.monitor.hash" || return 1
+    else
+        printf '%s\n' none > "$tx_dir/post.monitor.hash"
+    fi
+    if ! capture_vnstat_runtime_state > "$tx_dir/post.vnstat"; then
+        return 1
+    fi
+}
+
+traffic_quota_transaction_rollback() {
+    local tx_dir="$1" rc=0 current_monitor='' expected_monitor='' pre_monitor=0 current_block='' expected_block='' cron_rc vnstat_state='' expected_vnstat='' current_state current_traffic_env current_vnstat
+    [[ -d "$tx_dir" && ! -L "$tx_dir" ]] || return 1
+
+    # Establish every expected post-state before changing anything. This prevents
+    # rollback from overwriting state changed by another actor after provisioning.
+    if [[ -f "$tx_dir/post-traffic.env" ]]; then
+        current_traffic_env=$(umask 077; mktemp /tmp/A-Box-traffic-current-env.XXXXXX) || return 1
+        if ! capture_traffic_env_state_file "$ABOX_ENV" "$current_traffic_env" || ! cmp -s "$current_traffic_env" "$tx_dir/post-traffic.env"; then
+            rm -f -- "$current_traffic_env"
+            printf '%s\n' "A-Box traffic rollback conflict: traffic quota environment changed externally; recovery state preserved at $tx_dir" >&2
+            return 2
+        fi
+        rm -f -- "$current_traffic_env"
+    else
+        printf '%s\n' "A-Box traffic rollback could not establish the expected quota environment; recovery state preserved at $tx_dir" >&2
+        return 1
+    fi
+    if [[ -f "$tx_dir/post.desired" ]]; then
+        traffic_optional_state_matches_expected "$ABOX_DESIRED_STATE" "$tx_dir/post.desired" || {
+            printf '%s\n' "A-Box traffic rollback conflict: desired state changed externally; recovery state preserved at $tx_dir" >&2
+            return 2
+        }
+    else
+        printf '%s\n' "A-Box traffic rollback could not establish the expected desired state; recovery state preserved at $tx_dir" >&2
+        return 1
+    fi
+    if [[ -f "$tx_dir/post.block" ]]; then
+        traffic_optional_state_matches_expected "$ABOX_TRAFFIC_BLOCK_STATE" "$tx_dir/post.block" || {
+            printf '%s\n' "A-Box traffic rollback conflict: traffic block state changed externally; recovery state preserved at $tx_dir" >&2
+            return 2
+        }
+    else
+        printf '%s\n' "A-Box traffic rollback could not establish the expected block state; recovery state preserved at $tx_dir" >&2
+        return 1
+    fi
+
+    if [[ -f "$tx_dir/post.cron.traffic" ]]; then
+        expected_block=$(cat "$tx_dir/post.cron.traffic") || return 1
+        current=$(umask 077; mktemp /tmp/A-Box-traffic-current-cron.XXXXXX) || return 1
+        if ! read_crontab_to_file "$current"; then rm -f -- "$current"; return 1; fi
+        current_block=$(awk 'BEGIN{p=0} $0=="# A-Box TRAFFIC BEGIN"{p=1} p{print} $0=="# A-Box TRAFFIC END"{exit}' "$current")
+        rm -f -- "$current"
+        [[ "$current_block" == "$expected_block" ]] || {
+            printf '%s\n' "A-Box traffic rollback conflict: crontab TRAFFIC block changed externally; recovery state preserved at $tx_dir" >&2
+            return 2
+        }
+    else
+        printf '%s\n' "A-Box traffic rollback could not establish the expected TRAFFIC cron state; recovery state preserved at $tx_dir" >&2
+        return 1
+    fi
+
+    if [[ -s "$tx_dir/post.monitor.hash" ]]; then
+        IFS= read -r expected_monitor < "$tx_dir/post.monitor.hash" || return 1
+        if [[ "$expected_monitor" == none ]]; then
+            [[ ! -e "$ABOX_DIR/traffic_monitor.sh" && ! -L "$ABOX_DIR/traffic_monitor.sh" ]] || {
+                printf '%s\n' "A-Box traffic rollback conflict: traffic_monitor.sh was created externally; recovery state preserved at $tx_dir" >&2
+                return 2
+            }
+        else
+            current_monitor=$(traffic_snapshot_file_hash "$ABOX_DIR/traffic_monitor.sh" 2>/dev/null || true)
+            [[ "$current_monitor" == "$expected_monitor" ]] || {
+                printf '%s\n' "A-Box traffic rollback conflict: traffic_monitor.sh changed externally; recovery state preserved at $tx_dir" >&2
+                return 2
+            }
+        fi
+    else
+        printf '%s\n' "A-Box traffic rollback could not establish the expected monitor state; recovery state preserved at $tx_dir" >&2
+        return 1
+    fi
+
+    if [[ -s "$tx_dir/post.vnstat" ]]; then
+        IFS= read -r current_vnstat < <(capture_vnstat_runtime_state) || {
+            printf '%s\n' "A-Box traffic rollback could not read current vnStat state; recovery state preserved at $tx_dir" >&2
+            return 1
+        }
+        IFS= read -r expected_vnstat < "$tx_dir/post.vnstat" || return 1
+        [[ "$current_vnstat" == "$expected_vnstat" ]] || {
+            printf '%s\n' "A-Box traffic rollback conflict: vnStat state changed externally; recovery state preserved at $tx_dir" >&2
+            return 2
+        }
+    else
+        printf '%s\n' "A-Box traffic rollback could not establish the expected vnStat state; recovery state preserved at $tx_dir" >&2
+        return 1
+    fi
+
+    # Restore only A-Box-owned traffic state after the complete conflict preflight.
+    if [[ -f "$tx_dir/pre-traffic.env" ]]; then
+        local envtmp
+        envtmp=$(mktemp "$ABOX_DIR/.env.A-Box-traffic-rollback.XXXXXX") || rc=1
+        if (( rc == 0 )); then
+            awk '!/^TRAFFIC_LIMIT_(GB|MODE)=/' "$ABOX_ENV" > "$envtmp" || rc=1
+            cat "$tx_dir/pre-traffic.env" >> "$envtmp" || rc=1
+            chmod 600 "$envtmp" || rc=1
+            (( rc == 0 )) && mv -f -- "$envtmp" "$ABOX_ENV" || rm -f -- "$envtmp"
+        fi
+    fi
+    if [[ -s "$tx_dir/pre.desired" ]]; then IFS= read -r current_state < "$tx_dir/pre.desired" && write_private_line "$ABOX_DESIRED_STATE" "$current_state" || rc=1; else rm -f -- "$ABOX_DESIRED_STATE" 2>/dev/null || true; fi
+    if [[ -s "$tx_dir/pre.block" ]]; then IFS= read -r current_state < "$tx_dir/pre.block" && write_private_line "$ABOX_TRAFFIC_BLOCK_STATE" "$current_state" || rc=1; else rm -f -- "$ABOX_TRAFFIC_BLOCK_STATE" 2>/dev/null || true; fi
+
+    if [[ -f "$tx_dir/pre.cron.traffic" ]]; then
+        if ! traffic_restore_cron_block "$tx_dir/pre.cron.traffic" "$expected_block"; then cron_rc=$?; rc=1; fi
+        if (( cron_rc == 2 )); then printf '%s\n' "A-Box traffic rollback conflict: crontab TRAFFIC block changed externally; recovery state preserved at $tx_dir" >&2; fi
+    fi
+
+    if [[ -s "$tx_dir/pre.monitor.meta" ]]; then
+        IFS='|' read -r pre_monitor _ < "$tx_dir/pre.monitor.meta" || rc=1
+        if (( pre_monitor == 1 )); then
+            cp -a -- "$tx_dir/traffic_monitor.pre" "$ABOX_DIR/traffic_monitor.sh" || rc=1
+        else
+            remove_owned_runtime_helper "$ABOX_DIR/traffic_monitor.sh" || rc=1
+        fi
+    else
+        rc=1
+    fi
+
+    if [[ -s "$tx_dir/pre.vnstat" ]]; then
+        IFS= read -r vnstat_state < "$tx_dir/pre.vnstat" || rc=1
+        if [[ -n "$vnstat_state" && "$vnstat_state" != absent ]]; then
+            restore_vnstat_runtime_state "$vnstat_state" || { printf '%s\n' "A-Box traffic rollback incomplete: vnStat state restore failed; recovery state preserved at $tx_dir" >&2; rc=1; }
+        fi
+    else
+        rc=1
+    fi
+    return "$rc"
+}
+
+prepare_traffic_quota_transaction() {
+    local tx_dir="$1" traffic_env_tmp current
+    mkdir -p "$tx_dir" || return 1
+    chmod 700 "$tx_dir" || return 1
+    traffic_env_tmp="$tx_dir/pre-traffic.env"
+    grep -E '^TRAFFIC_LIMIT_(GB|MODE)=' "$ABOX_ENV" > "$traffic_env_tmp" || :
+    [[ -f "$ABOX_DESIRED_STATE" ]] && { cp -a -- "$ABOX_DESIRED_STATE" "$tx_dir/pre.desired" || return 1; } || :
+    [[ -f "$ABOX_TRAFFIC_BLOCK_STATE" ]] && { cp -a -- "$ABOX_TRAFFIC_BLOCK_STATE" "$tx_dir/pre.block" || return 1; } || :
+    current=$(umask 077; mktemp /tmp/A-Box-traffic-precron.XXXXXX) || return 1
+    read_crontab_to_file "$current" || { rm -f -- "$current"; return 1; }
+    awk 'BEGIN{p=0} $0=="# A-Box TRAFFIC BEGIN"{p=1} p{print} $0=="# A-Box TRAFFIC END"{exit}' "$current" > "$tx_dir/pre.cron.traffic" || { rm -f -- "$current"; return 1; }
+    rm -f -- "$current"
+    if [[ -e "$ABOX_DIR/traffic_monitor.sh" || -L "$ABOX_DIR/traffic_monitor.sh" ]]; then
+        [[ -f "$ABOX_DIR/traffic_monitor.sh" && ! -L "$ABOX_DIR/traffic_monitor.sh" ]] || return 1
+        auxiliary_content_is_abox_managed "$ABOX_DIR/traffic_monitor.sh" /etc/ddr/traffic_monitor.sh || return 1
+        printf '1|%s\n' "$(traffic_snapshot_file_hash "$ABOX_DIR/traffic_monitor.sh")" > "$tx_dir/pre.monitor.meta" || return 1
+        cp -a -- "$ABOX_DIR/traffic_monitor.sh" "$tx_dir/traffic_monitor.pre" || return 1
+    else
+        printf '%s\n' '0|none' > "$tx_dir/pre.monitor.meta"
+    fi
+    capture_vnstat_runtime_state > "$tx_dir/pre.vnstat" || return 1
+}
+
+finalize_traffic_quota_transaction() {
+    local tx_dir="$1"
+    capture_traffic_quota_expected_state "$tx_dir"
+}
+
 
 traffic_management_menu() {
     clear
@@ -6242,10 +6751,35 @@ traffic_management_menu() {
             read -r -p '计量模式 total/rx/tx (回车默认 total): ' mode_choice
             mode_choice=${mode_choice:-total}
             [[ "$mode_choice" =~ ^(total|rx|tx)$ ]] || { msg "${RED}[!] 计量模式无效。${NC}"; pause_return; return; }
+            local traffic_tx_dir="" old_die_hook="" traffic_tx_active=0
+            traffic_tx_dir=$(mktemp -d /run/A-Box-traffic-tx.XXXXXX) || die '无法创建流量状态事务目录。'
+            chmod 700 "$traffic_tx_dir" || { rm -rf -- "$traffic_tx_dir"; die '流量状态事务目录权限设置失败。'; }
+            prepare_traffic_quota_transaction "$traffic_tx_dir" || { rm -rf -- "$traffic_tx_dir"; die '无法保存流量限制事务前态。'; }
+            if [[ ${ABOX_DIE_HOOK+x} ]]; then old_die_hook="$ABOX_DIE_HOOK"; fi
+            ABOX_TRAFFIC_TX_DIR="$traffic_tx_dir"
+            ABOX_DIE_HOOK=traffic_quota_menu_die_rollback
+            traffic_quota_menu_die_rollback() {
+                local rollback_rc=0
+                traffic_quota_transaction_rollback "$traffic_tx_dir" || rollback_rc=$?
+                if (( rollback_rc != 0 )); then
+                    printf '%s\n' "A-Box traffic quota rollback incomplete/conflicted; recovery state preserved at $traffic_tx_dir" >&2
+                else
+                    rm -rf -- "$traffic_tx_dir" || true
+                fi
+                if [[ -n "$old_die_hook" && "$old_die_hook" != traffic_quota_menu_die_rollback ]] && declare -F "$old_die_hook" >/dev/null 2>&1; then
+                    "$old_die_hook" "$1" || true
+                fi
+            }
+            traffic_tx_active=1
             setup_traffic_monitor
             update_traffic_state_atomically "$limit_gb" "$mode_choice" || die '流量限制状态原子提交失败。'
             clear_traffic_block_period || die '旧流量封禁周期清理失败。'
             set_desired_state RUNNING || die '服务期望状态写入失败。'
+            finalize_traffic_quota_transaction "$traffic_tx_dir" || die '流量限制事务提交后校验失败。'
+            unset ABOX_DIE_HOOK
+            if [[ -n "$old_die_hook" ]]; then ABOX_DIE_HOOK="$old_die_hook"; fi
+            ABOX_TRAFFIC_TX_DIR=''
+            rm -rf -- "$traffic_tx_dir" || die '流量状态事务清理失败。'
             msg "${GREEN}流量限制已设定为 ${limit_gb} GB，模式 ${mode_choice}。${NC}"
             pause_return
             ;;
@@ -11851,13 +12385,42 @@ capture_managed_service_state() {
 }
 
 
+append_managed_service_state_entry() {
+    local source="$1" dest="$2" srv="$3" line
+    [[ -r "$source" && -f "$source" && ! -L "$source" ]] || return 1
+    line=$(awk -F'|' -v target="$srv" '$1 == target {print; found=1; exit} END {if (!found) exit 1}' "$source") || return 1
+    printf '%s\n' "$line" >> "$dest"
+}
+
 restore_managed_service_state() {
-    local state_file="${1:-}" line srv active enabled seen="|"
+    local state_file="${1:-}" expected_file="${2:-}" line srv active enabled extra seen="|"
     [[ -r "$state_file" && -f "$state_file" && ! -L "$state_file" ]] || return 1
     [[ "$(stat -c %u:%g "$state_file" 2>/dev/null || true)" == 0:0 ]] || return 1
     local mode
     mode=$(stat -c %a "$state_file" 2>/dev/null) || return 1
     [[ "$mode" =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 8#077) == 0 )) || return 1
+    if [[ -n "$expected_file" ]]; then
+        validate_services_state_file "$expected_file" || return 1
+        [[ "$(stat -c %u:%g "$expected_file" 2>/dev/null || true)" == 0:0 ]] || return 1
+        mode=$(stat -c %a "$expected_file" 2>/dev/null) || return 1
+        [[ "$mode" =~ ^[0-7]{3,4}$ ]] && (( (8#$mode & 8#077) == 0 )) || return 1
+        [[ "$(awk -F'|' '{print $1}' "$state_file" | sort)" == "$(awk -F'|' '{print $1}' "$expected_file" | sort)" ]] || return 1
+    fi
+
+    # Preflight the complete expected post-state before changing any service.
+    # A mismatch means another actor changed shared service state; never overwrite
+    # that state with an A-Box rollback snapshot.
+    if [[ -n "$expected_file" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -z "$line" ]] && continue
+            IFS='|' read -r srv _ _ extra <<< "$line"
+            [[ -z "${extra:-}" ]] || return 1
+            local expected_line current_state
+            expected_line="$line"
+            current_state=$(managed_service_state_value "$srv") || return 2
+            [[ "$current_state" == "$expected_line" ]] || return 2
+        done < "$expected_file"
+    fi
 
     while IFS= read -r line || [[ -n "$line" ]]; do
         [[ -z "$line" ]] && continue
@@ -11872,29 +12435,37 @@ restore_managed_service_state() {
         seen+="$srv|"
         abox_owns_service "$srv" || return 1
 
+        if [[ -n "$expected_file" ]]; then
+            local expected_state_before
+            expected_state_before=$(awk -F'|' -v target="$srv" '$1 == target {print; found=1; exit} END {if (!found) exit 1}' "$expected_file") || return 2
+            local current_state_before
+            current_state_before=$(managed_service_state_value "$srv") || return 2
+            [[ "$current_state_before" == "$expected_state_before" ]] || return 2
+        fi
+
         local restored_state restored_srv restored_active restored_enabled restored_extra
         if [[ "${INIT_SYS:-}" == systemd ]]; then
             systemctl daemon-reload >/dev/null 2>&1 || return 1
             if [[ "$enabled" == 1 ]]; then
-                systemctl enable "$srv" >/dev/null 2>&1 || true
+                systemctl enable "$srv" >/dev/null 2>&1 || return 1
             else
-                systemctl disable "$srv" >/dev/null 2>&1 || true
+                systemctl disable "$srv" >/dev/null 2>&1 || return 1
             fi
             if [[ "$active" == 1 ]]; then
-                systemctl start "$srv" >/dev/null 2>&1 || systemctl restart "$srv" >/dev/null 2>&1 || true
+                systemctl start "$srv" >/dev/null 2>&1 || systemctl restart "$srv" >/dev/null 2>&1 || return 1
             else
-                systemctl stop "$srv" >/dev/null 2>&1 || true
+                systemctl stop "$srv" >/dev/null 2>&1 || return 1
             fi
         elif [[ "${INIT_SYS:-}" == openrc ]]; then
             if [[ "$enabled" == 1 ]]; then
-                rc-update add "$srv" default >/dev/null 2>&1 || true
+                rc-update add "$srv" default >/dev/null 2>&1 || return 1
             else
-                rc-update del "$srv" default >/dev/null 2>&1 || true
+                rc-update del "$srv" default >/dev/null 2>&1 || return 1
             fi
             if [[ "$active" == 1 ]]; then
-                rc-service "$srv" start >/dev/null 2>&1 || rc-service "$srv" restart >/dev/null 2>&1 || true
+                rc-service "$srv" start >/dev/null 2>&1 || rc-service "$srv" restart >/dev/null 2>&1 || return 1
             else
-                rc-service "$srv" stop >/dev/null 2>&1 || true
+                rc-service "$srv" stop >/dev/null 2>&1 || return 1
             fi
         else
             return 1
@@ -12411,18 +12982,17 @@ PY_BACKUP_MANIFEST
 }
 
 validate_managed_paths_file() {
-    local file="$1"
+    local file="$1" allowed_paths='' srv core_paths
     [[ -f "$file" && ! -L "$file" ]] || return 1
-    python3 - "$file" <<'PY_MANAGED_PATHS'
+    allowed_paths=$(managed_auxiliary_paths) || return 1
+    for srv in xray sing-box hysteria; do
+        core_paths=$(core_family_paths "$srv") || return 1
+        allowed_paths+=$'\n'"$core_paths"
+    done
+    python3 - "$file" "$allowed_paths" <<'PY_MANAGED_PATHS'
 import sys
 from pathlib import Path
-allowed={
-'/usr/local/bin/sb','/etc/logrotate.d/A-Box','/etc/fail2ban/filter.d/A-Box.conf','/etc/fail2ban/jail.d/A-Box.local',
-'/etc/sysctl.d/99-A-Box-tune.conf','/etc/security/limits.d/A-Box.conf','/etc/systemd/system/A-Box-firewall.service','/etc/init.d/A-Box-firewall',
-'/usr/local/bin/xray','/usr/local/etc/xray','/usr/local/share/xray','/etc/systemd/system/xray.service','/etc/init.d/xray','/etc/conf.d/xray',
-'/usr/local/bin/sing-box','/etc/sing-box','/etc/systemd/system/sing-box.service','/etc/init.d/sing-box','/etc/conf.d/sing-box',
-'/usr/local/bin/hysteria','/etc/hysteria','/etc/systemd/system/hysteria.service','/etc/init.d/hysteria','/etc/conf.d/hysteria',
-}
+allowed={x for x in sys.argv[2].splitlines() if x}
 lines=[x for x in Path(sys.argv[1]).read_text(encoding='utf-8',errors='strict').splitlines() if x]
 if len(lines)!=len(set(lines)) or any(x not in allowed for x in lines): raise SystemExit(1)
 PY_MANAGED_PATHS
@@ -14322,20 +14892,37 @@ prepare_noninteractive_service_control() {
 }
 
 manual_stop_managed_stack() {
-    local srv failed=0 services previous_state state i
-    local -a stopped_services=()
+    local srv failed=0 services previous_state state pre_state changed_pre changed_expected tx_dir
+    local -a changed_services=()
     prepare_noninteractive_service_control
     services=$(expected_managed_services) || die '无法读取有效的 A-Box 部署状态。'
     previous_state=$(get_desired_state) || die '无法读取当前 A-Box 期望状态。'
+    tx_dir=$(mktemp -d /run/A-Box-service-tx.XXXXXX) || die '无法创建服务状态事务目录。'
+    chmod 700 "$tx_dir" || { rm -rf -- "$tx_dir"; die '服务状态事务目录权限设置失败。'; }
+    pre_state="$tx_dir/pre.state"
+    changed_pre="$tx_dir/changed-pre.state"
+    changed_expected="$tx_dir/changed-expected.state"
+    capture_managed_service_state "$pre_state" || { rm -rf -- "$tx_dir"; die '无法保存服务运行/启用状态快照。'; }
+    : > "$changed_pre"; : > "$changed_expected"
+
     while IFS= read -r srv; do
         [[ -n "$srv" ]] || continue
-        state=$(service_active_state_value "$srv" 2>/dev/null) || { failed=1; continue; }
+        state=$(service_active_state_value "$srv" 2>/dev/null) || { failed=1; break; }
         if [[ "$state" == 1 ]]; then
+            append_managed_service_state_entry "$pre_state" "$changed_pre" "$srv" || { failed=1; break; }
             if stop_abox_service "$srv"; then
-                stopped_services+=("$srv")
+                printf '%s|0|0\n' "$srv" >> "$changed_expected" || { failed=1; break; }
+                changed_services+=("$srv")
             else
-                state=$(service_active_state_value "$srv" 2>/dev/null || printf unknown)
-                [[ "$state" == 0 ]] && stopped_services+=("$srv")
+                # The stop helper can fail after a partial stop/disable. Probe the
+                # current state only to classify a known intermediate state; do not
+                # claim rollback ownership for an indeterminate service.
+                local post_state
+                post_state=$(managed_service_state_value "$srv" 2>/dev/null || true)
+                if [[ "$post_state" == "$srv|0|0" || "$post_state" == "$srv|0|1" ]]; then
+                    printf '%s\n' "$post_state" >> "$changed_expected" 2>/dev/null || true
+                    changed_services+=("$srv")
+                fi
                 failed=1
                 break
             fi
@@ -14344,35 +14931,47 @@ manual_stop_managed_stack() {
             break
         fi
     done <<< "$services"
+
     if (( failed == 0 )); then
         while IFS= read -r srv; do
             [[ -n "$srv" ]] || continue
-            state=$(service_active_state_value "$srv" 2>/dev/null) || { failed=1; break; }
-            [[ "$state" == 0 ]] || { failed=1; break; }
+            local final_state
+            final_state=$(managed_service_state_value "$srv" 2>/dev/null) || { failed=1; break; }
+            [[ "$final_state" == "$srv|0|0" ]] || { failed=1; break; }
         done <<< "$services"
     fi
+
+    service_tx_rollback() {
+        local rc=0
+        if (( ${#changed_services[@]} )); then
+            restore_managed_service_state "$changed_pre" "$changed_expected" || rc=$?
+        fi
+        return "$rc"
+    }
+    service_tx_fail() {
+        local rc=0 recovery="$tx_dir"
+        if ! service_tx_rollback; then
+            printf '%s\n' "A-Box service rollback incomplete or conflicted; recovery state preserved at $recovery" >&2
+            return 1
+        fi
+        rm -rf -- "$tx_dir" || return 1
+        return 1
+    }
+
     if (( failed != 0 )); then
-        # Desired state remains unchanged. Runtime rollback is best-effort for
-        # services already stopped by this operation.
-        for ((i=${#stopped_services[@]}-1; i>=0; i--)); do
-            start_owned "${stopped_services[i]}" >/dev/null 2>&1 || true
-        done
-        set_desired_state "$previous_state" >/dev/null 2>&1 || true
+        service_tx_fail || true
         die '至少一个托管服务停止失败；未提交 MANUAL_STOPPED 状态。'
     fi
     set_desired_state MANUAL_STOPPED || {
-        for ((i=${#stopped_services[@]}-1; i>=0; i--)); do
-            start_owned "${stopped_services[i]}" >/dev/null 2>&1 || true
-        done
-        set_desired_state "$previous_state" >/dev/null 2>&1 || true
+        service_tx_fail || true
         die '服务已停止但 MANUAL_STOPPED 状态提交失败；已尝试恢复原运行状态。'
     }
+    rm -rf -- "$tx_dir" || die '服务状态事务清理失败；服务已按预期停止，但未能清理事务材料。'
     printf 'A-Box managed stack stopped; Intent=MANUAL_STOPPED\n'
 }
 
 manual_start_managed_stack() {
-    local srv failed=0 services previous_state previous_block_period='' block_state_present=0 state i
-    local -a started_services=()
+    local srv failed=0 services previous_state previous_block_period='' block_state_present=0 state pre_state changed_pre changed_expected tx_dir
     prepare_noninteractive_service_control
     services=$(expected_managed_services) || die '无法读取有效的 A-Box 部署状态。'
     previous_state=$(get_desired_state) || die '无法读取当前 A-Box 期望状态。'
@@ -14380,17 +14979,32 @@ manual_start_managed_stack() {
         previous_block_period=$(get_traffic_block_period) || die '无法读取当前流量封禁周期状态。'
         block_state_present=1
     fi
+    tx_dir=$(mktemp -d /run/A-Box-service-tx.XXXXXX) || die '无法创建服务状态事务目录。'
+    chmod 700 "$tx_dir" || { rm -rf -- "$tx_dir"; die '服务状态事务目录权限设置失败。'; }
+    pre_state="$tx_dir/pre.state"
+    changed_pre="$tx_dir/changed-pre.state"
+    changed_expected="$tx_dir/changed-expected.state"
+    capture_managed_service_state "$pre_state" || { rm -rf -- "$tx_dir"; die '无法保存服务运行/启用状态快照。'; }
+    : > "$changed_pre"; : > "$changed_expected"
+
     while IFS= read -r srv; do
         [[ -n "$srv" ]] || continue
         abox_owns_service "$srv" || { failed=1; break; }
         state=$(service_active_state_value "$srv" 2>/dev/null) || { failed=1; break; }
         case "$state" in
             0)
+                append_managed_service_state_entry "$pre_state" "$changed_pre" "$srv" || { failed=1; break; }
                 if start_abox_service_soft "$srv"; then
-                    started_services+=("$srv")
+                    printf '%s|1|1\n' "$srv" >> "$changed_expected" || { failed=1; break; }
                 else
-                    state=$(service_active_state_value "$srv" 2>/dev/null || printf unknown)
-                    [[ "$state" == 1 ]] && started_services+=("$srv")
+                    # start_abox_service_soft enables before restart. Capture only
+                    # known reachable intermediate states so rollback can restore
+                    # them without guessing about external changes.
+                    local post_state
+                    post_state=$(managed_service_state_value "$srv" 2>/dev/null || true)
+                    if [[ "$post_state" == "$srv|0|1" || "$post_state" == "$srv|1|1" ]]; then
+                        printf '%s\n' "$post_state" >> "$changed_expected" 2>/dev/null || true
+                    fi
                     failed=1
                     break
                 fi
@@ -14399,28 +15013,49 @@ manual_start_managed_stack() {
             *) failed=1; break ;;
         esac
     done <<< "$services"
+
     if (( failed == 0 )); then
         while IFS= read -r srv; do
             [[ -n "$srv" ]] || continue
-            state=$(service_active_state_value "$srv" 2>/dev/null) || { failed=1; break; }
-            [[ "$state" == 1 ]] || { failed=1; break; }
+            local final_state
+            final_state=$(managed_service_state_value "$srv" 2>/dev/null) || { failed=1; break; }
+            [[ "$final_state" == "$srv|1|1" ]] || { failed=1; break; }
         done <<< "$services"
     fi
-    if (( failed == 0 )) && clear_traffic_block_period && set_desired_state RUNNING; then
-        printf 'A-Box managed stack started; Intent=RUNNING\n'
-        return 0
-    fi
 
-    for ((i=${#started_services[@]}-1; i>=0; i--)); do
-        stop_abox_service "${started_services[i]}" >/dev/null 2>&1 || true
-    done
-    if (( block_state_present == 1 )); then
-        set_traffic_block_period "$previous_block_period" >/dev/null 2>&1 || true
-    else
-        clear_traffic_block_period >/dev/null 2>&1 || true
+    service_tx_rollback() {
+        local rc=0
+        if [[ -s "$changed_pre" ]]; then
+            restore_managed_service_state "$changed_pre" "$changed_expected" || rc=$?
+        fi
+        return "$rc"
+    }
+    service_tx_fail() {
+        if ! service_tx_rollback; then
+            printf '%s\n' "A-Box service rollback incomplete or conflicted; recovery state preserved at $tx_dir" >&2
+            return 1
+        fi
+        rm -rf -- "$tx_dir" || return 1
+        return 1
+    }
+
+    if (( failed == 0 )); then
+        if ! clear_traffic_block_period || ! set_desired_state RUNNING; then
+            failed=1
+        fi
     fi
-    set_desired_state "$previous_state" >/dev/null 2>&1 || true
-    die '至少一个托管服务启动或状态提交失败；已回滚本次启动并恢复原状态。'
+    if (( failed != 0 )); then
+        if (( block_state_present == 1 )); then
+            set_traffic_block_period "$previous_block_period" >/dev/null 2>&1 || true
+        else
+            clear_traffic_block_period >/dev/null 2>&1 || true
+        fi
+        set_desired_state "$previous_state" >/dev/null 2>&1 || true
+        service_tx_fail || true
+        die '至少一个托管服务启动或状态提交失败；已尝试回滚本次启动并恢复原状态。'
+    fi
+    rm -rf -- "$tx_dir" || die '服务状态事务清理失败；服务已按预期启动，但未能清理事务材料。'
+    printf 'A-Box managed stack started; Intent=RUNNING\n'
 }
 
 show_cli_help() {
@@ -14587,6 +15222,16 @@ run_self_tests() {
     grep -q 'prepare_hysteria_acme_dir_ownership' "$0" || { echo 'FAIL: Hysteria ACME ownership gate missing'; failures=$((failures + 1)); }
     grep -q 'prepare_hysteria_acme_dir_ownership || return 1' "$0" || { echo 'FAIL: Hysteria cleanup legacy ownership migration gate missing'; failures=$((failures + 1)); }
     declare -F validate_abox_cron_file >/dev/null 2>&1 || { echo 'FAIL: cron semantic validator missing'; failures=$((failures + 1)); }
+    _managed_paths_fixture="$tmp/all-managed-paths.txt"
+    _saved_init_for_paths="${INIT_SYS:-}"
+    INIT_SYS=systemd
+    { managed_auxiliary_paths; for _srv in xray sing-box hysteria; do core_family_paths "$_srv" || exit 1; done; } | awk 'NF && !seen[$0]++' > "$_managed_paths_fixture" || { echo 'FAIL: authoritative managed-path enumeration'; failures=$((failures + 1)); }
+    validate_managed_paths_file "$_managed_paths_fixture" || { echo 'FAIL: full managed-path set must pass recovery whitelist validation'; failures=$((failures + 1)); }
+    INIT_SYS="$_saved_init_for_paths"
+    unset _saved_init_for_paths
+    grep -Fxq '/etc/modules-load.d/A-Box-bbr.conf' "$_managed_paths_fixture" || { echo 'FAIL: BBR managed path missing from authoritative test set'; failures=$((failures + 1)); }
+    printf '%s\n' '/etc/A-Box-selftest-unmanaged-path' >> "$_managed_paths_fixture"
+    if validate_managed_paths_file "$_managed_paths_fixture"; then echo 'FAIL: unmanaged recovery path accepted'; failures=$((failures + 1)); fi
     [[ "$ABOX_BUILD_EPOCH" =~ ^[0-9]+$ ]] || { echo 'FAIL: numeric build epoch missing'; failures=$((failures + 1)); }
     declare -F remove_ss_open_accept_rules >/dev/null 2>&1 || { echo 'FAIL: SS open ACCEPT cleanup missing'; failures=$((failures + 1)); }
     declare -F show_sni_preference_records >/dev/null 2>&1 || { echo 'FAIL: SNI record viewer missing'; failures=$((failures + 1)); }
@@ -14838,6 +15483,31 @@ run_self_tests() {
     [[ "$(msg 'literal\nbackslash\ttext')" == $'literal\\nbackslash\\ttext' ]] || { echo 'FAIL: msg must not reinterpret backslash escapes'; failures=$((failures + 1)); }
     [[ "$(msg "${RED}X${NC}")" == $'\033[0;31mX\033[0m' ]] || { echo 'FAIL: ANSI color escapes must remain functional'; failures=$((failures + 1)); }
 
+    if ! (
+        _curl_counter="$tmp/github-retry-count"
+        printf '0\n' > "$_curl_counter"
+        curl() {
+            local out=''; while (($#)); do case "$1" in -o) out="$2"; shift 2;; *) shift;; esac; done
+            local n; n=$(cat "$_curl_counter"); n=$((n + 1)); printf '%s\n' "$n" > "$_curl_counter"
+            printf '%s\n' "retry-${n}" > "$out"
+            if (( n == 1 )); then printf '500'; else printf '200'; fi
+        }
+        export GITHUB_API_RETRY_DELAY=0
+        [[ "$(github_api_get https://example.invalid/selftest-retry)" == 'retry-2' && "$(cat "$_curl_counter")" == 2 ]]
+    ); then echo 'FAIL: GitHub API must retry transient 5xx once'; failures=$((failures + 1)); fi
+    if ! (
+        _curl_counter="$tmp/github-403-count"
+        printf '0\n' > "$_curl_counter"
+        curl() {
+            local out=''; while (($#)); do case "$1" in -o) out="$2"; shift 2;; *) shift;; esac; done
+            local n; n=$(cat "$_curl_counter"); n=$((n + 1)); printf '%s\n' "$n" > "$_curl_counter"
+            : > "$out"; printf '403'
+        }
+        unset GITHUB_TOKEN
+        export GITHUB_API_RETRY_DELAY=0
+        ! github_api_get https://example.invalid/selftest-403 >/dev/null 2>&1 && [[ "$(cat "$_curl_counter")" == 1 ]]
+    ); then echo 'FAIL: GitHub API must not retry 403'; failures=$((failures + 1)); fi
+    unset GITHUB_API_RETRY_DELAY
     local redacted_json redacted_headers
     redacted_json=$(printf '%s\n' '{"password":"secret","nested":{"token":"abc"},"uri":"vless://abc@host:443"}' | redact_secrets_stream)
     grep -q '\*\*\*REDACTED\*\*\*' <<< "$redacted_json" || { echo 'FAIL: JSON secret redaction'; failures=$((failures + 1)); }
@@ -15115,12 +15785,18 @@ PY_SELFTEST_YAML
     grep -Fq 'state_load_failed=0' <<< "$traffic_body" || { echo 'FAIL: traffic monitor persisted-state failure handling missing'; failures=$((failures + 1)); }
     grep -Fq 'stop_all_owned_services() {' <<< "$traffic_body" || { echo 'FAIL: traffic monitor fail-closed stop path missing'; failures=$((failures + 1)); }
     grep -Fq 'persisted traffic state is unreadable or invalid' <<< "$traffic_body" || { echo 'FAIL: traffic monitor invalid persisted state must fail closed'; failures=$((failures + 1)); }
-    grep -Fq 'restore_iptables_saved_snapshot "$restore_cmd" "$snapshot"' <<< "$source_body" || { echo 'FAIL: firewall reorder rollback snapshot missing'; failures=$((failures + 1)); }
-    grep -Fq 'local save_cmd="${cmd}-save" restore_cmd="${cmd}-restore"' <<< "$source_body" || { echo 'FAIL: firewall reorder must bind snapshot tools to the selected iptables family'; failures=$((failures + 1)); }
+    grep -q '^reorder_ss_whitelist_rules_one() {' <<< "$source_body" || { echo 'FAIL: firewall reorder transaction missing'; failures=$((failures + 1)); }
+    grep -Fq 'exec {lock_fd}>>"$lock_file"' <<< "$source_body" || { echo 'FAIL: firewall reorder transaction lock missing'; failures=$((failures + 1)); }
+    grep -Fq 'firewall_rollback() {' <<< "$source_body" || { echo 'FAIL: firewall reorder rollback helper missing'; failures=$((failures + 1)); }
+    grep -Fq 'recovery snapshot preserved at $recovery_snapshot' <<< "$source_body" || { echo 'FAIL: firewall rollback conflict must preserve recovery snapshot'; failures=$((failures + 1)); }
+    grep -Fq '"${cmd}" -w -D INPUT "${rollback_argv_arr[@]:2}"' <<< "$source_body" || { echo 'FAIL: firewall rollback must remove exact owned rules'; failures=$((failures + 1)); }
+    grep -Fq 'current_foreign_lines' <<< "$source_body" || { echo 'FAIL: firewall rollback must track foreign INPUT rules'; failures=$((failures + 1)); }
     grep -Fq 'path_parent_chain_safe "$ABOX_DIR" || return 1' <<< "$source_body" || { echo 'FAIL: rollback restore must validate A-Box parent chain'; failures=$((failures + 1)); }
     grep -Fq 'install -d -m 700 "$ABOX_DIR" || return 1' <<< "$source_body" || { echo 'FAIL: rollback restore must recreate a missing A-Box directory'; failures=$((failures + 1)); }
     grep -Fq 'previous_state=$(get_desired_state)' "$0" || { echo 'FAIL: manual service transitions must snapshot desired state'; failures=$((failures + 1)); }
-    grep -Fq 'local -a started_services=()' "$0" || { echo 'FAIL: manual start rollback must track operation-started services'; failures=$((failures + 1)); }
+    grep -Fq 'local pre_state=' "$0" || { echo 'FAIL: manual service transactions must capture pre-state'; failures=$((failures + 1)); }
+    grep -Fq 'restore_managed_service_state "$changed_pre" "$changed_expected"' "$0" || { echo 'FAIL: manual service rollback must use expected-state conflict guards'; failures=$((failures + 1)); }
+    grep -Fq 'current_state_before=$(managed_service_state_value' "$0" || { echo 'FAIL: service rollback must recheck state before mutation'; failures=$((failures + 1)); }
     grep -Fq 'start_abox_service_soft "$srv"' "$0" || { echo 'FAIL: manual start must use non-fatal service start path'; failures=$((failures + 1)); }
     grep -Fq 'local preflight_rc=$(( fail > 0 ? 1 : 0 ))' "$0" || { echo 'FAIL: preflight must preserve result before cleanup'; failures=$((failures + 1)); }
     grep -Fq 'rm -rf -- "$report_dir" || return 1' "$0" || { echo 'FAIL: preflight report directory cleanup missing'; failures=$((failures + 1)); }
@@ -15130,6 +15806,11 @@ PY_SELFTEST_YAML
     _setup_line=$(grep -n -m1 'setup_traffic_monitor' <<< "$_traffic_menu" | cut -d: -f1 || true)
     _update_line=$(grep -n -m1 'update_traffic_state_atomically "$limit_gb" "$mode_choice"' <<< "$_traffic_menu" | cut -d: -f1 || true)
     [[ "$_setup_line" =~ ^[0-9]+$ && "$_update_line" =~ ^[0-9]+$ && "$_setup_line" -lt "$_update_line" ]] || { echo 'FAIL: quota monitor must be provisioned before quota-state commit'; failures=$((failures + 1)); }
+    grep -q '^capture_vnstat_runtime_state() {' "$0" || { echo 'FAIL: traffic transaction vnStat snapshot helper missing'; failures=$((failures + 1)); }
+    grep -q '^traffic_restore_cron_block() {' "$0" || { echo 'FAIL: traffic transaction must restore only the A-Box TRAFFIC cron block'; failures=$((failures + 1)); }
+    grep -q '^traffic_quota_transaction_rollback() {' "$0" || { echo 'FAIL: traffic quota rollback helper missing'; failures=$((failures + 1)); }
+    grep -Fq 'expected_vnstat' "$0" || { echo 'FAIL: traffic rollback must not reuse cron expected-state variable for vnStat'; failures=$((failures + 1)); }
+    grep -Fq 'ABOX_DIE_HOOK=traffic_quota_menu_die_rollback' "$0" || { echo 'FAIL: traffic setup/commit failure must trigger transaction rollback'; failures=$((failures + 1)); }
     grep -q '^firewall_snapshot_is_abox_managed() {' <<< "$source_body" || { echo 'FAIL: firewall persistence ownership gate missing'; failures=$((failures + 1)); }
     grep -Fq 'auxiliary_content_is_abox_managed "$fw_file" /etc/ddr/firewall_restore.sh || return 1' <<< "$source_body" || { echo 'FAIL: firewall persistence must preflight ownership before service deletion'; failures=$((failures + 1)); }
     grep -Fq '(( uid != 0 && gid != 0 )) || return 1' <<< "$source_body" || { echo 'FAIL: runtime service identity must never resolve to root UID/GID'; failures=$((failures + 1)); }
@@ -15142,6 +15823,7 @@ PY_SELFTEST_YAML
     grep -Fq 'valid_traffic_limit_gb "$limit_gb"' "$0" || { echo 'FAIL: traffic-limit prompt must use the persisted traffic-limit validator'; failures=$((failures + 1)); }
     grep -Fq 'read -r -p "$prompt" input || return 1' "$0" || { echo 'FAIL: looped input prompts must return failure on EOF'; failures=$((failures + 1)); }
     grep -Fq 'VLESS_PORT=$(prompt_port_input "$L_VISION" "$DEF_V_PORT") || die' "$0" || { echo 'FAIL: prompt command substitutions must propagate EOF failure'; failures=$((failures + 1)); }
+    grep -Fq 'exec < /dev/tty || die' "$0" || { echo 'FAIL: need_interactive_tty must fail fast when opening /dev/tty fails'; failures=$((failures + 1)); }
     if grep -Eq '(^|[[:space:];])read[[:space:]]+-r[[:space:]]+-e(p)?([[:space:]]|$)' "$0" || grep -Eq '(^|[[:space:];])read[[:space:]]+-r[[:space:]]+-e[[:space:]]+-p([[:space:]]|$)' "$0"; then
         echo 'FAIL: interactive reads must not use readline mode because Ctrl-D/EOF can stall on PTY inputs'
         failures=$((failures + 1))
@@ -15230,6 +15912,24 @@ EOF_SVC_TEST_SYSTEMCTL
     PATH="${_svc_test_bin}:$PATH"
     systemd_available() { return 0; }
     INIT_SYS=systemd
+    _svc_guard_pre="$tmp/service-guard-pre.state"
+    _svc_guard_expected="$tmp/service-guard-expected.state"
+    _svc_guard_log="$tmp/service-guard.log"
+    printf '%s\n' 'xray|0|0' > "$_svc_guard_pre"
+    printf '%s\n' 'xray|1|1' > "$_svc_guard_expected"
+    chown root:root "$_svc_guard_pre" "$_svc_guard_expected" || true
+    chmod 600 "$_svc_guard_pre" "$_svc_guard_expected"
+    _svc_guard_saved_state_fn=$(declare -f managed_service_state_value)
+    _svc_guard_saved_owns_fn=$(declare -f abox_owns_service)
+    managed_service_state_value() { printf '%s\n' 'xray|1|0'; }
+    abox_owns_service() { return 0; }
+    : > "$_svc_guard_log"
+    if restore_managed_service_state "$_svc_guard_pre" "$_svc_guard_expected" >/dev/null 2>&1; then
+        echo 'FAIL: service rollback must reject externally changed state'
+        failures=$((failures + 1))
+    fi
+    eval "$_svc_guard_saved_state_fn"
+    eval "$_svc_guard_saved_owns_fn"
     export ABOX_SELFTEST_SERVICE_QUERY_FAIL=1
     if service_active_state_value xray >/dev/null 2>&1; then
         echo 'FAIL: systemd active-state query error was accepted'
