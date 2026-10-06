@@ -33,7 +33,7 @@ PUBLIC_IP_CACHE_TTL=600
 BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-10}
 LOCK_FALLBACK_DIR='/run/A-Box.lock.d'
 ABOX_LANG='zh'
-ABOX_BUILD='2026-10-06-bugfix-v134'
+ABOX_BUILD='2026-10-06-bugfix-v135'
 ABOX_BUILD_EPOCH=20261006134
 # Current Xray compatibility pin for iOS Shadowrocket + XHTTP/REALITY as of 2026-10-05.
 # This pin is a prerelease upstream build; newer prereleases remain opt-in via ABOX_XRAY_VERSION.
@@ -3643,16 +3643,23 @@ add_port_pair() {
     printf -v "$arr_name" '%s%s/%s\n' "${!arr_name}" "$proto" "$port"
 }
 
+hy2_http01_enabled() {
+    local core="${1:-${CORE_IN:-${CORE:-}}}" mode="${2:-${MODE_IN:-${MODE:-}}}"
+    [[ -n "${HY2_DOMAIN:-}" && "${HY2_ACME_TYPE:-http}" == http &&
+       ( "$core" == 'hysteria' || ( "$core" == 'xray' && "$mode" == *'ALL'* ) ) ]]
+}
+
 selected_port_pairs() {
     local pairs=''
     add_port_pair pairs tcp "${VLESS_PORT:-}"
     add_port_pair pairs tcp "${XHTTP_PORT:-}"
     add_port_pair pairs tcp "${SS_PORT:-}"
     add_port_pair pairs udp "${SS_PORT:-}"
-    # HTTP-01 ACME temporarily binds TCP/80; include it in the planned listener
-    # set so it conflicts with user-selected node ports before startup.
-    if [[ -n "${HY2_DOMAIN:-}" && "${HY2_ACME_TYPE:-http}" == http ]]; then
+    # HTTP-01 ACME temporarily binds TCP/80; include it only for engines that
+    # actually use Hysteria/CertMagic HTTP-01.
+    if hy2_http01_enabled; then
         add_port_pair pairs tcp 80
+    fi
     fi
     # Native Hysteria official range mode listens on the first range port; the
     # separate base port is only real for non-hopping/manual redirect modes.
@@ -5222,7 +5229,7 @@ pre_install_setup() {
     printf '%s\n\n' "${CYAN}======================================================================${NC}"
 
     check_selected_ports_free
-    if [[ "$HAS_HY2" == 'true' && -n "${HY2_DOMAIN:-}" && "${HY2_ACME_TYPE:-http}" == 'http' && ( "$CORE_IN" == 'hysteria' || ( "$CORE_IN" == 'xray' && "$MODE_IN" == *'ALL'* ) ) ]]; then
+    if [[ "$HAS_HY2" == 'true' ]] && hy2_http01_enabled "$CORE_IN" "$MODE_IN"; then
         if ! holder=$(ss -H -n -l -p -A tcp 2>/dev/null); then
             die '无法检查 80/tcp 端口占用；ss 查询失败。'
         fi
@@ -5237,7 +5244,7 @@ pre_install_setup() {
     [[ "$HAS_VISION" == 'true' ]] && allowPort "$VLESS_PORT" tcp
     [[ "$HAS_XHTTP" == 'true' ]] && allowPort "$XHTTP_PORT" tcp
     if [[ "$HAS_HY2" == 'true' ]]; then
-        if [[ -n "$HY2_DOMAIN" && "${HY2_ACME_TYPE:-http}" == 'http' && ( "$CORE_IN" == 'hysteria' || ( "$CORE_IN" == 'xray' && "$MODE_IN" == *'ALL'* ) ) ]]; then
+        if hy2_http01_enabled "$CORE_IN" "$MODE_IN"; then
             allowPort 80 tcp
         fi
         if [[ "$HY2_HOP" == 'true' ]]; then
@@ -15327,12 +15334,16 @@ run_self_tests() {
         -u GITHUB_TOKEN' "$0" || { echo 'FAIL: remote third-party scripts must not inherit GITHUB_TOKEN'; failures=$((failures + 1)); }
 
     [[ "$(normalize_port_spec 020000-025000)" == '20000:25000' ]] || { echo 'FAIL: normalize port range'; failures=$((failures + 1)); }
-    HY2_DOMAIN=example.com HY2_ACME_TYPE=http VLESS_PORT=80 XHTTP_PORT=9443 SS_PORT=2053 HY2_BASE_PORT=443 HY2_HOP=false HY2_HOP_IMPL=none
-    [[ "$(selected_port_pairs | grep -Fx 'tcp/80')" == 'tcp/80' ]] || { echo 'FAIL: HTTP-01 TCP/80 missing from planned port set'; failures=$((failures + 1)); }
-    [[ "$(selected_port_pairs | awk 'NF' | sort | uniq -d)" == 'tcp/80' ]] || { echo 'FAIL: HTTP-01 TCP/80 conflict was not detected'; failures=$((failures + 1)); }
+    HY2_DOMAIN=example.com HY2_ACME_TYPE=http CORE_IN=hysteria MODE_IN=HY2 VLESS_PORT=80 XHTTP_PORT=9443 SS_PORT=2053 HY2_BASE_PORT=443 HY2_HOP=false HY2_HOP_IMPL=none
+    [[ "$(selected_port_pairs | grep -Fx 'tcp/80')" == 'tcp/80' ]] || { echo 'FAIL: Hysteria HTTP-01 must reserve TCP/80'; failures=$((failures + 1)); }
+    [[ "$(selected_port_pairs | awk 'NF' | sort | uniq -d)" == 'tcp/80' ]] || { echo 'FAIL: Hysteria HTTP-01 TCP/80 conflict was not detected'; failures=$((failures + 1)); }
+    CORE_IN=singbox MODE_IN=HY2
+    [[ "$(selected_port_pairs | grep -Fx 'tcp/80')" != 'tcp/80' ]] || { echo 'FAIL: Sing-box HY2 domain must not reserve TCP/80'; failures=$((failures + 1)); }
+    CORE_IN=xray MODE_IN=ALL HY2_ACME_TYPE=http
+    [[ "$(selected_port_pairs | grep -Fx 'tcp/80')" == 'tcp/80' ]] || { echo 'FAIL: Xray ALL HTTP-01 must reserve TCP/80'; failures=$((failures + 1)); }
     HY2_ACME_TYPE=dns
     [[ "$(selected_port_pairs | grep -Fx 'tcp/80')" != 'tcp/80' ]] || { echo 'FAIL: DNS-01 must not reserve TCP/80'; failures=$((failures + 1)); }
-    unset HY2_DOMAIN HY2_ACME_TYPE VLESS_PORT XHTTP_PORT SS_PORT HY2_BASE_PORT HY2_HOP HY2_HOP_IMPL
+    unset HY2_DOMAIN HY2_ACME_TYPE CORE_IN MODE_IN VLESS_PORT XHTTP_PORT SS_PORT HY2_BASE_PORT HY2_HOP HY2_HOP_IMPL
     [[ "$(sni_domain_penalty www.apple.com)" == '1800' ]] || { echo 'FAIL: Apple www SNI penalty'; failures=$((failures + 1)); }
     [[ "$(sni_domain_penalty maps.apple.com)" == '2400' ]] || { echo 'FAIL: Apple subdomain SNI penalty'; failures=$((failures + 1)); }
     [[ "$(sni_domain_penalty apple.com)" == '2400' ]] || { echo 'FAIL: Apple apex SNI penalty'; failures=$((failures + 1)); }
