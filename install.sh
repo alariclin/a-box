@@ -33,8 +33,8 @@ PUBLIC_IP_CACHE_TTL=600
 BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-10}
 LOCK_FALLBACK_DIR='/run/A-Box.lock.d'
 ABOX_LANG='zh'
-ABOX_BUILD='2026-10-05-bugfix-v133'
-ABOX_BUILD_EPOCH=20261005133
+ABOX_BUILD='2026-10-06-bugfix-v134'
+ABOX_BUILD_EPOCH=20261006134
 # Current Xray compatibility pin for iOS Shadowrocket + XHTTP/REALITY as of 2026-10-05.
 # This pin is a prerelease upstream build; newer prereleases remain opt-in via ABOX_XRAY_VERSION.
 ABOX_XRAY_DEFAULT_VERSION='v26.6.27'
@@ -1645,12 +1645,27 @@ if len({(r[0],r[1],r[2]) for r in rows}) != len(rows):
 # original hashes, so a user edit to config.yaml/certs still fails closed.
 rows=[r for r in rows if not (r[1]==srv and (r[2]==target or r[2].startswith(target + '/')))]
 entries=[]
+mountpoints=set()
+try:
+    with open('/proc/self/mountinfo','r',encoding='utf-8',errors='strict') as mf:
+        for line in mf:
+            fields=line.rstrip('\n').split(' ')
+            if len(fields) < 5:
+                continue
+            mp=__import__('re').sub(r'\\([0-7]{3})', lambda m: chr(int(m.group(1),8)), fields[4])
+            mountpoints.add(os.path.abspath(os.path.normpath(mp)))
+except (OSError, UnicodeError):
+    raise SystemExit(1)
+
+def is_mountpoint(path):
+    return os.path.abspath(os.path.normpath(path)) in mountpoints
+
 try:
     st=safe_stat(target)
 except FileNotFoundError:
     st=None
 if st is not None:
-    if not stat.S_ISDIR(st.st_mode) or os.path.ismount(target):
+    if not stat.S_ISDIR(st.st_mode) or is_mountpoint(target):
         raise SystemExit(1)
     def add(path):
         st=safe_stat(path)
@@ -1662,7 +1677,7 @@ if st is not None:
                 for chunk in iter(lambda:f.read(1024*1024), b''): h.update(chunk)
             entries.append(['F',srv,path,h.hexdigest()])
         elif stat.S_ISDIR(st.st_mode):
-            if os.path.ismount(path): raise SystemExit(1)
+            if is_mountpoint(path): raise SystemExit(1)
             entries.append(['D',srv,path,'-'])
             for name in sorted(os.listdir(path), key=os.fsencode):
                 add(os.path.join(path,name))
@@ -3634,6 +3649,11 @@ selected_port_pairs() {
     add_port_pair pairs tcp "${XHTTP_PORT:-}"
     add_port_pair pairs tcp "${SS_PORT:-}"
     add_port_pair pairs udp "${SS_PORT:-}"
+    # HTTP-01 ACME temporarily binds TCP/80; include it in the planned listener
+    # set so it conflicts with user-selected node ports before startup.
+    if [[ -n "${HY2_DOMAIN:-}" && "${HY2_ACME_TYPE:-http}" == http ]]; then
+        add_port_pair pairs tcp 80
+    fi
     # Native Hysteria official range mode listens on the first range port; the
     # separate base port is only real for non-hopping/manual redirect modes.
     if [[ "${HY2_HOP:-}" != true || "${HY2_HOP_IMPL:-none}" != official ]]; then
@@ -4084,7 +4104,7 @@ fetch_github_release() {
         # but are treated as compatibility-sensitive.
         XTLS/Xray-core:xray_core.zip) release_ref="${ABOX_XRAY_VERSION:-$ABOX_XRAY_DEFAULT_VERSION}" ;;
         SagerNet/sing-box:singbox_core.tar.gz) release_ref="${ABOX_SINGBOX_VERSION:-v1.14.2}" ;;
-        HyNetworks/hysteria:hysteria_core) release_ref="${ABOX_HYSTERIA_APP_VERSION:-app/v2.12.3}" ;;
+        HyNetworks/hysteria:hysteria_core) release_ref="${ABOX_HYSTERIA_APP_VERSION:-app/v2.13.0}" ;;
         *) release_ref='' ;;
     esac
     [[ "$release_ref" =~ ^[A-Za-z0-9._/-]+$ ]] || die '核心版本号非法。'
@@ -4714,6 +4734,11 @@ flock -n 9 || exit 0
 RUNTIME_LOCK=/run/A-Box.lock
 acquire_abox_runtime_guard() {
     [[ -d /run && ! -L /run ]] || exit 0
+    # /run is recreated on reboot. Create the shared lock inode on demand;
+    # absence of the lock must not silently disable the helper.
+    if [[ ! -e "$RUNTIME_LOCK" && ! -L "$RUNTIME_LOCK" ]]; then
+        ( umask 077; set -C; : > "$RUNTIME_LOCK" ) 2>/dev/null || true
+    fi
     [[ -f "$RUNTIME_LOCK" && ! -L "$RUNTIME_LOCK" ]] || exit 0
     [[ "$(stat -c %u:%g "$RUNTIME_LOCK" 2>/dev/null || true)" == 0:0 ]] || exit 0
     local mode
@@ -4901,6 +4926,11 @@ flock -n 9 || exit 0
 RUNTIME_LOCK=/run/A-Box.lock
 acquire_abox_runtime_guard() {
     [[ -d /run && ! -L /run ]] || exit 0
+    # /run is recreated on reboot. Create the shared lock inode on demand;
+    # absence of the lock must not silently disable the helper.
+    if [[ ! -e "$RUNTIME_LOCK" && ! -L "$RUNTIME_LOCK" ]]; then
+        ( umask 077; set -C; : > "$RUNTIME_LOCK" ) 2>/dev/null || true
+    fi
     [[ -f "$RUNTIME_LOCK" && ! -L "$RUNTIME_LOCK" ]] || exit 0
     [[ "$(stat -c %u:%g "$RUNTIME_LOCK" 2>/dev/null || true)" == 0:0 ]] || exit 0
     local mode
@@ -5100,7 +5130,8 @@ pre_install_setup() {
                     if is_yes "$INPUT_ACME_DNS"; then
                         HY2_ACME_TYPE='dns'
                         HY2_ACME_DNS_PROVIDER='cloudflare'
-                        read -r -sep "   ${L_HY2} Cloudflare API Token: " INPUT_CF_TOKEN; echo
+                        read -r -s -p "   ${L_HY2} Cloudflare API Token: " INPUT_CF_TOKEN || die '交互输入已结束 / Interactive input closed.'
+                        echo
                         HY2_ACME_DNS_CF_API_TOKEN="$INPUT_CF_TOKEN"
                     fi
                 fi
@@ -5998,9 +6029,9 @@ deploy_singbox() {
 
     if [[ "$MODE_IN" == *'HY2'* || "$MODE_IN" == *'ALL'* ]] && [[ "${HY2_HOP:-}" == 'true' ]]; then
         SB_CAPS='CAP_NET_ADMIN CAP_NET_BIND_SERVICE'
-        SB_PRE_START="ExecStartPre=-/bin/sh -c '$IPT -w -t nat -D PREROUTING -i $INGRESS_IF -p udp --dport ${HY2_RANGE_START}:${HY2_RANGE_END} -m comment --comment \"A-Box-HY2-HOP\" -j REDIRECT --to-ports $HY2_BASE_PORT 2>/dev/null || true'
-ExecStartPre=/bin/sh -c '$IPT -w -t nat -A PREROUTING -i $INGRESS_IF -p udp --dport ${HY2_RANGE_START}:${HY2_RANGE_END} -m comment --comment \"A-Box-HY2-HOP\" -j REDIRECT --to-ports $HY2_BASE_PORT'"
-        SB_POST_STOP="ExecStopPost=-/bin/sh -c '$IPT -w -t nat -D PREROUTING -i $INGRESS_IF -p udp --dport ${HY2_RANGE_START}:${HY2_RANGE_END} -m comment --comment \"A-Box-HY2-HOP\" -j REDIRECT --to-ports $HY2_BASE_PORT 2>/dev/null || true'"
+        SB_PRE_START="ExecStartPre=-+/bin/sh -c '$IPT -w -t nat -D PREROUTING -i $INGRESS_IF -p udp --dport ${HY2_RANGE_START}:${HY2_RANGE_END} -m comment --comment \"A-Box-HY2-HOP\" -j REDIRECT --to-ports $HY2_BASE_PORT 2>/dev/null || true'
+ExecStartPre=+/bin/sh -c '$IPT -w -t nat -A PREROUTING -i $INGRESS_IF -p udp --dport ${HY2_RANGE_START}:${HY2_RANGE_END} -m comment --comment \"A-Box-HY2-HOP\" -j REDIRECT --to-ports $HY2_BASE_PORT'"
+        SB_POST_STOP="ExecStopPost=-+/bin/sh -c '$IPT -w -t nat -D PREROUTING -i $INGRESS_IF -p udp --dport ${HY2_RANGE_START}:${HY2_RANGE_END} -m comment --comment \"A-Box-HY2-HOP\" -j REDIRECT --to-ports $HY2_BASE_PORT 2>/dev/null || true'"
         SB_RC_PRE="start_pre() {
   $IPT -w -t nat -D PREROUTING -i $INGRESS_IF -p udp --dport ${HY2_RANGE_START}:${HY2_RANGE_END} -m comment --comment \"A-Box-HY2-HOP\" -j REDIRECT --to-ports $HY2_BASE_PORT 2>/dev/null || true
   $IPT -w -t nat -A PREROUTING -i $INGRESS_IF -p udp --dport ${HY2_RANGE_START}:${HY2_RANGE_END} -m comment --comment \"A-Box-HY2-HOP\" -j REDIRECT --to-ports $HY2_BASE_PORT || return 1"
@@ -6008,10 +6039,10 @@ ExecStartPre=/bin/sh -c '$IPT -w -t nat -A PREROUTING -i $INGRESS_IF -p udp --dp
   $IPT -w -t nat -D PREROUTING -i $INGRESS_IF -p udp --dport ${HY2_RANGE_START}:${HY2_RANGE_END} -m comment --comment \"A-Box-HY2-HOP\" -j REDIRECT --to-ports $HY2_BASE_PORT 2>/dev/null || true"
         if has_ipv6 && ipv6_nat_redirect_usable; then
             SB_PRE_START+="
-ExecStartPre=-/bin/sh -c '$IPT6 -w -t nat -D PREROUTING -i $INGRESS_IF -p udp --dport ${HY2_RANGE_START}:${HY2_RANGE_END} -m comment --comment \"A-Box-HY2-HOP\" -j REDIRECT --to-ports $HY2_BASE_PORT 2>/dev/null || true'
-ExecStartPre=/bin/sh -c '$IPT6 -w -t nat -A PREROUTING -i $INGRESS_IF -p udp --dport ${HY2_RANGE_START}:${HY2_RANGE_END} -m comment --comment \"A-Box-HY2-HOP\" -j REDIRECT --to-ports $HY2_BASE_PORT'"
+ExecStartPre=-+/bin/sh -c '$IPT6 -w -t nat -D PREROUTING -i $INGRESS_IF -p udp --dport ${HY2_RANGE_START}:${HY2_RANGE_END} -m comment --comment \"A-Box-HY2-HOP\" -j REDIRECT --to-ports $HY2_BASE_PORT 2>/dev/null || true'
+ExecStartPre=+/bin/sh -c '$IPT6 -w -t nat -A PREROUTING -i $INGRESS_IF -p udp --dport ${HY2_RANGE_START}:${HY2_RANGE_END} -m comment --comment \"A-Box-HY2-HOP\" -j REDIRECT --to-ports $HY2_BASE_PORT'"
             SB_POST_STOP+="
-ExecStopPost=-/bin/sh -c '$IPT6 -w -t nat -D PREROUTING -i $INGRESS_IF -p udp --dport ${HY2_RANGE_START}:${HY2_RANGE_END} -m comment --comment \"A-Box-HY2-HOP\" -j REDIRECT --to-ports $HY2_BASE_PORT 2>/dev/null || true'"
+ExecStopPost=-+/bin/sh -c '$IPT6 -w -t nat -D PREROUTING -i $INGRESS_IF -p udp --dport ${HY2_RANGE_START}:${HY2_RANGE_END} -m comment --comment \"A-Box-HY2-HOP\" -j REDIRECT --to-ports $HY2_BASE_PORT 2>/dev/null || true'"
             SB_RC_PRE+="
   $IPT6 -w -t nat -D PREROUTING -i $INGRESS_IF -p udp --dport ${HY2_RANGE_START}:${HY2_RANGE_END} -m comment --comment \"A-Box-HY2-HOP\" -j REDIRECT --to-ports $HY2_BASE_PORT 2>/dev/null || true
   $IPT6 -w -t nat -A PREROUTING -i $INGRESS_IF -p udp --dport ${HY2_RANGE_START}:${HY2_RANGE_END} -m comment --comment \"A-Box-HY2-HOP\" -j REDIRECT --to-ports $HY2_BASE_PORT || return 1"
@@ -6157,11 +6188,16 @@ flock -n 9 || exit 0
 RUNTIME_LOCK=/run/A-Box.lock
 acquire_abox_runtime_guard() {
     [[ -d /run && ! -L /run ]] || exit 0
+    # /run is recreated on reboot. Create the shared lock inode on demand;
+    # absence of the lock must not silently disable the helper.
+    if [[ ! -e "$RUNTIME_LOCK" && ! -L "$RUNTIME_LOCK" ]]; then
+        ( umask 077; set -C; : > "$RUNTIME_LOCK" ) 2>/dev/null || true
+    fi
     [[ -f "$RUNTIME_LOCK" && ! -L "$RUNTIME_LOCK" ]] || exit 0
     [[ "$(stat -c %u:%g "$RUNTIME_LOCK" 2>/dev/null || true)" == 0:0 ]] || exit 0
     local mode
     mode=$(stat -c %a "$RUNTIME_LOCK" 2>/dev/null) || exit 0
-    [[ "$mode" =~ ^[0-9]{3,4}$ ]] || exit 0
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || exit 0
     (( (8#$mode & 8#077) == 0 )) || exit 0
     exec 10>>"$RUNTIME_LOCK" || exit 0
     flock -n 10 || exit 0
@@ -7311,7 +7347,7 @@ PY_BACKUP_MANIFEST
 }
 
 confirm_remote_script_hash() {
-    local label="$1" url="$2" sha="$3" answer
+    local label="$1" url="$2" sha="$3"
     if [[ -n "${ABOX_REMOTE_SHA256_ALLOWLIST:-}" ]]; then
         if sha256_in_allowlist "$sha" "$ABOX_REMOTE_SHA256_ALLOWLIST"; then
             msg "${GREEN}[*] Remote script SHA256 matched ABOX_REMOTE_SHA256_ALLOWLIST.${NC}"
@@ -7321,14 +7357,13 @@ confirm_remote_script_hash() {
     fi
     if [[ "${ABOX_LANG:-zh}" == 'en' ]]; then
         msg "${YELLOW}[!] This is third-party code outside A-Box control. Syntax validation is not a trust guarantee.${NC}"
-        msg "${YELLOW}[!] Review the source and SHA256 before execution: ${url}${NC}"
-        read -r -p 'Type YES-RUN-UNTRUSTED to execute this remote script: ' answer
+        msg "${YELLOW}[!] Review the displayed SHA256 and source before execution: ${url}${NC}"
+        confirm_yes_no 'Execute this downloaded third-party script? [Y/N]: '
     else
         msg "${YELLOW}[!] 这是 A-Box 无法控制的第三方代码。语法校验不等于可信校验。${NC}"
-        msg "${YELLOW}[!] 执行前请核对来源与 SHA256：${url}${NC}"
-        read -r -p '输入 YES-RUN-UNTRUSTED 才执行此远程脚本: ' answer
+        msg "${YELLOW}[!] 请核对上方 SHA256 与来源后再执行：${url}${NC}"
+        confirm_yes_no '确认执行此下载的第三方脚本？[Y/N]: '
     fi
-    [[ "$answer" == 'YES-RUN-UNTRUSTED' ]] || return 130
 }
 
 run_remote_bash_script() {
@@ -12735,8 +12770,7 @@ convert_legacy_backup_archive() {
         backup_checksum_verify "$selected" "${selected}.sha256" || die 'Legacy backup SHA256 verification failed.'
     else
         [[ -t 0 ]] || die 'Legacy backup has no checksum and conversion is non-interactive.'
-        read -r -p 'Legacy backup has no trusted checksum. Type IMPORT-UNVERIFIED-LEGACY to continue: ' answer
-        [[ "$answer" == 'IMPORT-UNVERIFIED-LEGACY' ]] || return 130
+        confirm_yes_no 'Legacy backup has no trusted checksum. Import anyway? [Y/N]: ' || return 130
     fi
     validate_legacy_backup_archive "$selected" || die 'Legacy backup archive safety validation failed.'
     work=$(mktemp -d /tmp/A-Box-legacy-import.XXXXXX) || die 'Legacy conversion temp directory failed.'
@@ -15258,6 +15292,8 @@ run_self_tests() {
     grep -Fq 'write_file_atomically_from_stdin /etc/init.d/hysteria 755 <<EOF_SVC' "$0" || { echo 'FAIL: Hysteria OpenRC capabilities heredoc must expand deployment-time value'; failures=$((failures + 1)); }
     [[ "$(grep -Fc 'capabilities="cap_net_bind_service"' "$0")" -ge 2 ]] || { echo 'FAIL: Xray/Sing-box OpenRC capabilities missing'; failures=$((failures + 1)); }
     grep -Fq 'User=abox-singbox' "$0" || { echo 'FAIL: Sing-box systemd unit must drop root UID'; failures=$((failures + 1)); }
+    grep -Fq 'ExecStartPre=+/bin/sh -c' "$0" || { echo 'FAIL: Sing-box systemd HY2 hop setup must use full-privilege pre-start hook'; failures=$((failures + 1)); }
+    grep -Fq 'ExecStopPost=-+/bin/sh -c' "$0" || { echo 'FAIL: Sing-box systemd HY2 hop cleanup must use full-privilege post-stop hook'; failures=$((failures + 1)); }
     grep -Fq 'command_user="abox-singbox:abox-singbox"' "$0" || { echo 'FAIL: Sing-box OpenRC service must drop root UID'; failures=$((failures + 1)); }
     grep -Fq 'User=abox-hysteria' "$0" || { echo 'FAIL: Hysteria systemd unit must drop root UID'; failures=$((failures + 1)); }
     grep -Fq 'command_user="abox-hysteria:abox-hysteria"' "$0" || { echo 'FAIL: Hysteria OpenRC service must drop root UID'; failures=$((failures + 1)); }
@@ -15269,6 +15305,8 @@ run_self_tests() {
     [[ "$(effective_xray_version)" == "$ABOX_XRAY_DEFAULT_VERSION" ]] || { echo 'FAIL: effective Xray compatibility default'; failures=$((failures + 1)); }
     ( ABOX_XRAY_VERSION=v26.9 xray_reality_requires_mlkem ) >/dev/null 2>&1 && { echo 'FAIL: malformed Xray version accepted'; failures=$((failures + 1)); }
     grep -Fq 'support-x25519mlkem768: $clash_mlkem' "$0" || { echo 'FAIL: Clash REALITY ML-KEM flag must be version-aware'; failures=$((failures + 1)); }
+    sed -n '/^confirm_remote_script_hash()/,/^}/p' "$0" | grep -Fq 'YES-RUN-UNTRUSTED' && { echo 'FAIL: long remote-script confirmation token remains'; failures=$((failures + 1)); }
+    sed -n '/^confirm_remote_script_hash()/,/^}/p' "$0" | grep -Fq 'confirm_yes_no' || { echo 'FAIL: remote script execution must use simple Y/N confirmation'; failures=$((failures + 1)); }
     grep -Fq "ABOX_XRAY_DEFAULT_VERSION='v26.6.27'" "$0" || { echo 'FAIL: Xray iOS/XHTTP compatibility pin missing'; failures=$((failures + 1)); }
     [[ "$(xray_version_compare v26.6.27 v26.3.27)" == '1' ]] || { echo 'FAIL: Xray version comparison'; failures=$((failures + 1)); }
     [[ "$(xray_version_compare v26.6.27 v26.6.27)" == '0' ]] || { echo 'FAIL: Xray compatibility pin comparison'; failures=$((failures + 1)); }
@@ -15277,7 +15315,10 @@ run_self_tests() {
     grep -Fq "ABOX_XRAY_REALITY_MLKEM_MIN_VERSION='v26.9.8'" "$0" || { echo 'FAIL: Xray REALITY ML-KEM threshold constant missing'; failures=$((failures + 1)); }
     runtime_guard_count=$(grep -Fc 'RUNTIME_LOCK=/run/A-Box.lock' "$0" || true)
     [[ "$runtime_guard_count" =~ ^[0-9]+$ && "$runtime_guard_count" -ge 3 ]] || { echo 'FAIL: all background helpers must honor the global A-Box runtime lock'; failures=$((failures + 1)); }
+    runtime_guard_impl_count=$(grep -Fc '( umask 077; set -C; : > "$RUNTIME_LOCK" )' "$0" || true)
+    [[ "$runtime_guard_impl_count" =~ ^[0-9]+$ && "$runtime_guard_impl_count" -ge 3 ]] || { echo 'FAIL: all background helpers must recreate the runtime lock after /run recreation'; failures=$((failures + 1)); }
     grep -Fq 'systemctl disable "$srv"' "$0" || { echo 'FAIL: traffic quota stop path must disable systemd autostart'; failures=$((failures + 1)); }
+    grep -Fq "Legacy backup has no trusted checksum. Import anyway? [Y/N]: " "$0" || { echo 'FAIL: legacy backup import confirmation must use Y/N'; failures=$((failures + 1)); }
     grep -Fq 'rc-update del "$srv" default' "$0" || { echo 'FAIL: traffic quota stop path must remove OpenRC autostart'; failures=$((failures + 1)); }
     ( verify_github_asset_digest /dev/null '' ) >/dev/null 2>&1 && { echo 'FAIL: missing GitHub digest must be rejected'; failures=$((failures + 1)); }
     grep -q '\[\[ "\${digest#sha256:}" =~ \^\[A-Fa-f0-9\]{64}\$ \]\]' "$0" || { echo 'FAIL: fetch helper must prevalidate GitHub digest before mirror retry'; failures=$((failures + 1)); }
@@ -15286,6 +15327,12 @@ run_self_tests() {
         -u GITHUB_TOKEN' "$0" || { echo 'FAIL: remote third-party scripts must not inherit GITHUB_TOKEN'; failures=$((failures + 1)); }
 
     [[ "$(normalize_port_spec 020000-025000)" == '20000:25000' ]] || { echo 'FAIL: normalize port range'; failures=$((failures + 1)); }
+    HY2_DOMAIN=example.com HY2_ACME_TYPE=http VLESS_PORT=80 XHTTP_PORT=9443 SS_PORT=2053 HY2_BASE_PORT=443 HY2_HOP=false HY2_HOP_IMPL=none
+    [[ "$(selected_port_pairs | grep -Fx 'tcp/80')" == 'tcp/80' ]] || { echo 'FAIL: HTTP-01 TCP/80 missing from planned port set'; failures=$((failures + 1)); }
+    [[ "$(selected_port_pairs | awk 'NF' | sort | uniq -d)" == 'tcp/80' ]] || { echo 'FAIL: HTTP-01 TCP/80 conflict was not detected'; failures=$((failures + 1)); }
+    HY2_ACME_TYPE=dns
+    [[ "$(selected_port_pairs | grep -Fx 'tcp/80')" != 'tcp/80' ]] || { echo 'FAIL: DNS-01 must not reserve TCP/80'; failures=$((failures + 1)); }
+    unset HY2_DOMAIN HY2_ACME_TYPE VLESS_PORT XHTTP_PORT SS_PORT HY2_BASE_PORT HY2_HOP HY2_HOP_IMPL
     [[ "$(sni_domain_penalty www.apple.com)" == '1800' ]] || { echo 'FAIL: Apple www SNI penalty'; failures=$((failures + 1)); }
     [[ "$(sni_domain_penalty maps.apple.com)" == '2400' ]] || { echo 'FAIL: Apple subdomain SNI penalty'; failures=$((failures + 1)); }
     [[ "$(sni_domain_penalty apple.com)" == '2400' ]] || { echo 'FAIL: Apple apex SNI penalty'; failures=$((failures + 1)); }
@@ -15673,7 +15720,7 @@ EOF_SELFTEST_IPT
     jq -e '.inbounds[] | select(.protocol=="vless" and .port==8443 and .streamSettings.realitySettings.serverNames[0]=="www.microsoft.com")' "$tmp/xray/config.json" >/dev/null 2>&1 || { echo 'FAIL: Xray Vision SNI split'; failures=$((failures + 1)); }
     jq -e '.inbounds[] | select(.protocol=="vless" and .port==9443 and .streamSettings.realitySettings.serverNames[0]=="www.microsoft.com")' "$tmp/xray/config.json" >/dev/null 2>&1 || { echo 'FAIL: Xray XHTTP SNI split'; failures=$((failures + 1)); }
     jq -e 'all(.inbounds[] | select(.protocol=="vless"); .streamSettings.realitySettings.minClientVer == "1.8.2")' "$tmp/xray/config.json" >/dev/null 2>&1 || { echo 'FAIL: Xray REALITY minClientVer compatibility guard'; failures=$((failures + 1)); }
-    assert_ok valid_github_download_url HyNetworks/hysteria https://github.com/HyNetworks/hysteria/releases/download/app/v2.12.3/hysteria-linux-amd64
+    assert_ok valid_github_download_url HyNetworks/hysteria https://github.com/HyNetworks/hysteria/releases/download/app/v2.13.0/hysteria-linux-amd64
     assert_bad valid_github_download_url HyNetworks/hysteria https://example.com/HyNetworks/hysteria/releases/download/app/v2.12.2/hysteria-linux-amd64
     printf '%s\n' 'sentinel' > "$tmp/sing-box/sentinel.txt"
     ln -s "$tmp/sing-box/sentinel.txt" "$tmp/sing-box/config.json.tmp.$$"
