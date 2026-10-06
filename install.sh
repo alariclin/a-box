@@ -33,8 +33,8 @@ PUBLIC_IP_CACHE_TTL=600
 BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-10}
 LOCK_FALLBACK_DIR='/run/A-Box.lock.d'
 ABOX_LANG='zh'
-ABOX_BUILD='2026-10-06-bugfix-v136'
-ABOX_BUILD_EPOCH=20261006136
+ABOX_BUILD='2026-10-06-bugfix-v137'
+ABOX_BUILD_EPOCH=20261006137
 # Current Xray compatibility pin for iOS Shadowrocket + XHTTP/REALITY as of 2026-10-05.
 # This pin is a prerelease upstream build; newer prereleases remain opt-in via ABOX_XRAY_VERSION.
 ABOX_XRAY_DEFAULT_VERSION='v26.6.27'
@@ -15349,6 +15349,12 @@ run_self_tests() {
     legacy_remote_token=$(printf '%s%s' 'YES-RUN-' 'UNTRUSTED')
     grep -Fq "$legacy_remote_token" <<< "$remote_confirm_block" && { echo 'FAIL: long remote-script confirmation token remains'; failures=$((failures + 1)); }
     sed -n '/^confirm_remote_script_hash()/,/^}/p' "$0" | grep -Fq 'confirm_yes_no' || { echo 'FAIL: remote script execution must use simple Y/N confirmation'; failures=$((failures + 1)); }
+    grep -Fq 'A-Box .env exists but is invalid' "$0" || { echo 'FAIL: preflight must block invalid existing .env'; failures=$((failures + 1)); }
+    grep -Fq 'preflight_extra_ports' "$0" || { echo 'FAIL: preflight must include HTTP-01 listener reservation'; failures=$((failures + 1)); }
+    grep -Fq 'sni_domain_public_dns' "$0" || { echo 'FAIL: SNI probe must validate public DNS targets'; failures=$((failures + 1)); }
+    grep -Fq 'max-redirs 0' "$0" || { echo 'FAIL: SNI probe must not follow redirects'; failures=$((failures + 1)); }
+    grep -Fq 'Diagnostic bundle checksum creation failed' "$0" || { echo 'FAIL: diagnostic checksum failure must be blocking'; failures=$((failures + 1)); }
+    grep -Fq 'CloudflareWARP' "$0" || { echo 'FAIL: WARP interface detection must include CloudflareWARP'; failures=$((failures + 1)); }
     grep -Fq "ABOX_XRAY_DEFAULT_VERSION='v26.6.27'" "$0" || { echo 'FAIL: Xray iOS/XHTTP compatibility pin missing'; failures=$((failures + 1)); }
     [[ "$(xray_version_compare v26.6.27 v26.3.27)" == '1' ]] || { echo 'FAIL: Xray version comparison'; failures=$((failures + 1)); }
     [[ "$(xray_version_compare v26.6.27 v26.6.27)" == '0' ]] || { echo 'FAIL: Xray compatibility pin comparison'; failures=$((failures + 1)); }
