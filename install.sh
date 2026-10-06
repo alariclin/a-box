@@ -33,8 +33,8 @@ PUBLIC_IP_CACHE_TTL=600
 BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-10}
 LOCK_FALLBACK_DIR='/run/A-Box.lock.d'
 ABOX_LANG='zh'
-ABOX_BUILD='2026-10-06-bugfix-v135'
-ABOX_BUILD_EPOCH=20261006134
+ABOX_BUILD='2026-10-06-bugfix-v136'
+ABOX_BUILD_EPOCH=20261006136
 # Current Xray compatibility pin for iOS Shadowrocket + XHTTP/REALITY as of 2026-10-05.
 # This pin is a prerelease upstream build; newer prereleases remain opt-in via ABOX_XRAY_VERSION.
 ABOX_XRAY_DEFAULT_VERSION='v26.6.27'
@@ -15312,7 +15312,9 @@ run_self_tests() {
     [[ "$(effective_xray_version)" == "$ABOX_XRAY_DEFAULT_VERSION" ]] || { echo 'FAIL: effective Xray compatibility default'; failures=$((failures + 1)); }
     ( ABOX_XRAY_VERSION=v26.9 xray_reality_requires_mlkem ) >/dev/null 2>&1 && { echo 'FAIL: malformed Xray version accepted'; failures=$((failures + 1)); }
     grep -Fq 'support-x25519mlkem768: $clash_mlkem' "$0" || { echo 'FAIL: Clash REALITY ML-KEM flag must be version-aware'; failures=$((failures + 1)); }
-    sed -n '/^confirm_remote_script_hash()/,/^}/p' "$0" | grep -Fq 'YES-RUN-UNTRUSTED' && { echo 'FAIL: long remote-script confirmation token remains'; failures=$((failures + 1)); }
+    remote_confirm_block=$(sed -n '/^confirm_remote_script_hash()/,/^}/p' "$0") || { echo 'FAIL: remote confirmation self-test extraction'; failures=$((failures + 1)); }
+    legacy_remote_token=$(printf '%s%s' 'YES-RUN-' 'UNTRUSTED')
+    grep -Fq "$legacy_remote_token" <<< "$remote_confirm_block" && { echo 'FAIL: long remote-script confirmation token remains'; failures=$((failures + 1)); }
     sed -n '/^confirm_remote_script_hash()/,/^}/p' "$0" | grep -Fq 'confirm_yes_no' || { echo 'FAIL: remote script execution must use simple Y/N confirmation'; failures=$((failures + 1)); }
     grep -Fq "ABOX_XRAY_DEFAULT_VERSION='v26.6.27'" "$0" || { echo 'FAIL: Xray iOS/XHTTP compatibility pin missing'; failures=$((failures + 1)); }
     [[ "$(xray_version_compare v26.6.27 v26.3.27)" == '1' ]] || { echo 'FAIL: Xray version comparison'; failures=$((failures + 1)); }
