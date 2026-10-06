@@ -7401,6 +7401,13 @@ run_remote_bash_script() {
         -u AWS_ACCESS_KEY_ID \
         -u AWS_SECRET_ACCESS_KEY \
         -u AWS_SESSION_TOKEN \
+        -u AWS_SECURITY_TOKEN \
+        -u AZURE_CLIENT_ID \
+        -u AZURE_CLIENT_SECRET \
+        -u AZURE_TENANT_ID \
+        -u GCP_ACCESS_TOKEN \
+        -u GOOGLE_APPLICATION_CREDENTIALS \
+        -u KUBECONFIG \
         bash "$tmp" "$@"
     local rc=$?
     rm -f "$tmp"
@@ -11846,8 +11853,11 @@ run_builtin_sni_radar() {
     if [[ ! -s "$report" ]]; then
         cp -f "$raw_sorted" "$report"
     fi
-    mkdir -p "$ABOX_DIR" 2>/dev/null || true
-    cp -f "$report" "$ABOX_DIR/A-Box-sni-${profile}.tsv" 2>/dev/null || true
+    ensure_abox_dir_owned "$ABOX_DIR"
+    local saved_sni="$ABOX_DIR/A-Box-sni-${profile}.tsv"
+    cp -f "$report" "$saved_sni" 2>/dev/null || die 'SNI report persistence failed.'
+    [[ -s "$saved_sni" && ! -L "$saved_sni" ]] || die 'SNI report persistence verification failed.'
+    chmod 600 "$saved_sni" 2>/dev/null || die 'SNI report permission hardening failed.'
     msg "${BLUE}----------------------------------------------------------------------${NC}"
     msg "${YELLOW}[ Top SNI Candidates / 优选 SNI 候选 ]${NC}"
     awk -F'\t' -v n="$topn" 'NR<=n {printf "%2d. %-42s %s %s %s %s %s %s %s %s %s\n", NR, $2, $3, $4, $5, $6, $7, $9, $10, $11, $12}' "$report"
@@ -13579,7 +13589,7 @@ export_diagnostic_bundle() {
     diag_dir="$ABOX_DIR/diagnostics"
     work=$(mktemp -d /tmp/A-Box-diagnostic.XXXXXX) || die 'Diagnostic temp directory creation failed.'
     mkdir -p "$diag_dir" "$work/logs" || { rm -rf -- "$work"; die '诊断目录创建失败。'; }
-    chmod 700 "$diag_dir" 2>/dev/null || true
+    chmod 700 "$diag_dir" || { rm -rf -- "$work"; die 'Diagnostic directory permission setup failed.'; }
 
     msg "${YELLOW}[*] Collecting diagnostic information with secret redaction...${NC}"
     {
@@ -13612,10 +13622,11 @@ export_diagnostic_bundle() {
 
     bundle="$diag_dir/A-Box-diagnostic-${ts}.tar.gz"
     tar -C "$work" -czf "$bundle" . || { rm -rf "$work"; die 'Diagnostic bundle creation failed.'; }
-    chmod 600 "$bundle" 2>/dev/null || true
+    chmod 600 "$bundle" || { rm -rf -- "$work"; die 'Diagnostic bundle permission setup failed.'; }
     checksum="${bundle}.sha256"
-    sha256sum "$bundle" > "$checksum" 2>/dev/null || true
-    chmod 600 "$checksum" 2>/dev/null || true
+    sha256sum "$bundle" > "$checksum" || { rm -rf -- "$work"; die 'Diagnostic bundle checksum creation failed.'; }
+    chmod 600 "$checksum" || { rm -rf -- "$work"; die 'Diagnostic checksum permission setup failed.'; }
+    [[ -s "$checksum" && ! -L "$checksum" ]] || { rm -rf -- "$work"; die 'Diagnostic checksum verification failed.'; }
     rm -rf "$work"
     msg "${GREEN}[*] Diagnostic bundle:${NC} $bundle"
     [[ -f "$checksum" ]] && msg "${GREEN}[*] SHA256:${NC} $checksum"
@@ -15344,7 +15355,7 @@ run_self_tests() {
     HY2_DOMAIN=example.com HY2_ACME_TYPE=http CORE_IN=hysteria MODE_IN=HY2 VLESS_PORT=80 XHTTP_PORT=9443 SS_PORT=2053 HY2_BASE_PORT=443 HY2_HOP=false HY2_HOP_IMPL=none
     [[ "$(selected_port_pairs | grep -Fx 'tcp/80')" == 'tcp/80' ]] || { echo 'FAIL: Hysteria HTTP-01 must reserve TCP/80'; failures=$((failures + 1)); }
     [[ "$(selected_port_pairs | awk 'NF' | sort | uniq -d)" == 'tcp/80' ]] || { echo 'FAIL: Hysteria HTTP-01 TCP/80 conflict was not detected'; failures=$((failures + 1)); }
-    CORE_IN=singbox MODE_IN=HY2
+    CORE_IN=singbox MODE_IN=HY2 VLESS_PORT=8443 XHTTP_PORT=9443 SS_PORT=2053 HY2_BASE_PORT=443
     [[ "$(selected_port_pairs | grep -Fx 'tcp/80')" != 'tcp/80' ]] || { echo 'FAIL: Sing-box HY2 domain must not reserve TCP/80'; failures=$((failures + 1)); }
     CORE_IN=xray MODE_IN=ALL HY2_ACME_TYPE=http
     [[ "$(selected_port_pairs | grep -Fx 'tcp/80')" == 'tcp/80' ]] || { echo 'FAIL: Xray ALL HTTP-01 must reserve TCP/80'; failures=$((failures + 1)); }
