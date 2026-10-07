@@ -16000,7 +16000,7 @@ abox_region_ntp() {
 
 abox_region_write_state() {
     local label="$1" tz="$2" loc="$3" ntp="$4" locked="$5"
-    [[ "$label" =~ ^[-A-Za-z0-9._@+:/ ]{0,64}$ ]] || return 1
+    [[ "$label" =~ ^[-A-Za-z0-9._@+:/[:space:]]{0,64}$ ]] || return 1
     ensure_abox_dir_owned "$ABOX_DIR" || return 1
     write_file_atomically_from_stdin "$ABOX_REGION_STATE" 600 <<EOF_REGION
 region_label=$label
