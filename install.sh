@@ -7035,6 +7035,46 @@ manage_ss_whitelist() {
     esac
 }
 
+abort_incomplete_dns_restore_state() {
+    local path
+    for path in "$ABOX_DNS_RESOLVED_BACKUP" "$ABOX_DNS_RESCONF_BACKUP"; do
+        [[ ! -e "$path" && ! -L "$path" ]] && continue
+        [[ -f "$path" && ! -L "$path" ]] || return 1
+        path_owned_by_root "$path" || return 1
+        path_mode_has_no_group_other_write "$path" || return 1
+    done
+    return 0
+}
+
+dns_restore_previous() {
+    ensure_abox_dir_owned "$ABOX_DIR" || return 1
+    path_parent_chain_safe "$ABOX_DNS_RESOLVED_DROPIN" || return 1
+    if [[ -f "$ABOX_DNS_RESOLVED_BACKUP" && ! -L "$ABOX_DNS_RESOLVED_BACKUP" ]]; then
+        path_owned_by_root "$ABOX_DNS_RESOLVED_BACKUP" || return 1
+        path_mode_has_no_group_other_write "$ABOX_DNS_RESOLVED_BACKUP" || return 1
+        install_file_atomically "$ABOX_DNS_RESOLVED_BACKUP" "$ABOX_DNS_RESOLVED_DROPIN" 600 || return 1
+    elif [[ -e "$ABOX_DNS_RESOLVED_DROPIN" || -L "$ABOX_DNS_RESOLVED_DROPIN" ]]; then
+        [[ -f "$ABOX_DNS_RESOLVED_DROPIN" && ! -L "$ABOX_DNS_RESOLVED_DROPIN" ]] || return 1
+        grep -Fq '# Managed by A-Box DNS Manager' "$ABOX_DNS_RESOLVED_DROPIN" 2>/dev/null || return 1
+        rm -f -- "$ABOX_DNS_RESOLVED_DROPIN" || return 1
+    fi
+    if [[ -e "$ABOX_DNS_RESCONF_BACKUP" || -L "$ABOX_DNS_RESCONF_BACKUP" ]]; then
+        [[ -f "$ABOX_DNS_RESCONF_BACKUP" && ! -L "$ABOX_DNS_RESCONF_BACKUP" ]] || return 1
+        path_owned_by_root "$ABOX_DNS_RESCONF_BACKUP" || return 1
+        [[ -f /etc/resolv.conf && ! -L /etc/resolv.conf ]] || return 1
+        path_is_mountpoint /etc/resolv.conf && return 1
+        cp -a -- "$ABOX_DNS_RESCONF_BACKUP" /etc/resolv.conf || return 1
+    fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        systemctl restart systemd-resolved >/dev/null 2>&1 || return 1
+    fi
+    if [[ -e "$ABOX_DNS_STATE" || -L "$ABOX_DNS_STATE" ]]; then
+        [[ -f "$ABOX_DNS_STATE" && ! -L "$ABOX_DNS_STATE" ]] || return 1
+        path_owned_by_root "$ABOX_DNS_STATE" || return 1
+    fi
+    rm -f -- "$ABOX_DNS_STATE" || return 1
+}
+
 do_cleanup() {
     clear; msg "${RED}正在执行清理逻辑...${NC}"
     init_system_environment
@@ -12948,6 +12988,1304 @@ PY_LEGACY_EXTRACT
     msg "${YELLOW}[*] Services are imported as stopped; review configuration before starting them.${NC}"
 }
 
+
+prepare_backup_runtime_identities() {
+    local archive="$1" need_sb=0 need_hy=0
+    [[ -s "$archive" ]] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    IFS=
+    local archive="$1"
+    local sb_runtime_gid=0 hy_runtime_uid=0 hy_runtime_gid=0
+    [[ -s "$archive" ]] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    if getent group "$ABOX_RUNTIME_SINGBOX_GROUP" >/dev/null 2>&1; then
+        sb_runtime_gid=$(getent group "$ABOX_RUNTIME_SINGBOX_GROUP" 2>/dev/null | awk -F: '{print $3}')
+    fi
+    if getent passwd "$ABOX_RUNTIME_HYSTERIA_USER" >/dev/null 2>&1; then
+        hy_runtime_uid=$(id -u "$ABOX_RUNTIME_HYSTERIA_USER" 2>/dev/null || printf '0')
+    fi
+    if getent group "$ABOX_RUNTIME_HYSTERIA_GROUP" >/dev/null 2>&1; then
+        hy_runtime_gid=$(getent group "$ABOX_RUNTIME_HYSTERIA_GROUP" 2>/dev/null | awk -F: '{print $3}')
+    fi
+    [[ "$sb_runtime_gid" =~ ^[0-9]+$ && "$hy_runtime_uid" =~ ^[0-9]+$ && "$hy_runtime_gid" =~ ^[0-9]+$ ]] || return 1
+    python3 - "$archive" "$sb_runtime_gid" "$hy_runtime_uid" "$hy_runtime_gid" <<'PY_VALIDATE'
+import posixpath,stat,sys,tarfile
+fn=sys.argv[1]
+sb_runtime_gid=int(sys.argv[2])
+hy_runtime_uid=int(sys.argv[3]); hy_runtime_gid=int(sys.argv[4])
+MAX_MEMBERS=10000
+MAX_FILE=512*1024*1024
+MAX_TOTAL=1024*1024*1024
+SB_DIR='root/etc/sing-box'
+HY_DIR='root/etc/hysteria'
+HY_ACME=HY_DIR + '/acme'
+try: tf=tarfile.open(fn,'r:gz')
+except Exception: raise SystemExit(1)
+seen=set(); total=0
+members=tf.getmembers()
+if len(members)>MAX_MEMBERS: raise SystemExit(1)
+for m in members:
+    raw=m.name
+    if '\x00' in raw or raw.startswith('/'): raise SystemExit(1)
+    while raw.startswith('./'): raw=raw[2:]
+    n=posixpath.normpath(raw)
+    if n in ('','.'): continue
+    if n=='..' or n.startswith('../') or n.split('/',1)[0] not in ('root','meta'): raise SystemExit(1)
+    if n in seen and not m.isdir(): raise SystemExit(1)
+    seen.add(n)
+    # Backup contents are copied regular files/directories only.  Reject all
+    # links and special members to avoid re-rooting and extraction ambiguity.
+    if m.issym() or m.islnk() or m.ischr() or m.isblk() or m.isfifo() or m.isdev(): raise SystemExit(1)
+    if not (m.isfile() or m.isdir()): raise SystemExit(1)
+    mode=m.mode & 0o7777
+    if mode & 0o7000 or mode & 0o002: raise SystemExit(1)
+    in_sb = n == SB_DIR or n.startswith(SB_DIR + '/')
+    in_hy = n == HY_DIR or n.startswith(HY_DIR + '/')
+    in_hy_acme = n == HY_ACME or n.startswith(HY_ACME + '/')
+    if in_sb:
+        # Sing-box config data may be group-readable by its dedicated runtime
+        # service account. Legacy root:root backups remain valid; runtime-group
+        # ownership is accepted only when the named group exists on this host.
+        if m.uid != 0: raise SystemExit(1)
+        if m.gid == 0:
+            if mode & 0o077: raise SystemExit(1)
+        elif sb_runtime_gid == 0 or m.gid != sb_runtime_gid:
+            raise SystemExit(1)
+        if n == SB_DIR and not ((m.gid == sb_runtime_gid and mode == 0o750) or (m.gid == 0 and (mode & 0o077) == 0)): raise SystemExit(1)
+        if mode & 0o020: raise SystemExit(1)
+    elif in_hy_acme:
+        # Hysteria ACME state is runtime-owned to allow non-root renewal. Only
+        # this subtree may contain runtime-owned members.
+        if (m.uid != 0 or m.gid != 0) and (hy_runtime_uid == 0 or hy_runtime_gid == 0): raise SystemExit(1)
+        if m.uid not in (0, hy_runtime_uid) or m.gid not in (0, hy_runtime_gid): raise SystemExit(1)
+        if n == HY_ACME:
+            if not m.isdir(): raise SystemExit(1)
+            if not ((m.uid == 0 and m.gid == 0 and (mode & 0o077) == 0) or
+                    (m.uid == 0 and m.gid == hy_runtime_gid and mode == 0o770)): raise SystemExit(1)
+        elif mode & 0o020:
+            raise SystemExit(1)
+    elif in_hy:
+        # Hysteria's top-level config tree is group-readable by its dedicated
+        # runtime account; runtime uid ownership is confined to ACME above.
+        # Legacy root:root backups remain valid for restore compatibility.
+        if m.uid != 0: raise SystemExit(1)
+        if m.gid == 0:
+            if mode & 0o077: raise SystemExit(1)
+        elif hy_runtime_gid == 0 or m.gid != hy_runtime_gid:
+            raise SystemExit(1)
+        if n == HY_DIR and not ((m.gid == hy_runtime_gid and mode == 0o750) or (m.gid == 0 and (mode & 0o077) == 0)): raise SystemExit(1)
+        if mode & 0o020: raise SystemExit(1)
+    else:
+        if m.uid != 0 or m.gid != 0: raise SystemExit(1)
+        if mode & 0o020: raise SystemExit(1)
+    if m.isfile():
+        if m.size < 0 or m.size > MAX_FILE: raise SystemExit(1)
+        total += m.size
+        if total > MAX_TOTAL: raise SystemExit(1)
+required_names={'root/etc/ddr','meta/manifest.version','meta/manifest.sha256','meta/managed-paths.txt','meta/services.state','meta/firewall.backend','meta/iptables.snapshot','meta/ip6tables.snapshot','meta/cron.abox.txt'}
+if not required_names.issubset(seen): raise SystemExit(1)
+required_root='root/etc/ddr'
+if required_root not in seen: raise SystemExit(1)
+root_member=next((m for m in members if posixpath.normpath(m.name.lstrip('./'))==required_root),None)
+if root_member is None or not root_member.isdir(): raise SystemExit(1)
+raise SystemExit(0)
+PY_VALIDATE
+}
+
+backup_root_contains_service() {
+    local root="$1" srv="$2" path
+    local -a paths=()
+    case "$srv" in
+        xray) paths=(
+            /usr/local/bin/xray /usr/local/etc/xray /usr/local/share/xray
+            /etc/systemd/system/xray.service /etc/init.d/xray /etc/conf.d/xray
+        ) ;;
+        sing-box) paths=(
+            /usr/local/bin/sing-box /etc/sing-box
+            /etc/systemd/system/sing-box.service /etc/init.d/sing-box /etc/conf.d/sing-box
+        ) ;;
+        hysteria) paths=(
+            /usr/local/bin/hysteria /etc/hysteria
+            /etc/systemd/system/hysteria.service /etc/init.d/hysteria /etc/conf.d/hysteria
+        ) ;;
+        *) return 2 ;;
+    esac
+    for path in "${paths[@]}"; do
+        [[ -e "$root$path" || -L "$root$path" ]] && return 0
+    done
+    return 1
+}
+
+backup_root_service_init() {
+    local root="$1" srv="$2" unit found=''
+    for unit in "$root/etc/systemd/system/${srv}.service" "$root/etc/init.d/${srv}"; do
+        [[ -e "$unit" || -L "$unit" ]] || continue
+        if [[ -n "$found" ]]; then
+            return 2
+        fi
+        case "$unit" in
+            "$root/etc/systemd/system/${srv}.service") found=systemd ;;
+            "$root/etc/init.d/${srv}") found=openrc ;;
+        esac
+    done
+    [[ -n "$found" ]] || return 1
+    printf '%s\n' "$found"
+}
+
+validate_backup_core_init_compatibility() {
+    local root="$1" srv backup_init current_init contains_rc
+    current_init=$(effective_init_system) || return 1
+    [[ "$current_init" == systemd || "$current_init" == openrc ]] || return 1
+    for srv in xray sing-box hysteria; do
+        backup_root_contains_service "$root" "$srv"
+        contains_rc=$?
+        case "$contains_rc" in
+            0) ;;
+            1) continue ;;
+            *) return 1 ;;
+        esac
+        backup_root_service_is_managed "$root" "$srv" || return 1
+        backup_init=$(backup_root_service_init "$root" "$srv") || return 1
+        [[ "$backup_init" == "$current_init" ]] || {
+            msg "${RED}[!] Backup for ${srv} uses ${backup_init}, but this VPS uses ${current_init}; refusing restore before any destructive change.${NC}"
+            return 1
+        }
+    done
+    return 0
+}
+
+backup_root_service_is_managed() {
+    local root="$1" srv="$2" unit found=0
+    for unit in "$root/etc/systemd/system/${srv}.service" "$root/etc/init.d/${srv}"; do
+        [[ -e "$unit" || -L "$unit" ]] || continue
+        [[ -f "$unit" && ! -L "$unit" ]] || return 1
+        grep -Fxq '# Managed by A-Box' "$unit" 2>/dev/null || return 1
+        found=$((found + 1))
+    done
+    (( found == 1 ))
+}
+
+validate_backup_manifest_tree() {
+    local work="$1"
+    python3 - "$work" <<'PY_BACKUP_MANIFEST'
+import hashlib
+import os
+import re
+import sys
+from pathlib import Path, PurePosixPath
+root=Path(sys.argv[1]).resolve()
+manifest=root/'meta'/'manifest.sha256'
+if not manifest.is_file() or manifest.is_symlink(): raise SystemExit(1)
+entries={}
+for raw in manifest.read_text(encoding='utf-8',errors='strict').splitlines():
+    m=re.fullmatch(r'([0-9A-Fa-f]{64})  (.+)',raw)
+    if not m: raise SystemExit(1)
+    digest,name=m.groups()
+    pp=PurePosixPath(name)
+    if pp.is_absolute() or '..' in pp.parts or not pp.parts or pp.parts[0] not in {'root','meta'}: raise SystemExit(1)
+    if name=='meta/manifest.sha256' or name in entries: raise SystemExit(1)
+    entries[name]=digest.lower()
+actual={}
+for base in (root/'root',root/'meta'):
+    for path in base.rglob('*'):
+        if path.is_symlink(): raise SystemExit(1)
+        if path.is_file():
+            rel=path.relative_to(root).as_posix()
+            if rel=='meta/manifest.sha256': continue
+            actual[rel]=path
+if set(entries)!=set(actual): raise SystemExit(1)
+for name,path in actual.items():
+    h=hashlib.sha256()
+    with path.open('rb') as f:
+        for chunk in iter(lambda:f.read(1024*1024),b''): h.update(chunk)
+    if h.hexdigest()!=entries[name]: raise SystemExit(1)
+PY_BACKUP_MANIFEST
+}
+
+validate_managed_paths_file() {
+    local file="$1" allowed_paths='' srv core_paths
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    allowed_paths=$(managed_auxiliary_paths) || return 1
+    for srv in xray sing-box hysteria; do
+        core_paths=$(core_family_paths "$srv") || return 1
+        allowed_paths+=$'\n'"$core_paths"
+    done
+    python3 - "$file" "$allowed_paths" <<'PY_MANAGED_PATHS'
+import sys
+from pathlib import Path
+allowed={x for x in sys.argv[2].splitlines() if x}
+lines=[x for x in Path(sys.argv[1]).read_text(encoding='utf-8',errors='strict').splitlines() if x]
+if len(lines)!=len(set(lines)) or any(x not in allowed for x in lines): raise SystemExit(1)
+PY_MANAGED_PATHS
+}
+
+validate_services_state_file() {
+    local file="$1"
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    awk -F'|' '
+      NF==0 {next}
+      NF!=3 || $1 !~ /^(xray|sing-box|hysteria)$/ || $2 !~ /^[01]$/ || $3 !~ /^[01]$/ {bad=1; exit}
+      seen[$1]++ {bad=1; exit}
+      END {exit bad}
+    ' "$file"
+}
+
+validate_extracted_backup_content() {
+    local root="$1" srv path src work
+    work=$(dirname "$root")
+    [[ -f "$work/meta/manifest.version" && -f "$work/meta/manifest.sha256" ]] || return 1
+    grep -Fxq 'A-Box backup manifest v3' "$work/meta/manifest.version" || return 1
+    validate_backup_manifest_tree "$work" || return 1
+    validate_managed_paths_file "$work/meta/managed-paths.txt" || return 1
+    validate_abox_cron_file "$work/meta/cron.abox.txt" || return 1
+    grep -Eq '^(iptables|ufw|firewalld)$' "$work/meta/firewall.backend" || return 1
+    validate_services_state_file "$work/meta/services.state" || return 1
+    [[ -f "$root$ABOX_DIR/.A-Box-owner" && ! -L "$root$ABOX_DIR/.A-Box-owner" ]] || return 1
+    grep -Fxq 'A-Box managed directory v1' "$root$ABOX_DIR/.A-Box-owner" 2>/dev/null || return 1
+    for srv in xray sing-box hysteria; do
+        backup_root_contains_service "$root" "$srv" || continue
+        backup_root_service_is_managed "$root" "$srv" || return 1
+    done
+    local aux_paths=''
+    aux_paths=$(managed_auxiliary_paths) || return 1
+    while IFS= read -r path; do
+        src="$root$path"
+        [[ -e "$src" || -L "$src" ]] || continue
+        auxiliary_content_is_abox_managed "$src" "$path" || return 1
+    done <<< "$aux_paths"
+}
+
+assert_restore_target_safe() {
+    local root="$1" srv path c=''
+    validate_extracted_backup_content "$root" || { msg "${RED}[!] Backup content ownership markers are invalid.${NC}"; return 1; }
+    local conflicts=''
+    for srv in xray sing-box hysteria; do
+        backup_root_contains_service "$root" "$srv" || continue
+        conflicts=$(list_foreign_core_conflicts "$srv") || return 1
+        c+="$conflicts"$'\n'
+    done
+    local aux_paths=''
+    aux_paths=$(managed_auxiliary_paths) || return 1
+    while IFS= read -r path; do
+        [[ "$path" == /usr/local/bin/sb ]] && continue
+        [[ -e "$root$path" || -L "$root$path" ]] || continue
+        [[ ! -e "$path" && ! -L "$path" ]] || auxiliary_path_is_abox_managed "$path" || c+="aux|${path}"$'\n'
+    done <<< "$aux_paths"
+    [[ -z "${c//$'\n'/}" ]] || { msg "${RED}[!] Restore would overwrite non-A-Box paths:${NC}"; printf '%s' "$c" >&2; return 1; }
+}
+
+assert_restore_shortcut_safe() {
+    local root="$1"
+    [[ -e "$root/usr/local/bin/sb" || -L "$root/usr/local/bin/sb" ]] || return 0
+    assert_abox_shortcut_safe /usr/local/bin/sb
+}
+
+abox_restore_preserved_name() {
+    case "$1" in
+        backups|diagnostics|preflight|A-Box.sh|.backup-hmac.key|.runtime.lock|.runtime.lock.d|socket_probe.sh|geo_update.sh|traffic_monitor.sh|firewall_restore.sh|iptables.v4|iptables.v6) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+clear_abox_runtime_for_restore() {
+    local child base failed=0
+    [[ -d "$ABOX_DIR" && ! -L "$ABOX_DIR" ]] || return 0
+    for child in "$ABOX_DIR"/* "$ABOX_DIR"/.[!.]* "$ABOX_DIR"/..?*; do
+        [[ -e "$child" || -L "$child" ]] || continue
+        base=${child##*/}
+        abox_restore_preserved_name "$base" && continue
+        path_tree_has_mountpoint "$child" && { msg "${RED}[!] Restore cleanup encountered a mountpoint; aborting before deletion: ${child}${NC}"; return 1; }
+    done
+    for child in "$ABOX_DIR"/* "$ABOX_DIR"/.[!.]* "$ABOX_DIR"/..?*; do
+        [[ -e "$child" || -L "$child" ]] || continue
+        base=${child##*/}
+        abox_restore_preserved_name "$base" && continue
+        rm -rf -- "$child" || failed=1
+    done
+    (( failed == 0 ))
+}
+
+restore_abox_directory() {
+    local root="$1" src child base
+    src="$root$ABOX_DIR"
+    [[ -d "$src" && ! -L "$src" ]] || return 1
+    path_parent_chain_safe "$ABOX_DIR" || return 1
+    if [[ -e "$ABOX_DIR" || -L "$ABOX_DIR" ]]; then
+        [[ -d "$ABOX_DIR" && ! -L "$ABOX_DIR" ]] || return 1
+    else
+        install -d -m 700 "$ABOX_DIR" || return 1
+    fi
+    path_tree_has_mountpoint "$ABOX_DIR" && return 1
+    ensure_abox_dir_owned "$ABOX_DIR" || return 1
+    for child in "$src"/* "$src"/.[!.]* "$src"/..?*; do
+        [[ -e "$child" || -L "$child" ]] || continue
+        base=${child##*/}
+        abox_restore_preserved_name "$base" && continue
+        [[ ! -L "$child" ]] || return 1
+        cp -a -- "$child" "$ABOX_DIR/" || return 1
+    done
+    ensure_abox_dir_owned "$ABOX_DIR" || return 1
+}
+
+regenerate_runtime_assets_after_restore() {
+    clear_abox_env_vars
+    load_abox_env "$ABOX_ENV" || return 1
+    for srv in xray sing-box hysteria; do
+        abox_owns_service "$srv" || continue
+        prepare_abox_runtime_permissions "$srv" || return 1
+    done
+    setup_shortcut || return 1
+    setup_health_monitor || return 1
+    setup_geo_cron || return 1
+    if valid_traffic_limit_gb "${TRAFFIC_LIMIT_GB:-}"; then
+        setup_traffic_monitor || return 1
+    else
+        disable_traffic_monitor || return 1
+    fi
+}
+
+
+restore_tree_path() {
+    local root="$1" path="$2" src parent current
+    src="$root$path"
+    [[ "$path" == /* && "$path" != / ]] || return 1
+    parent=$(dirname "$path")
+    # Refuse to traverse a symlinked live parent directory.
+    current='/'
+    IFS='/' read -r -a _parts <<< "${parent#/}"
+    for _part in "${_parts[@]}"; do
+        [[ -n "$_part" ]] || continue
+        current="${current%/}/$_part"
+        [[ -L "$current" ]] && return 1
+    done
+    if [[ "$parent" != "/" ]] && path_is_mountpoint "$parent"; then
+        return 1
+    fi
+    if [[ ! -e "$src" && ! -L "$src" ]]; then
+        # Even when the backup has no matching target, the live target may
+        # contain nested mounts. Treat the whole target tree as protected so
+        # cleanup cannot recurse into an unrelated mounted filesystem.
+        path_tree_has_mountpoint "$path" && return 1
+        rm -rf -- "$path"
+        return 0
+    fi
+    [[ ! -L "$src" ]] || return 1
+    path_tree_has_mountpoint "$path" && return 1
+    mkdir -p "$parent" || return 1
+    rm -rf -- "$path" || return 1
+    cp -a -- "$src" "$parent/" || return 1
+    [[ ! -L "$path" ]]
+}
+
+restore_shortcut_from_backup() {
+    local root="$1" src
+    src="$root/usr/local/bin/sb"
+    if [[ -e "$src" || -L "$src" ]]; then
+        auxiliary_content_is_abox_managed "$src" /usr/local/bin/sb || return 1
+        assert_abox_shortcut_safe /usr/local/bin/sb
+        restore_tree_path "$root" /usr/local/bin/sb
+    else
+        remove_abox_shortcut /usr/local/bin/sb
+    fi
+}
+
+restore_auxiliary_path_from_backup() {
+    local root="$1" path="$2" src
+    src="$root$path"
+    [[ "$path" != /usr/local/bin/sb ]] || { restore_shortcut_from_backup "$root"; return; }
+    if [[ -e "$src" || -L "$src" ]]; then
+        auxiliary_content_is_abox_managed "$src" "$path" || return 1
+        [[ ! -e "$path" && ! -L "$path" ]] || auxiliary_path_is_abox_managed "$path" || return 1
+        restore_tree_path "$root" "$path"
+    else
+        remove_owned_auxiliary_path "$path"
+    fi
+}
+
+restore_core_family_from_backup() {
+    local root="$1" srv="$2" path core_paths='' contains_rc=0 backup_init current_init
+    backup_root_contains_service "$root" "$srv"
+    contains_rc=$?
+    case "$contains_rc" in
+        0) ;;
+        1) return 0 ;;
+        *) return 1 ;;
+    esac
+    backup_root_service_is_managed "$root" "$srv" || return 1
+    backup_init=$(backup_root_service_init "$root" "$srv") || return 1
+    current_init=$(effective_init_system) || return 1
+    [[ "$backup_init" == "$current_init" ]] || {
+        msg "${RED}[!] Backup for ${srv} uses ${backup_init}, but this VPS uses ${current_init}; refusing cross-init restore.${NC}"
+        return 1
+    }
+    core_paths=$(core_family_paths "$srv") || return 1
+    [[ -n "$core_paths" ]] || return 1
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        restore_tree_path "$root" "$path" || return 1
+    done <<< "$core_paths"
+}
+
+
+restore_cron_from_file() {
+    local f="$1" tmp current err
+    [[ -r "$f" && -f "$f" && ! -L "$f" ]] || return 0
+    validate_abox_cron_file "$f" || return 1
+    tmp=$(umask 077; mktemp /tmp/A-Box-cron-restore.XXXXXX) || return 1
+    current=$(umask 077; mktemp /tmp/A-Box-cron-current.XXXXXX) || { rm -f "$tmp"; return 1; }
+    err=$(umask 077; mktemp /tmp/A-Box-cron-error.XXXXXX) || { rm -f "$tmp" "$current"; return 1; }
+    if LC_ALL=C crontab -l > "$current" 2> "$err"; then :
+    elif grep -Eqi 'no crontab|no crontab for' "$err"; then : > "$current"
+    else rm -f "$tmp" "$current" "$err"; return 1
+    fi
+    strip_abox_cron_blocks_from_file "$current" "$tmp" || { rm -f "$tmp" "$current" "$err"; return 1; }
+    cat "$f" >> "$tmp" || { rm -f "$tmp" "$current" "$err"; return 1; }
+    crontab "$tmp"
+    local rc=$?
+    rm -f "$tmp" "$current" "$err"
+    return "$rc"
+}
+
+backup_current_config() {
+    local ts unique backup_dir work root tarball backup_failed=0 backend srv path _abox_links _old_backups
+    valid_backup_retention_count "$BACKUP_RETENTION_COUNT" || die 'BACKUP_RETENTION_COUNT 无效；必须是 0-1000 的整数。'
+    ts=$(date +%Y%m%d-%H%M%S); unique=$(openssl rand -hex 3 2>/dev/null || printf '%s' "$$")
+    backup_dir="${1:-$ABOX_DIR/backups}"
+    [[ "$backup_dir" == /* ]] || die 'Backup directory must be an absolute path.'
+    path_parent_chain_safe "$backup_dir/.A-Box-backup-destination" || die 'Backup directory parent chain is unsafe.'
+    if [[ -e "$backup_dir" || -L "$backup_dir" ]]; then
+        [[ -d "$backup_dir" && ! -L "$backup_dir" ]] || die 'Backup directory is not a safe regular directory.'
+        path_owned_by_root "$backup_dir" || die 'Backup directory is not root-owned.'
+        path_mode_has_no_group_other_write "$backup_dir" || die 'Backup directory permissions are unsafe.'
+    fi
+    work=$(mktemp -d /tmp/A-Box-backup.XXXXXX) || die 'Backup temp directory creation failed.'
+    root="$work/root"; install -d -m 700 "$backup_dir" "$root" "$work/meta" || { rm -rf "$work"; die 'Backup directory creation failed.'; }
+    path_owned_by_root "$backup_dir" || { rm -rf "$work"; die 'Backup directory ownership verification failed.'; }
+    path_mode_has_no_group_other_write "$backup_dir" || { rm -rf "$work"; die 'Backup directory permissions verification failed.'; }
+    local managed_paths='' core_paths=''
+    managed_paths=$(managed_auxiliary_paths) || { rm -rf "$work"; die 'Managed path list creation failed.'; }
+    for srv in xray sing-box hysteria; do
+        core_paths=$(core_family_paths "$srv") || { rm -rf "$work"; die "Core path enumeration failed: $srv"; }
+        managed_paths+=$'\n'"$core_paths"
+    done
+    printf '%s\n' "$managed_paths" | awk 'NF && !seen[$0]++' > "$work/meta/managed-paths.txt" || { rm -rf "$work"; die 'Managed path list write failed.'; }
+    msg "${YELLOW}[*] Creating A-Box configuration backup...${NC}"
+    backup_copy_path() {
+        local src="$1" dst links
+        [[ -e "$src" ]] || return 0
+        [[ ! -L "$src" ]] || { backup_failed=1; return 1; }
+        # A managed path may acquire a nested mount after ownership was recorded.
+        # Never let cp -a traverse into an external filesystem/bind mount during backup.
+        path_tree_has_mountpoint "$src" && { backup_failed=1; return 1; }
+        if [[ -d "$src" ]]; then
+            links=$(find "$src" -type l -print 2>/dev/null) || { backup_failed=1; return 1; }
+            [[ -z "$links" ]] || { backup_failed=1; return 1; }
+        fi
+        dst="$root$src"
+        mkdir -p "$(dirname "$dst")" || { backup_failed=1; return 1; }
+        cp -a -- "$src" "$dst" || backup_failed=1
+    }
+    if [[ -d "$ABOX_DIR" ]]; then
+        # The A-Box data directory itself can live on a separate filesystem, but
+        # a nested mount must never be traversed by tar during backup. This also
+        # catches same-device bind mounts that --one-file-system cannot detect.
+        path_tree_has_nested_mountpoint "$ABOX_DIR" && backup_failed=1
+        _abox_links=$(find "$ABOX_DIR" -path "$ABOX_DIR/backups" -prune -o -path "$ABOX_DIR/diagnostics" -prune -o -path "$ABOX_DIR/preflight" -prune -o -type l -print 2>/dev/null) || backup_failed=1
+        if [[ -n "${_abox_links:-}" ]]; then
+            backup_failed=1
+        else
+            mkdir -p "$root$ABOX_DIR" || backup_failed=1
+            [[ "$backup_failed" == 0 ]] && (cd "$ABOX_DIR" && tar \
+                --exclude='./backups' --exclude='./diagnostics' --exclude='./preflight' \
+                --exclude='./A-Box.sh' --exclude='./.backup-hmac.key' --exclude='./.runtime.lock' --exclude='./.runtime.lock.d' \
+                --exclude='./socket_probe.sh' --exclude='./geo_update.sh' --exclude='./traffic_monitor.sh' \
+                --exclude='./firewall_restore.sh' --exclude='./iptables.v4' --exclude='./iptables.v6' \
+                -cpf - . | tar -C "$root$ABOX_DIR" -xpf -) || backup_failed=1
+        fi
+    fi
+    shortcut_is_abox_managed /usr/local/bin/sb && backup_copy_path /usr/local/bin/sb
+    for srv in xray sing-box hysteria; do
+        if abox_owns_service "$srv"; then
+            core_paths=$(core_family_paths "$srv") || { rm -rf "$work"; die "Core path enumeration failed during backup: $srv"; }
+            while IFS= read -r path; do
+                [[ -n "$path" ]] || continue
+                backup_copy_path "$path"
+            done <<< "$core_paths"
+        fi
+    done
+    local aux_paths=''
+    aux_paths=$(managed_auxiliary_paths) || { rm -rf "$work"; die 'Managed auxiliary path enumeration failed during backup.'; }
+    while IFS= read -r path; do
+        [[ "$path" == /usr/local/bin/sb ]] && continue
+        auxiliary_path_is_abox_managed "$path" && backup_copy_path "$path"
+    done <<< "$aux_paths"
+    { echo 'A-Box backup'; echo "Created: $(now_iso)"; echo "Host: $(hostname 2>/dev/null || true)"; echo "Kernel: $(uname -a 2>/dev/null || true)"; echo "Init: ${INIT_SYS:-unknown}"; echo "Script SHA256: $(sha256sum "$0" 2>/dev/null | awk '{print $1}')"; } > "$work/meta/metadata.txt"
+    collect_abox_cron > "$work/meta/cron.abox.txt" 2>/dev/null || backup_failed=1
+    capture_managed_service_state "$work/meta/services.state" || backup_failed=1
+    backend=$(firewall_backend); printf '%s\n' "$backend" > "$work/meta/firewall.backend"
+    capture_abox_iptables_snapshot "$work/meta/iptables.snapshot" 4 || backup_failed=1
+    capture_abox_iptables_snapshot "$work/meta/ip6tables.snapshot" 6 || backup_failed=1
+    (( backup_failed == 0 )) || { rm -rf "$work"; die 'Backup aborted because an existing A-Box path could not be copied.'; }
+    printf '%s\n' 'A-Box backup manifest v3' > "$work/meta/manifest.version"
+    create_backup_manifest "$work" "$work/meta/manifest.sha256" || { rm -rf "$work"; die 'Backup manifest creation failed.'; }
+    tarball="$backup_dir/A-Box-backup-${ts}-${unique}.tar.gz"
+    tar -C "$work" -czf "$tarball" root meta || { rm -rf "$work"; rm -f "$tarball"; die 'Backup tarball creation failed.'; }
+    chmod 600 "$tarball"; validate_backup_archive "$tarball" || { rm -rf "$work"; rm -f "$tarball"; die 'Backup archive validation failed.'; }
+    backup_checksum_write "$tarball" || { rm -rf "$work"; rm -f "$tarball" "${tarball}.sha256"; die 'Backup SHA256 creation failed.'; }
+    backup_auth_write "$tarball" || { rm -rf "$work"; rm -f "$tarball" "${tarball}.sha256" "${tarball}.hmac"; die 'Backup HMAC authentication creation failed.'; }
+    local backup_dir_real abox_dir_real
+    backup_dir_real=$(canonical_path "$backup_dir") || { rm -rf "$work"; die 'Backup directory canonicalization failed.'; }
+    abox_dir_real=$(canonical_path "$ABOX_DIR") || { rm -rf "$work"; die 'A-Box directory canonicalization failed.'; }
+    if [[ "$backup_dir_real" != "$abox_dir_real" && "$backup_dir_real" != "$abox_dir_real/"* ]]; then
+        msg "${YELLOW}[*] External backup created without exporting the authentication key beside it.${NC}"
+        msg "${YELLOW}[*] Use --export-backup-key to save the recovery key on a separate trusted medium.${NC}"
+    fi
+    rm -rf "$work"
+    ABOX_LAST_BACKUP="$tarball"
+    _old_backups=()
+    local _old_backups_output=''
+    if _old_backups_output=$(python3 - "$backup_dir" "$BACKUP_RETENTION_COUNT" <<'PY_BACKUP_RETENTION'
+from pathlib import Path
+import sys
+root=Path(sys.argv[1]); keep=int(sys.argv[2])
+items=[]
+for p in root.glob('A-Box-backup-*.tar.gz'):
+    try:
+        if p.is_file() and not p.is_symlink(): items.append((p.stat().st_mtime_ns, str(p)))
+    except OSError: pass
+for _, name in sorted(items, reverse=True)[keep:]: print(name)
+PY_BACKUP_RETENTION
+); then
+        [[ -z "$_old_backups_output" ]] || mapfile -t _old_backups <<< "$_old_backups_output"
+        for _old in "${_old_backups[@]}"; do [[ "$_old" == "$ABOX_LAST_BACKUP" ]] || rm -f -- "$_old" "${_old}.sha256" "${_old}.hmac" "${_old}.key"; done
+    else
+        msg "${YELLOW}[!] Backup retention enumeration failed; keeping existing backups unchanged.${NC}"
+    fi
+    msg "${GREEN}[*] Backup created:${NC} $tarball"
+}
+
+auto_backup_prompt() {
+    local reason="${1:-operation}" dest="${2:-$ABOX_DIR/backups}" answer
+    msg "${YELLOW}[!] Backup recommended before: ${reason}${NC}"
+    read -r -p 'Create backup now? [Y/N]: ' answer
+    if is_yes "$answer"; then
+        backup_current_config "$dest"
+    else
+        msg "${YELLOW}[*] Backup skipped by user.${NC}"
+    fi
+}
+
+auto_backup_silent() {
+    local reason="${1:-operation}" dest="${2:-$ABOX_DIR/backups}"
+    msg "${YELLOW}[*] Auto backup before: ${reason}${NC}"
+    backup_current_config "$dest"
+}
+
+restore_latest_backup_silent() {
+    local backup_dir="${1:-$ABOX_DIR/backups}" selected="${2:-}" key_file="${3:-}" work root backend mode=all srv
+    [[ -d "$backup_dir" ]] || return 1
+    if [[ -n "$selected" ]]; then
+        [[ -f "$selected" && "$(dirname "$selected")" == "$backup_dir" ]] || return 1
+    else
+        selected=$(find "$backup_dir" -maxdepth 1 -type f -name 'A-Box-backup-*.tar.gz' -print | sort -r | sed -n '1p')
+    fi
+    [[ -n "$selected" ]] || return 1
+    backup_checksum_verify "$selected" "${selected}.sha256" || return 1
+    prepare_backup_runtime_identities "$selected" || return 1
+    if [[ -n "$key_file" ]]; then
+        backup_auth_verify_with_key_file "$selected" "${selected}.hmac" "$key_file" || return 1
+    else
+        backup_auth_verify "$selected" "${selected}.hmac" || return 1
+    fi
+    validate_backup_archive "$selected" || return 1
+    work=$(mktemp -d /tmp/A-Box-rollback.XXXXXX) || return 1; chmod 700 "$work"
+    tar -xzf "$selected" -C "$work" || { rm -rf "$work"; return 1; }
+    root="$work/root"; assert_restore_target_safe "$root" || { rm -rf "$work"; return 1; }; assert_restore_shortcut_safe "$root" || { rm -rf "$work"; return 1; }; validate_backup_core_init_compatibility "$root" || { rm -rf "$work"; return 1; }
+    stop_all_managed_services >/dev/null 2>&1 || { rm -rf "$work"; return 1; }
+    clean_nat_rules >/dev/null 2>&1 || { rm -rf "$work"; return 1; }
+    clean_input_rules >/dev/null 2>&1 || { rm -rf "$work"; return 1; }
+    remove_all_owned_core_families || { rm -rf "$work"; return 1; }
+    clear_abox_runtime_for_restore || { rm -rf "$work"; return 1; }
+    restore_abox_directory "$root" || { rm -rf "$work"; return 1; }
+    for srv in xray sing-box hysteria; do restore_core_family_from_backup "$root" "$srv" || { rm -rf "$work"; return 1; }; done
+    local aux_paths=''
+    aux_paths=$(managed_auxiliary_paths) || { rm -rf "$work"; return 1; }
+    while IFS= read -r path; do
+        [[ "$path" == /usr/local/bin/sb ]] && continue
+        restore_auxiliary_path_from_backup "$root" "$path" || { rm -rf "$work"; return 1; }
+    done <<< "$aux_paths"
+    regenerate_runtime_assets_after_restore >/dev/null 2>&1 || { rm -rf "$work"; return 1; }
+    apply_native_firewall_rules_from_state >/dev/null 2>&1 || { rm -rf "$work"; return 1; }
+    backend=$(cat "$work/meta/firewall.backend" 2>/dev/null || echo iptables); [[ "$backend" == iptables ]] || mode=special
+    restore_abox_iptables_snapshot "$work/meta/iptables.snapshot" 4 "$mode" || { rm -rf "$work"; return 1; }
+    restore_abox_iptables_snapshot "$work/meta/ip6tables.snapshot" 6 "$mode" || { rm -rf "$work"; return 1; }
+    load_abox_env "$ABOX_ENV" >/dev/null 2>&1 || true
+    enforce_ss_whitelist_order "${SS_PORT:-}" || { rm -rf "$work"; return 1; }
+    save_firewall_rules >/dev/null 2>&1 || { rm -rf "$work"; return 1; }
+    if [[ "${INIT_SYS:-}" == systemd ]]; then systemctl daemon-reload >/dev/null 2>&1 || { rm -rf "$work"; return 1; }; fi
+    restore_managed_service_state "$work/meta/services.state" || { rm -rf "$work"; return 1; }
+    rm -rf "$work"; msg "${GREEN}[*] Rollback restored backup:${NC} $selected"
+}
+
+restore_from_backup() {
+    local backup_dir="$ABOX_DIR/backups" backups i choice selected work root answer backend mode=all srv path targets='' backups_output=''
+    if ! backups_output=$(
+        for _dir in "$ABOX_DIR/backups" /root/A-Box-backups; do
+            [[ -d "$_dir" && ! -L "$_dir" ]] || continue
+            find "$_dir" -maxdepth 1 -type f -name 'A-Box-backup-*.tar.gz' -print
+        done | sort -ru
+    ); then
+        msg "${RED}[!] Failed to enumerate A-Box backups; restore was not started.${NC}"
+        pause_return
+        return
+    fi
+    backups=()
+    [[ -z "$backups_output" ]] || mapfile -t backups <<< "$backups_output"
+    (( ${#backups[@]} )) || { msg "${RED}[!] No A-Box backup tarballs found in $ABOX_DIR/backups or /root/A-Box-backups.${NC}"; pause_return; return; }
+    clear
+    for i in "${!backups[@]}"; do printf '%2d. %s\n' "$((i+1))" "${backups[$i]}"; done
+    read -r -p 'Select backup (0 back): ' choice
+    [[ "$choice" == 0 ]] && return
+    if ! [[ "$choice" =~ ^[1-9][0-9]*$ ]] || ! valid_decimal_upto "$choice" "${#backups[@]}"; then
+        msg "${RED}[!] Invalid selection.${NC}"
+        pause_return
+        return
+    fi
+    selected="${backups[$((10#$choice-1))]}"
+    backup_checksum_verify "$selected" "${selected}.sha256" || die 'Backup SHA256 is missing or invalid.'
+    prepare_backup_runtime_identities "$selected" || die 'Backup runtime identity preparation failed.'
+    prepare_backup_auth_for_manual_restore "$selected" || die 'Backup HMAC/recovery-key authentication failed or was not authorized.'
+    validate_backup_archive "$selected" || die 'Backup archive structure/link validation failed.'
+    work=$(mktemp -d /tmp/A-Box-restore.XXXXXX) || die 'Restore temp directory creation failed.'
+    chmod 700 "$work"
+    tar -xzf "$selected" -C "$work" || { rm -rf "$work"; die 'Backup extraction failed.'; }
+    root="$work/root"
+    assert_restore_target_safe "$root" || { rm -rf "$work"; die 'Restore target ownership check failed.'; }
+    assert_restore_shortcut_safe "$root" || { rm -rf "$work"; die 'Restore shortcut ownership check failed.'; }
+    validate_backup_core_init_compatibility "$root" || { rm -rf "$work"; die 'Backup init system is incompatible with the current VPS; restore was aborted before destructive changes.'; }
+    msg "${YELLOW}[!] Restore will replace only A-Box-owned paths and A-Box firewall rules.${NC}"
+    read -r -p 'Continue restore? [Y/N]: ' answer
+    is_yes "$answer" || { rm -rf "$work"; return; }
+
+    ABOX_LAST_BACKUP=''
+    backup_current_config "$backup_dir"
+    [[ -n "$ABOX_LAST_BACKUP" && -f "$ABOX_LAST_BACKUP" ]] || { rm -rf "$work"; die 'Pre-restore snapshot creation failed.'; }
+    for srv in xray sing-box hysteria; do
+        if abox_owns_service "$srv" || backup_root_contains_service "$root" "$srv"; then
+            targets+=" ${srv}"
+        fi
+    done
+    ABOX_DEPLOY_TX_ACTIVE=1
+    ABOX_DEPLOY_TX_REASON='manual backup restore'
+    ABOX_DEPLOY_TX_TARGETS="${targets# }"
+    ABOX_DEPLOY_TX_BACKUP="$ABOX_LAST_BACKUP"
+    ABOX_DEPLOY_TX_TMP="$work"
+    ABOX_DIE_HOOK=deployment_transaction_rollback
+    install_deployment_transaction_traps
+
+    stop_all_managed_services || die '恢复前无法停止全部 A-Box 托管服务。'
+    clean_nat_rules || die '恢复前无法完整删除 A-Box HY2 NAT 规则。'
+    clean_input_rules || die '恢复前无法完整删除 A-Box INPUT/原生防火墙规则。'
+    remove_all_owned_core_families || die '恢复前删除当前 A-Box 核心文件失败。'
+    clear_abox_runtime_for_restore || die '恢复前清理 A-Box 运行目录失败。'
+    restore_abox_directory "$root" || die 'Restore A-Box directory failed.'
+    for srv in xray sing-box hysteria; do
+        restore_core_family_from_backup "$root" "$srv" || die "Restore failed for core family: $srv"
+    done
+    local aux_paths=''
+    aux_paths=$(managed_auxiliary_paths) || die '无法枚举 A-Box 辅助文件，恢复已中止。'
+    while IFS= read -r path; do
+        [[ "$path" == /usr/local/bin/sb ]] && continue
+        restore_auxiliary_path_from_backup "$root" "$path" || die "Restore failed: $path"
+    done <<< "$aux_paths"
+    chmod 700 "$ABOX_DIR" 2>/dev/null || true
+    chmod 600 "$ABOX_ENV" 2>/dev/null || true
+    regenerate_runtime_assets_after_restore || die 'Regenerate trusted A-Box runtime helpers and cron blocks failed.'
+    apply_native_firewall_rules_from_state || die 'Restore native firewall rules failed.'
+    backend=$(cat "$work/meta/firewall.backend" 2>/dev/null || echo iptables)
+    [[ "$backend" == iptables ]] || mode=special
+    restore_abox_iptables_snapshot "$work/meta/iptables.snapshot" 4 "$mode" || die 'IPv4 A-Box firewall restore failed.'
+    restore_abox_iptables_snapshot "$work/meta/ip6tables.snapshot" 6 "$mode" || die 'IPv6 A-Box firewall restore failed.'
+    load_abox_env "$ABOX_ENV" >/dev/null 2>&1 || true
+    enforce_ss_whitelist_order "${SS_PORT:-}" || die 'Restored SS whitelist order validation failed.'
+    save_firewall_rules || die 'Restored A-Box firewall persistence failed.'
+    if [[ "${INIT_SYS:-}" == systemd ]]; then systemctl daemon-reload >/dev/null 2>&1 || die 'systemd daemon-reload after restore failed.'; fi
+    restore_managed_service_state "$work/meta/services.state" || die 'Restored service state failed validation/startup.'
+    for srv in xray sing-box hysteria; do abox_owns_service "$srv" && record_core_family_ownership "$srv" || true; done
+    commit_deployment_transaction
+    rm -rf "$work"
+    msg "${GREEN}[*] Restore completed.${NC}"
+    pause_return
+}
+
+backup_restore_menu() {
+    clear
+    msg "${CYAN}======================================================================${NC}"
+    msg "${BOLD}${GREEN}Backup / Restore / 配置备份与恢复${NC}"
+    msg "${CYAN}======================================================================${NC}"
+    if [[ "${ABOX_LANG:-zh}" == 'en' ]]; then
+        msg "${YELLOW}1. Backup current A-Box configuration${NC}"
+        msg "${YELLOW}2. Restore from backup${NC}"
+        msg "${YELLOW}3. Export recovery key to a separate medium${NC}"
+        msg "${YELLOW}4. Convert a legacy backup to manifest v3${NC}"
+        msg "${GREEN}0. Back${NC}"
+    else
+        msg "${YELLOW}1. 备份当前 A-Box 配置${NC}"
+        msg "${YELLOW}2. 从备份恢复${NC}"
+        msg "${YELLOW}3. 将恢复密钥导出到独立介质${NC}"
+        msg "${YELLOW}4. 将旧版备份安全转换为 manifest v3${NC}"
+        msg "${GREEN}0. 返回${NC}"
+    fi
+    local c
+    read -r -p 'Select [0-4]: ' c
+    case "$c" in
+        1) backup_current_config; pause_return ;;
+        2) restore_from_backup ;;
+        3)
+            local key_dest
+            read -r -p 'Absolute path on a separate trusted medium: ' key_dest
+            export_backup_recovery_key "$key_dest"; pause_return
+            ;;
+        4)
+            local legacy_path legacy_out
+            read -r -p 'Legacy .tar.gz path: ' legacy_path
+            read -r -p 'Output directory (default: same directory): ' legacy_out
+            convert_legacy_backup_archive "$legacy_path" "${legacy_out:-$(dirname "$legacy_path")}"; pause_return
+            ;;
+        *) return 0 ;;
+    esac
+}
+
+export_diagnostic_bundle() {
+    local ts diag_dir work bundle checksum
+    ts=$(date +%Y%m%d-%H%M%S)
+    diag_dir="$ABOX_DIR/diagnostics"
+    work=$(mktemp -d /tmp/A-Box-diagnostic.XXXXXX) || die 'Diagnostic temp directory creation failed.'
+    mkdir -p "$diag_dir" "$work/logs" || { rm -rf -- "$work"; die '诊断目录创建失败。'; }
+    chmod 700 "$diag_dir" 2>/dev/null || { rm -rf -- "$work"; die '诊断目录权限设置失败。'; }
+
+    msg "${YELLOW}[*] Collecting diagnostic information with secret redaction...${NC}"
+    {
+        echo "A-Box diagnostic bundle"
+        echo "Created: $(now_iso)"
+        echo "Host: $(hostname 2>/dev/null || true)"
+        echo "Script: $0"
+        echo "Script SHA256: $(sha256sum "$0" 2>/dev/null | awk '{print $1}')"
+    } > "$work/summary.txt"
+
+    { uname -a 2>/dev/null; echo; cat /etc/os-release 2>/dev/null || true; echo; command -v systemctl >/dev/null 2>&1 && systemctl --version 2>/dev/null | head -n 3 || true; } > "$work/system.txt"
+    { ip addr 2>/dev/null || true; echo; ip route 2>/dev/null || true; echo; ip -6 route 2>/dev/null || true; echo; ss -lntup 2>/dev/null || true; } > "$work/network.txt"
+    { show_status_report 2>/dev/null || true; echo; for c in xray sing-box hysteria; do command -v "$c" >/dev/null 2>&1 && "$c" version 2>/dev/null | head -n 5; done; } > "$work/status.txt"
+    { iptables -S 2>/dev/null | grep 'A-Box' || true; echo; iptables -t nat -S 2>/dev/null | grep 'A-Box' || true; echo; ip6tables -S 2>/dev/null | grep 'A-Box' || true; echo; ip6tables -t nat -S 2>/dev/null | grep 'A-Box' || true; } > "$work/firewall.txt"
+    collect_abox_cron > "$work/cron.txt" 2>/dev/null || true
+    if [[ -e "$ABOX_ENV" || -L "$ABOX_ENV" ]]; then
+        write_redacted_file "$ABOX_ENV" "$work/env.redacted" || { rm -rf "$work"; die 'Diagnostic secret redaction failed; refusing to create a misleading bundle.'; }
+    else
+        printf '%s\n' 'A-Box environment file is not present.' > "$work/env.redacted" || { rm -rf "$work"; die 'Diagnostic environment placeholder creation failed.'; }
+    fi
+
+    if command -v journalctl >/dev/null 2>&1; then
+        journalctl -u xray --no-pager -n 120 2>/dev/null | redact_secrets_stream > "$work/logs/xray.journal.txt" || true
+        journalctl -u sing-box --no-pager -n 120 2>/dev/null | redact_secrets_stream > "$work/logs/sing-box.journal.txt" || true
+        journalctl -u hysteria --no-pager -n 120 2>/dev/null | redact_secrets_stream > "$work/logs/hysteria.journal.txt" || true
+    fi
+    for f in /var/log/A-Box-xray-error.log /var/log/A-Box-xray-access.log /var/log/A-Box-singbox.log /var/log/A-Box-hysteria.log; do
+        [[ -r "$f" ]] && tail -n 200 "$f" 2>/dev/null | redact_secrets_stream > "$work/logs/$(basename "$f").tail.txt" || true
+    done
+
+    bundle=$(mktemp "$diag_dir/A-Box-diagnostic-${ts}.XXXXXX.tar.gz") || { rm -rf "$work"; die 'Diagnostic bundle filename allocation failed.'; }
+    tar -C "$work" -czf "$bundle" . || { rm -rf "$work"; die 'Diagnostic bundle creation failed.'; }
+    chmod 600 "$bundle" 2>/dev/null || { rm -rf "$work"; rm -f "$bundle"; die 'Diagnostic bundle permission hardening failed.'; }
+    checksum="${bundle}.sha256"
+    checksum_tmp=$(mktemp "$diag_dir/.A-Box-diagnostic-checksum.XXXXXX") || { rm -rf "$work"; rm -f "$bundle"; die 'Diagnostic checksum temporary file creation failed.'; }
+    if ! sha256sum "$bundle" > "$checksum_tmp" 2>/dev/null; then
+        rm -rf "$work"; rm -f "$bundle" "$checksum_tmp"
+        die 'Diagnostic checksum generation failed.'
+    fi
+    chmod 600 "$checksum_tmp" 2>/dev/null || { rm -rf "$work"; rm -f "$bundle" "$checksum_tmp"; die 'Diagnostic checksum permission hardening failed.'; }
+    if [[ $EUID -eq 0 ]]; then
+        chown root:root "$checksum_tmp" 2>/dev/null || { rm -rf "$work"; rm -f "$bundle" "$checksum_tmp"; die 'Diagnostic checksum ownership hardening failed.'; }
+    fi
+    mv -f -- "$checksum_tmp" "$checksum" 2>/dev/null || { rm -rf "$work"; rm -f "$bundle" "$checksum_tmp"; die 'Diagnostic checksum atomic commit failed.'; }
+    [[ -s "$checksum" && ! -L "$checksum" ]] || { rm -rf "$work"; rm -f "$bundle" "$checksum"; die 'Diagnostic checksum verification failed.'; }
+    rm -rf "$work"
+    msg "${GREEN}[*] Diagnostic bundle:${NC}" $bundle
+    msg "${GREEN}[*] SHA256:${NC}" $checksum
+    pause_return
+}
+
+
+default_route_uses_warp() {
+    local dev=''
+    dev=$(ip -o route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)
+    [[ "$dev" =~ ^(wg|warp|tun|CloudflareWARP)[0-9A-Za-z_.-]*$ ]]
+}
+
+
+light_preflight_check() {
+    local fail=0 warn=0 c
+    msg "${YELLOW}[*] Running lightweight preflight check...${NC}"
+    [[ $EUID -eq 0 ]] || { msg "${RED}[FAIL] root privilege required${NC}"; fail=$((fail+1)); }
+    [[ -t 0 ]] || { msg "${YELLOW}[WARN] no interactive TTY on stdin${NC}"; warn=$((warn+1)); }
+    if [[ -r /etc/os-release ]]; then
+        . /etc/os-release
+        case "${ID:-}" in debian|ubuntu|centos|rhel|rocky|almalinux|alpine) msg "${GREEN}[PASS] OS: ${ID:-unknown}${NC}" ;; *) msg "${YELLOW}[WARN] OS may be unsupported: ${ID:-unknown}${NC}"; warn=$((warn+1)) ;; esac
+    else
+        msg "${YELLOW}[WARN] /etc/os-release not readable${NC}"; warn=$((warn+1))
+    fi
+    local route_dev warp_confirm=''
+    route_dev=$(ip -o route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' || true)
+    if default_route_uses_warp; then
+        msg "${YELLOW}[WARN] 默认公网路由经由 $route_dev；REALITY dest、HY2 伪装和公网 IP 探测可能使用该出口。${NC}"
+        if [[ -t 0 ]]; then
+            read -r -p '仍要使用当前默认公网路由继续部署吗？[Y/N]: ' warp_confirm || warp_confirm='N'
+            is_yes "$warp_confirm" || { msg "${RED}[FAIL] 未确认使用 wg/warp/tun 默认出口。${NC}"; fail=$((fail+1)); }
+        else
+            msg "${RED}[FAIL] 非交互部署检测到 wg/warp/tun 默认出口；必须显式在交互环境确认后再部署。${NC}"
+            fail=$((fail+1))
+        fi
+    fi
+    if systemd_available; then
+        msg "${GREEN}[PASS] init: systemd${NC}"
+    elif command -v rc-service >/dev/null 2>&1; then
+        msg "${GREEN}[PASS] init: OpenRC${NC}"
+    else
+        msg "${RED}[FAIL] no supported init system detected${NC}"; fail=$((fail+1))
+    fi
+    case "$(uname -m)" in x86_64|amd64|aarch64|arm64) msg "${GREEN}[PASS] arch: $(uname -m)${NC}" ;; *) msg "${RED}[FAIL] unsupported arch: $(uname -m)${NC}"; fail=$((fail+1)) ;; esac
+    for c in bash curl jq openssl unzip tar iptables ss lsof python3 getent flock qrencode fail2ban-client; do
+        command -v "$c" >/dev/null 2>&1 || { msg "${YELLOW}[WARN] command missing before dependency sync: $c${NC}"; warn=$((warn+1)); }
+    done
+    if curl -fsS --connect-timeout 3 -m 6 https://api.github.com >/dev/null 2>&1; then
+        msg "${GREEN}[PASS] GitHub API reachable${NC}"
+    else
+        msg "${YELLOW}[WARN] GitHub API unreachable now; official release metadata/digest cannot be verified and core installation may fail${NC}"; warn=$((warn+1))
+    fi
+    if (( fail > 0 )); then
+        die "Lightweight preflight found blocking failures."
+    fi
+    msg "${GREEN}[*] Lightweight preflight completed. WARN=${warn}${NC}"
+    unset -f pf_pass pf_warn pf_fail 2>/dev/null || true
+}
+
+preflight_check() {
+    local report_dir report fail=0 warn=0 port proto holder now interactive=1
+    [[ "${1:-}" == '--no-pause' ]] && interactive=0
+    report_dir=$(umask 077; mktemp -d /tmp/A-Box-preflight.XXXXXX) || die 'Preflight report directory creation failed.'
+    chmod 700 "$report_dir" || { rm -rf -- "$report_dir"; die 'Preflight report directory permission setup failed.'; }
+    report="$report_dir/A-Box-preflight-$(date +%Y%m%d-%H%M%S).txt"
+
+    pf_pass() { printf '[PASS] %s\n' "$*" | tee -a "$report"; }
+    pf_warn() { warn=$((warn+1)); printf '[WARN] %s\n' "$*" | tee -a "$report"; }
+    pf_fail() { fail=$((fail+1)); printf '[FAIL] %s\n' "$*" | tee -a "$report"; }
+
+    : > "$report"
+    echo "A-Box preflight check: $(now_iso)" | tee -a "$report"
+    echo "----------------------------------------------------------------------" | tee -a "$report"
+
+    [[ $EUID -eq 0 ]] && pf_pass 'root privilege available' || pf_fail 'not running as root'
+    [[ -t 0 ]] && pf_pass 'interactive TTY available' || pf_warn 'no interactive TTY on stdin'
+    if [[ -r /etc/os-release ]]; then
+        . /etc/os-release
+        case "${ID:-}" in debian|ubuntu|centos|rhel|rocky|almalinux|alpine) pf_pass "supported OS detected: ${ID:-unknown}" ;; *) pf_warn "OS may be unsupported: ${ID:-unknown}" ;; esac
+    else
+        pf_warn '/etc/os-release not readable'
+    fi
+    if systemd_available; then
+        INIT_SYS='systemd'
+        pf_pass 'systemd detected'
+    elif command -v rc-service >/dev/null 2>&1; then
+        INIT_SYS='openrc'
+        pf_pass 'OpenRC detected'
+    else
+        pf_fail 'no supported init system detected'
+    fi
+    case "$(uname -m)" in x86_64|amd64|aarch64|arm64) pf_pass "supported CPU architecture: $(uname -m)" ;; *) pf_fail "unsupported CPU architecture: $(uname -m)" ;; esac
+
+    for c in bash curl jq openssl bc unzip tar iptables ss lsof vnstat python3 getent flock qrencode fail2ban-client; do
+        command -v "$c" >/dev/null 2>&1 && pf_pass "command available: $c" || pf_warn "command missing before dependency sync: $c"
+    done
+
+    if curl -fsS --connect-timeout 5 -m 10 https://api.github.com >/dev/null 2>&1; then
+        pf_pass 'GitHub API reachable'
+    else
+        pf_warn 'GitHub API unreachable from this host now; official release metadata/digest cannot be verified and core installation may fail'
+    fi
+
+    local preflight_pairs='' env_present=0
+    if [[ -e "$ABOX_ENV" || -L "$ABOX_ENV" ]]; then
+        env_present=1
+        if ! load_abox_env "$ABOX_ENV" >/dev/null 2>&1; then
+            pf_fail "A-Box environment state exists but failed trust/parse validation: $ABOX_ENV"
+        elif ! validate_abox_env_semantics >/dev/null 2>&1; then
+            pf_fail "A-Box environment state failed semantic validation: $ABOX_ENV"
+        else
+            preflight_pairs=$(selected_port_pairs | awk 'NF' | sort -u) || preflight_pairs=''
+        fi
+    fi
+    if (( env_present == 0 )); then
+        preflight_pairs=$'tcp/443\ntcp/8443\ntcp/2053\nudp/2053'
+    fi
+    if ! command -v ss >/dev/null 2>&1; then
+        pf_warn 'ss is unavailable; port occupancy audit skipped'
+    else
+        local -a preflight_pairs_arr=()
+        if [[ -n "$preflight_pairs" ]]; then
+            mapfile -t preflight_pairs_arr <<< "$preflight_pairs"
+        fi
+        for pair in "${preflight_pairs_arr[@]}"; do
+            [[ "$pair" =~ ^(tcp|udp)/([0-9]+)$ ]] || continue
+            proto=${BASH_REMATCH[1]}
+            port=${BASH_REMATCH[2]}
+            local preflight_ss_output
+            if ! preflight_ss_output=$(ss -H -n -l -p -A "$proto" 2>/dev/null); then
+                pf_warn "ss failed for ${proto}; port occupancy audit skipped for ${proto}"
+                continue
+            fi
+            local holder managed_owner
+            holder=$(grep -E "[:.]${port}([[:space:]]|$)" <<< "$preflight_ss_output" || true)
+            if [[ -n "$holder" ]]; then
+                managed_owner=$(managed_socket_owner_for_port "$proto" "$port" 2>/dev/null || true)
+                if [[ -n "$managed_owner" ]]; then
+                    pf_pass "${port}/${proto} occupied by managed A-Box service: ${managed_owner}"
+                else
+                    pf_warn "${port}/${proto} occupied by foreign or unresolved process: $(head -n 1 <<< "$holder")"
+                fi
+            else
+                pf_pass "${port}/${proto} available"
+            fi
+        done
+    fi
+
+    managed_services_active
+    case $? in
+        0) pf_warn 'existing A-Box managed service is active' ;;
+        1) pf_pass 'no active A-Box managed service detected' ;;
+        2) pf_warn 'A-Box managed service state could not be determined safely' ;;
+        *) pf_fail 'A-Box managed service state query failed unexpectedly' ;;
+    esac
+    if [[ -L "$ABOX_DIR" ]]; then
+        pf_fail "A-Box directory is a symbolic link: $ABOX_DIR"
+    elif [[ -e "$ABOX_DIR" && ! -d "$ABOX_DIR" ]]; then
+        pf_fail "A-Box path is not a directory: $ABOX_DIR"
+    elif [[ -d "$ABOX_DIR" ]]; then
+        path_owned_by_root "$ABOX_DIR" && path_mode_has_no_group_other_write "$ABOX_DIR" && pf_pass "A-Box directory ownership/mode is safe: $ABOX_DIR" || pf_fail "A-Box directory is not root-owned and protected: $ABOX_DIR"
+    else
+        [[ -d "$(dirname "$ABOX_DIR")" && ! -L "$(dirname "$ABOX_DIR")" ]] && pf_pass "A-Box directory can be created after runtime ownership checks: $ABOX_DIR" || pf_fail "A-Box directory parent is unavailable or symlinked: $(dirname "$ABOX_DIR")"
+    fi
+
+    echo "----------------------------------------------------------------------" | tee -a "$report"
+    echo "Summary: FAIL=${fail} WARN=${warn}" | tee -a "$report"
+    echo "Report: temporary report generated for this run; cleaned after result." | tee -a "$report"
+    if (( fail > 0 )); then
+        msg "${RED}[!] Preflight completed with blocking failures.${NC}"
+    elif (( warn > 0 )); then
+        msg "${YELLOW}[*] Preflight completed with warnings.${NC}"
+    else
+        msg "${GREEN}[*] Preflight passed.${NC}"
+    fi
+    (( interactive == 1 )) && pause_return
+    local preflight_rc=$(( fail > 0 ? 1 : 0 ))
+    rm -rf -- "$report_dir" || return 1
+    return "$preflight_rc"
+}
+
+
+valid_network_mode() {
+    case "$1" in ipv4|dual|ipv6) return 0 ;; *) return 1 ;; esac
+}
+
+
+network_mode_label() {
+    case "$1" in
+        ipv4) printf '%s\n' 'IPv4-only' ;;
+        dual) printf '%s\n' 'IPv4 + IPv6 双栈' ;;
+        ipv6) printf '%s\n' 'IPv6-only' ;;
+        *) printf '%s\n' '未知' ;;
+    esac
+}
+
+
+network_global_ipv4_ok() {
+    ip -4 addr show scope global 2>/dev/null | awk '/inet / { found=1 } END { exit !found }'
+}
+
+
+network_global_ipv6_ok() {
+    has_ipv6
+}
+
+
+network_default_ipv4_ok() {
+    ip -4 route show default 2>/dev/null | awk '/^default/ { found=1 } END { exit !found }'
+}
+
+
+network_default_ipv6_ok() {
+    ip -6 route show default 2>/dev/null | awk '/^default/ { found=1 } END { exit !found }'
+}
+
+
+network_curl_family_ok() {
+    case "$1" in
+        4) curl -4 -fsS --proto '=https' --proto-redir '=https' --max-redirs 0 --connect-timeout 4 --max-time 8 https://api.github.com/zen >/dev/null 2>&1 ;;
+        6) curl -6 -fsS --proto '=https' --proto-redir '=https' --max-redirs 0 --connect-timeout 4 --max-time 8 https://api.github.com/zen >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+
+network_ssh_family() {
+    local remote=''
+    if [[ -n "$SSH_CONNECTION" ]]; then
+        remote=$(printf '%s\n' "$SSH_CONNECTION" | awk '{print $1}')
+        [[ "$remote" == *:* ]] && printf 'ipv6\n' || printf 'ipv4\n'
+    else
+        printf 'none\n'
+    fi
+}
+
+
+network_ipv4_block_chain_exists() {
+    command -v iptables >/dev/null 2>&1 || return 1
+    iptables -w -S "$ABOX_NETWORK_IPV4_CHAIN" >/dev/null 2>&1
+}
+
+
+network_ipv4_block_rule_is_ours() {
+    network_ipv4_block_chain_exists || return 1
+    iptables -w -S "$ABOX_NETWORK_IPV4_CHAIN" 2>/dev/null | grep -Fq -- '-A A-Box-NETWORK -m comment --comment A-Box-IPv4-LOCK -j DROP'
+}
+
+
+network_remove_ipv4_block() {
+    local chain="$ABOX_NETWORK_IPV4_CHAIN" parent
+    command -v iptables >/dev/null 2>&1 || return 0
+    if network_ipv4_block_chain_exists; then
+        network_ipv4_block_rule_is_ours || return 1
+    fi
+    for parent in INPUT OUTPUT FORWARD; do
+        while iptables -w -C "$parent" -j "$chain" >/dev/null 2>&1; do
+            iptables -w -D "$parent" -j "$chain" >/dev/null 2>&1 || return 1
+        done
+    done
+    while iptables -w -C INPUT -i lo -m comment --comment A-Box-NETWORK-LO -j ACCEPT >/dev/null 2>&1; do
+        iptables -w -D INPUT -i lo -m comment --comment A-Box-NETWORK-LO -j ACCEPT >/dev/null 2>&1 || return 1
+    done
+    while iptables -w -C OUTPUT -o lo -m comment --comment A-Box-NETWORK-LO -j ACCEPT >/dev/null 2>&1; do
+        iptables -w -D OUTPUT -o lo -m comment --comment A-Box-NETWORK-LO -j ACCEPT >/dev/null 2>&1 || return 1
+    done
+    if network_ipv4_block_chain_exists; then
+        network_ipv4_block_rule_is_ours || return 1
+        iptables -w -F "$chain" >/dev/null 2>&1 || return 1
+        iptables -w -X "$chain" >/dev/null 2>&1 || return 1
+    fi
+}
+
+
+network_apply_ipv4_block() {
+    local chain="$ABOX_NETWORK_IPV4_CHAIN" parent position
+    command -v iptables >/dev/null 2>&1 || return 1
+    [[ "$(firewall_backend 2>/dev/null || printf 'iptables')" == iptables ]] || return 1
+    if network_ipv4_block_chain_exists; then
+        network_ipv4_block_rule_is_ours || return 1
+        iptables -w -F "$chain" >/dev/null 2>&1 || return 1
+    else
+        iptables -w -N "$chain" >/dev/null 2>&1 || return 1
+    fi
+    iptables -w -F "$chain" >/dev/null 2>&1 || return 1
+    iptables -w -A "$chain" -m comment --comment A-Box-IPv4-LOCK -j DROP >/dev/null 2>&1 || return 1
+    iptables -w -C INPUT -i lo -m comment --comment A-Box-NETWORK-LO -j ACCEPT >/dev/null 2>&1 || \
+        iptables -w -I INPUT 1 -i lo -m comment --comment A-Box-NETWORK-LO -j ACCEPT >/dev/null 2>&1 || return 1
+    iptables -w -C OUTPUT -o lo -m comment --comment A-Box-NETWORK-LO -j ACCEPT >/dev/null 2>&1 || \
+        iptables -w -I OUTPUT 1 -o lo -m comment --comment A-Box-NETWORK-LO -j ACCEPT >/dev/null 2>&1 || return 1
+    for parent in INPUT OUTPUT FORWARD; do
+        position=1
+        [[ "$parent" == INPUT || "$parent" == OUTPUT ]] && position=2
+        iptables -w -C "$parent" -j "$chain" >/dev/null 2>&1 || \
+            iptables -w -I "$parent" "$position" -j "$chain" >/dev/null 2>&1 || return 1
+    done
+}
+
+
+network_try_reconfigure_interface() {
+    local iface
+    iface=$(get_active_interface 2>/dev/null || true)
+    [[ -n "$iface" ]] || return 0
+    if command -v networkctl >/dev/null 2>&1; then
+        networkctl reconfigure "$iface" >/dev/null 2>&1 || true
+    fi
+    if command -v nmcli >/dev/null 2>&1; then
+        nmcli device reapply "$iface" >/dev/null 2>&1 || true
+    fi
+}
+
+
+network_current_mode() {
+    local v4=0 v6=0 dis6=0 bind6=0 blocked=0
+    network_global_ipv4_ok && v4=1 || true
+    network_global_ipv6_ok && v6=1 || true
+    dis6=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || printf 'unknown')
+    bind6=$(sysctl -n net.ipv6.bindv6only 2>/dev/null || printf 'unknown')
+    [[ "$dis6" =~ ^[01]$ && "$bind6" =~ ^[01]$ ]] || { printf 'mixed\n'; return 0; }
+    network_ipv4_block_rule_is_ours && blocked=1 || true
+    if [[ "$dis6" == 1 && "$v4" == 1 ]]; then
+        printf 'ipv4\n'
+    elif [[ "$blocked" == 1 && "$v6" == 1 ]]; then
+        printf 'ipv6\n'
+    elif [[ "$dis6" == 0 && "$bind6" == 0 && "$v4" == 1 && "$v6" == 1 ]]; then
+        printf 'dual\n'
+    else
+        printf 'mixed\n'
+    fi
+}
+
+
+network_precheck_target() {
+    case "$1" in
+        ipv4) network_global_ipv4_ok && network_default_ipv4_ok && network_curl_family_ok 4 ;;
+        dual) network_global_ipv4_ok && network_default_ipv4_ok && network_curl_family_ok 4 && network_global_ipv6_ok && network_default_ipv6_ok && network_curl_family_ok 6 ;;
+        ipv6) network_global_ipv6_ok && network_default_ipv6_ok && network_curl_family_ok 6 ;;
+        *) return 1 ;;
+    esac
+}
+
+
+network_precheck_transition() {
+    local current="$1" target="$2"
+    case "$current:$target" in
+        ipv4:dual|ipv4:ipv6) network_global_ipv4_ok && network_default_ipv4_ok && network_curl_family_ok 4 ;;
+        ipv6:dual|ipv6:ipv4) network_global_ipv6_ok && network_default_ipv6_ok && network_curl_family_ok 6 ;;
+        *) network_precheck_target "$target" ;;
+    esac
+}
+
+network_write_sysctl() {
+    local target="$1" content=''
+    case "$target" in
+        ipv4) content=$'# Managed by A-Box\nnet.ipv6.conf.all.disable_ipv6=1\nnet.ipv6.conf.default.disable_ipv6=1\nnet.ipv6.bindv6only=0\n# Managed by A-Box Network Manager\n' ;;
+        dual) content=$'# Managed by A-Box\nnet.ipv6.conf.all.disable_ipv6=0\nnet.ipv6.conf.default.disable_ipv6=0\nnet.ipv6.bindv6only=0\n# Managed by A-Box Network Manager\n' ;;
+        ipv6) content=$'# Managed by A-Box\nnet.ipv6.conf.all.disable_ipv6=0\nnet.ipv6.conf.default.disable_ipv6=0\nnet.ipv6.bindv6only=1\n# Managed by A-Box Network Manager\n' ;;
+        *) return 1 ;;
+    esac
+    ensure_abox_dir_owned "$ABOX_DIR" || return 1
+    path_parent_chain_safe "$ABOX_NETWORK_SYSCTL_FILE" || return 1
+    if [[ -e "$ABOX_NETWORK_SYSCTL_FILE" || -L "$ABOX_NETWORK_SYSCTL_FILE" ]]; then
+        [[ -f "$ABOX_NETWORK_SYSCTL_FILE" && ! -L "$ABOX_NETWORK_SYSCTL_FILE" ]] || return 1
+        grep -Fq '# Managed by A-Box Network Manager' "$ABOX_NETWORK_SYSCTL_FILE" || return 1
+    fi
+    write_file_atomically_from_stdin "$ABOX_NETWORK_SYSCTL_FILE" 600 <<< "$content"
+}
+
+
+
+network_validate_managed_services() {
+    managed_services_active
+    case $? in
+        0|1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+network_sync_core_listeners() {
+    local target="$1" work="$2" desired cfg tmp
+    case "$target" in ipv4) desired='0.0.0.0' ;; dual|ipv6) desired='::' ;; *) return 1 ;; esac
+    [[ -d "$work" && ! -L "$work" ]] || return 1
+
+    if abox_owns_service xray && [[ -f /usr/local/etc/xray/config.json && ! -L /usr/local/etc/xray/config.json ]]; then
+        cfg=/usr/local/etc/xray/config.json
+        cp -a -- "$cfg" "$work/xray-config.json" || return 1
+        tmp=$(mktemp "/usr/local/etc/xray/.A-Box-network-xray.XXXXXX") || return 1
+        jq --arg addr "$desired" '
+            if (.inbounds|type)=="array" then
+              .inbounds |= map(if has("listen") then .listen=$addr else . end)
+            else . end
+        ' "$cfg" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+        chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+        [[ $EUID -eq 0 ]] && chown root:root "$tmp" || true
+        XRAY_LOCATION_ASSET=/usr/local/share/xray /usr/local/bin/xray run -test -config "$tmp" >/dev/null 2>&1 || { rm -f -- "$tmp"; return 1; }
+        mv -f -- "$tmp" "$cfg" || { rm -f -- "$tmp"; return 1; }
+    fi
+
+    if abox_owns_service sing-box && [[ -f /etc/sing-box/config.json && ! -L /etc/sing-box/config.json ]]; then
+        cfg=/etc/sing-box/config.json
+        cp -a -- "$cfg" "$work/singbox-config.json" || return 1
+        tmp=$(mktemp "/etc/sing-box/.A-Box-network-singbox.XXXXXX") || return 1
+        jq --arg addr "$desired" '
+            if (.inbounds|type)=="array" then
+              .inbounds |= map(if has("listen") then .listen=$addr else . end)
+            else . end
+        ' "$cfg" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+        chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+        [[ $EUID -eq 0 ]] && chown root:root "$tmp" || true
+        /usr/local/bin/sing-box check -c "$tmp" >/dev/null 2>&1 || { rm -f -- "$tmp"; return 1; }
+        mv -f -- "$tmp" "$cfg" || { rm -f -- "$tmp"; return 1; }
+    fi
+}
+
+
+network_restore_core_listeners() {
+    local work="$1"
+    if [[ -f "$work/xray-config.json" && -f /usr/local/etc/xray/config.json ]]; then
+        cp -a -- "$work/xray-config.json" /usr/local/etc/xray/config.json || return 1
+        chmod 600 /usr/local/etc/xray/config.json 2>/dev/null || true
+    fi
+    if [[ -f "$work/singbox-config.json" && -f /etc/sing-box/config.json ]]; then
+        cp -a -- "$work/singbox-config.json" /etc/sing-box/config.json || return 1
+        chmod 600 /etc/sing-box/config.json 2>/dev/null || true
+    fi
+}
+
+
+network_restart_snapshot() {
+    local snapshot="$1" srv
+    for srv in $snapshot; do
+        restart_service_soft "$srv" || return 1
+    done
+}
+
+
+network_restore_runtime() {
+    local old_dis6="$1" old_dis6_default="$2" old_bind6="$3" old_block="$4" old_sysctl_present="$5" work="$6" active="$7" rc=0
+    network_restore_core_listeners "$work" || rc=1
+    if [[ "$old_block" == 1 ]]; then network_apply_ipv4_block || rc=1; else network_remove_ipv4_block || rc=1; fi
+    [[ "$old_dis6" =~ ^[01]$ ]] && sysctl -w "net.ipv6.conf.all.disable_ipv6=$old_dis6" >/dev/null 2>&1 || rc=1
+    [[ "$old_dis6_default" =~ ^[01]$ ]] && sysctl -w "net.ipv6.conf.default.disable_ipv6=$old_dis6_default" >/dev/null 2>&1 || rc=1
+    [[ "$old_bind6" =~ ^[01]$ ]] && sysctl -w "net.ipv6.bindv6only=$old_bind6" >/dev/null 2>&1 || rc=1
+    network_try_reconfigure_interface || true
+    network_restart_snapshot "$active" || rc=1
+    if [[ "$old_sysctl_present" == 1 ]]; then
+        if [[ -f "$work/network-sysctl.conf" ]]; then install -m 600 "$work/network-sysctl.conf" "$ABOX_NETWORK_SYSCTL_FILE" || rc=1; fi
+    else
+        if [[ -e "$ABOX_NETWORK_SYSCTL_FILE" || -L "$ABOX_NETWORK_SYSCTL_FILE" ]]; then
+            [[ ! -L "$ABOX_NETWORK_SYSCTL_FILE" ]] && rm -f -- "$ABOX_NETWORK_SYSCTL_FILE" || rc=1
+        fi
+    fi
+    return "$rc"
+}\t' read -r need_sb need_hy < <(python3 - "$archive" <<'PY_BACKUP_RUNTIME_SCAN'
+import posixpath,sys,tarfile
+fn=sys.argv[1]; sb=hy=0
+SB='root/etc/sing-box'; HY='root/etc/hysteria'
+try:
+    with tarfile.open(fn,'r:gz') as tf:
+        for m in tf.getmembers():
+            raw=m.name
+            if '\x00' in raw or raw.startswith('/'): raise SystemExit(1)
+            while raw.startswith('./'): raw=raw[2:]
+            n=posixpath.normpath(raw)
+            if n in ('','.') : continue
+            if n=='..' or n.startswith('../') or n.split('/',1)[0] not in ('root','meta'): raise SystemExit(1)
+            if (n == SB or n.startswith(SB + '/')) and (m.uid != 0 or m.gid != 0): sb=1
+            if (n == HY or n.startswith(HY + '/')) and (m.uid != 0 or m.gid != 0): hy=1
+    print(f'{sb}\t{hy}')
+except Exception:
+    raise SystemExit(1)
+PY_BACKUP_RUNTIME_SCAN
+    ) || return 1
+    [[ "$need_sb" =~ ^[01]$ && "$need_hy" =~ ^[01]$ ]] || return 1
+    if (( need_sb == 1 )); then ensure_abox_runtime_identity sing-box || return 1; fi
+    if (( need_hy == 1 )); then ensure_abox_runtime_identity hysteria || return 1; fi
+}
 
 validate_backup_archive() {
     local archive="$1"
