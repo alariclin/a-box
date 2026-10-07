@@ -12933,12 +12933,9 @@ PY_LEGACY_EXTRACT
 
 validate_backup_archive() {
     local archive="$1"
-    local sb_runtime_uid=0 sb_runtime_gid=0 hy_runtime_uid=0 hy_runtime_gid=0
+    local sb_runtime_gid=0 hy_runtime_uid=0 hy_runtime_gid=0
     [[ -s "$archive" ]] || return 1
     command -v python3 >/dev/null 2>&1 || return 1
-    if getent passwd "$ABOX_RUNTIME_SINGBOX_USER" >/dev/null 2>&1; then
-        sb_runtime_uid=$(id -u "$ABOX_RUNTIME_SINGBOX_USER" 2>/dev/null || printf '0')
-    fi
     if getent group "$ABOX_RUNTIME_SINGBOX_GROUP" >/dev/null 2>&1; then
         sb_runtime_gid=$(getent group "$ABOX_RUNTIME_SINGBOX_GROUP" 2>/dev/null | awk -F: '{print $3}')
     fi
@@ -12948,12 +12945,12 @@ validate_backup_archive() {
     if getent group "$ABOX_RUNTIME_HYSTERIA_GROUP" >/dev/null 2>&1; then
         hy_runtime_gid=$(getent group "$ABOX_RUNTIME_HYSTERIA_GROUP" 2>/dev/null | awk -F: '{print $3}')
     fi
-    [[ "$sb_runtime_uid" =~ ^[0-9]+$ && "$sb_runtime_gid" =~ ^[0-9]+$ && "$hy_runtime_uid" =~ ^[0-9]+$ && "$hy_runtime_gid" =~ ^[0-9]+$ ]] || return 1
-    python3 - "$archive" "$sb_runtime_uid" "$sb_runtime_gid" "$hy_runtime_uid" "$hy_runtime_gid" <<'PY_VALIDATE'
+    [[ "$sb_runtime_gid" =~ ^[0-9]+$ && "$hy_runtime_uid" =~ ^[0-9]+$ && "$hy_runtime_gid" =~ ^[0-9]+$ ]] || return 1
+    python3 - "$archive" "$sb_runtime_gid" "$hy_runtime_uid" "$hy_runtime_gid" <<'PY_VALIDATE'
 import posixpath,stat,sys,tarfile
 fn=sys.argv[1]
-sb_runtime_uid=int(sys.argv[2]); sb_runtime_gid=int(sys.argv[3])
-hy_runtime_uid=int(sys.argv[4]); hy_runtime_gid=int(sys.argv[5])
+sb_runtime_gid=int(sys.argv[2])
+hy_runtime_uid=int(sys.argv[3]); hy_runtime_gid=int(sys.argv[4])
 MAX_MEMBERS=10000
 MAX_FILE=512*1024*1024
 MAX_TOTAL=1024*1024*1024
@@ -12997,7 +12994,7 @@ for m in members:
     elif in_hy_acme:
         # Hysteria ACME state is runtime-owned to allow non-root renewal. Only
         # this subtree may contain runtime-owned members.
-        if hy_runtime_uid == 0 or hy_runtime_gid == 0: raise SystemExit(1)
+        if (m.uid != 0 or m.gid != 0) and (hy_runtime_uid == 0 or hy_runtime_gid == 0): raise SystemExit(1)
         if m.uid not in (0, hy_runtime_uid) or m.gid not in (0, hy_runtime_gid): raise SystemExit(1)
         if n == HY_ACME:
             if not m.isdir(): raise SystemExit(1)
