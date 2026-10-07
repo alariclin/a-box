@@ -11900,9 +11900,18 @@ run_builtin_sni_radar() {
     if [[ ! -s "$report" ]]; then
         cp -f "$raw_sorted" "$report"
     fi
-    mkdir -p "$ABOX_DIR" 2>/dev/null || die 'SNI record directory creation failed; refusing to report a false Saved state.'
-    local saved_report="$ABOX_DIR/A-Box-sni-${profile}.tsv"
-    cp -f "$report" "$saved_report" 2>/dev/null || die 'SNI record persistence failed.'
+    ensure_abox_dir_owned "$ABOX_DIR" || die 'SNI record directory ownership validation failed.'
+    local saved_report="$ABOX_DIR/A-Box-sni-${profile}.tsv" saved_report_tmp
+    saved_report_tmp=$(mktemp "$ABOX_DIR/.A-Box-sni-report.XXXXXX") || die 'SNI record temporary file creation failed.'
+    if ! cp -f "$report" "$saved_report_tmp"; then
+        rm -f -- "$saved_report_tmp"
+        die 'SNI record persistence failed.'
+    fi
+    chmod 600 "$saved_report_tmp" || { rm -f -- "$saved_report_tmp"; die 'SNI record permission hardening failed.'; }
+    if [[ $EUID -eq 0 ]]; then
+        chown root:root "$saved_report_tmp" || { rm -f -- "$saved_report_tmp"; die 'SNI record ownership hardening failed.'; }
+    fi
+    mv -f -- "$saved_report_tmp" "$saved_report" || { rm -f -- "$saved_report_tmp"; die 'SNI record atomic commit failed.'; }
     [[ -s "$saved_report" && ! -L "$saved_report" ]] || die 'SNI record persistence verification failed.'
     msg "${BLUE}----------------------------------------------------------------------${NC}"
     msg "${YELLOW}[ Top SNI Candidates / 优选 SNI 候选 ]${NC}"
