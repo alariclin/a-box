@@ -13,6 +13,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: CLI entrypoint smoke
+        run: |
+          bash install.sh --version
+          bash install.sh --help >/dev/null
+          grep -Fq 'main "$@"' install.sh
+          grep -Fq 'run_self_tests() {' install.sh
       - name: Bash syntax
         run: bash -n install.sh
       - name: Built-in self-test
