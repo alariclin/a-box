@@ -33,8 +33,8 @@ PUBLIC_IP_CACHE_TTL=600
 BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-10}
 LOCK_FALLBACK_DIR='/run/A-Box.lock.d'
 ABOX_LANG='zh'
-ABOX_BUILD='2026-10-07-network-toolbox-v139'
-ABOX_BUILD_EPOCH=20261007139
+ABOX_BUILD='2026-10-07-fullfix-v144'
+ABOX_BUILD_EPOCH=20261007144
 # Current Xray compatibility pin for iOS Shadowrocket + XHTTP/REALITY as of 2026-10-05.
 # This pin is a prerelease upstream build; newer prereleases remain opt-in via ABOX_XRAY_VERSION.
 ABOX_XRAY_DEFAULT_VERSION='v26.6.27'
@@ -11770,6 +11770,7 @@ sni_probe_domain() {
 sni_openssl_check() {
     local domain="$1" timeout_s="${2:-5}" out cert sanext rest alpn='none' tls13=0 san=0
     command -v openssl >/dev/null 2>&1 || { printf 'tls13=unknown\talpn=unknown\tsan=unknown'; return 0; }
+    sni_domain_public_dns "$domain" || { printf 'tls13=0\talpn=none\tsan=0'; return 0; }
     out=$(printf '' | timeout "$timeout_s" openssl s_client -connect "${domain}:443" -servername "$domain" -alpn 'h2,http/1.1' -tls1_3 -showcerts 2>/dev/null | tr -d '\000') || out=''
     if [[ -n "$out" ]]; then
         grep -qiE 'Protocol *: *TLSv1\.3|New, TLSv1\.3' <<< "$out" && tls13=1
@@ -12939,11 +12940,43 @@ PY_LEGACY_EXTRACT
 }
 
 
-validate_backup_archive() {
-    local archive="$1"
-    local sb_runtime_gid=0 hy_runtime_uid=0 hy_runtime_gid=0
+prepare_backup_runtime_identities() {
+    local archive="$1" need_sb=0 need_hy=0
     [[ -s "$archive" ]] || return 1
     command -v python3 >/dev/null 2>&1 || return 1
+    IFS=$'\t' read -r need_sb need_hy < <(python3 - "$archive" <<'PY_BACKUP_RUNTIME_SCAN'
+import posixpath,sys,tarfile
+fn=sys.argv[1]; sb=hy=0
+SB='root/etc/sing-box'; HY='root/etc/hysteria'
+try:
+    with tarfile.open(fn,'r:gz') as tf:
+        for m in tf.getmembers():
+            raw=m.name
+            if '\x00' in raw or raw.startswith('/'): raise SystemExit(1)
+            while raw.startswith('./'): raw=raw[2:]
+            n=posixpath.normpath(raw)
+            if n in ('','.') : continue
+            if n=='..' or n.startswith('../') or n.split('/',1)[0] not in ('root','meta'): raise SystemExit(1)
+            if (n == SB or n.startswith(SB + '/')) and (m.uid != 0 or m.gid != 0): sb=1
+            if (n == HY or n.startswith(HY + '/')) and (m.uid != 0 or m.gid != 0): hy=1
+    print(f'{sb}\t{hy}')
+except Exception:
+    raise SystemExit(1)
+PY_BACKUP_RUNTIME_SCAN
+    ) || return 1
+    [[ "$need_sb" =~ ^[01]$ && "$need_hy" =~ ^[01]$ ]] || return 1
+    if (( need_sb == 1 )); then ensure_abox_runtime_identity sing-box || return 1; fi
+    if (( need_hy == 1 )); then ensure_abox_runtime_identity hysteria || return 1; fi
+}
+
+validate_backup_archive() {
+    local archive="$1"
+    local sb_runtime_uid=0 sb_runtime_gid=0 hy_runtime_uid=0 hy_runtime_gid=0
+    [[ -s "$archive" ]] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    if getent passwd "$ABOX_RUNTIME_SINGBOX_USER" >/dev/null 2>&1; then
+        sb_runtime_uid=$(id -u "$ABOX_RUNTIME_SINGBOX_USER" 2>/dev/null || printf '0')
+    fi
     if getent group "$ABOX_RUNTIME_SINGBOX_GROUP" >/dev/null 2>&1; then
         sb_runtime_gid=$(getent group "$ABOX_RUNTIME_SINGBOX_GROUP" 2>/dev/null | awk -F: '{print $3}')
     fi
@@ -12953,12 +12986,12 @@ validate_backup_archive() {
     if getent group "$ABOX_RUNTIME_HYSTERIA_GROUP" >/dev/null 2>&1; then
         hy_runtime_gid=$(getent group "$ABOX_RUNTIME_HYSTERIA_GROUP" 2>/dev/null | awk -F: '{print $3}')
     fi
-    [[ "$sb_runtime_gid" =~ ^[0-9]+$ && "$hy_runtime_uid" =~ ^[0-9]+$ && "$hy_runtime_gid" =~ ^[0-9]+$ ]] || return 1
-    python3 - "$archive" "$sb_runtime_gid" "$hy_runtime_uid" "$hy_runtime_gid" <<'PY_VALIDATE'
+    [[ "$sb_runtime_uid" =~ ^[0-9]+$ && "$sb_runtime_gid" =~ ^[0-9]+$ && "$hy_runtime_uid" =~ ^[0-9]+$ && "$hy_runtime_gid" =~ ^[0-9]+$ ]] || return 1
+    python3 - "$archive" "$sb_runtime_uid" "$sb_runtime_gid" "$hy_runtime_uid" "$hy_runtime_gid" <<'PY_VALIDATE'
 import posixpath,stat,sys,tarfile
 fn=sys.argv[1]
-sb_runtime_gid=int(sys.argv[2])
-hy_runtime_uid=int(sys.argv[3]); hy_runtime_gid=int(sys.argv[4])
+sb_runtime_uid=int(sys.argv[2]); sb_runtime_gid=int(sys.argv[3])
+hy_runtime_uid=int(sys.argv[4]); hy_runtime_gid=int(sys.argv[5])
 MAX_MEMBERS=10000
 MAX_FILE=512*1024*1024
 MAX_TOTAL=1024*1024*1024
@@ -13002,7 +13035,7 @@ for m in members:
     elif in_hy_acme:
         # Hysteria ACME state is runtime-owned to allow non-root renewal. Only
         # this subtree may contain runtime-owned members.
-        if (m.uid != 0 or m.gid != 0) and (hy_runtime_uid == 0 or hy_runtime_gid == 0): raise SystemExit(1)
+        if hy_runtime_uid == 0 or hy_runtime_gid == 0: raise SystemExit(1)
         if m.uid not in (0, hy_runtime_uid) or m.gid not in (0, hy_runtime_gid): raise SystemExit(1)
         if n == HY_ACME:
             if not m.isdir(): raise SystemExit(1)
@@ -13537,6 +13570,7 @@ restore_latest_backup_silent() {
     fi
     [[ -n "$selected" ]] || return 1
     backup_checksum_verify "$selected" "${selected}.sha256" || return 1
+    prepare_backup_runtime_identities "$selected" || return 1
     if [[ -n "$key_file" ]]; then
         backup_auth_verify_with_key_file "$selected" "${selected}.hmac" "$key_file" || return 1
     else
@@ -13598,6 +13632,7 @@ restore_from_backup() {
     fi
     selected="${backups[$((10#$choice-1))]}"
     backup_checksum_verify "$selected" "${selected}.sha256" || die 'Backup SHA256 is missing or invalid.'
+    prepare_backup_runtime_identities "$selected" || die 'Backup runtime identity preparation failed.'
     prepare_backup_auth_for_manual_restore "$selected" || die 'Backup HMAC/recovery-key authentication failed or was not authorized.'
     validate_backup_archive "$selected" || die 'Backup archive structure/link validation failed.'
     work=$(mktemp -d /tmp/A-Box-restore.XXXXXX) || die 'Restore temp directory creation failed.'
@@ -13737,7 +13772,7 @@ export_diagnostic_bundle() {
         [[ -r "$f" ]] && tail -n 200 "$f" 2>/dev/null | redact_secrets_stream > "$work/logs/$(basename "$f").tail.txt" || true
     done
 
-    bundle="$diag_dir/A-Box-diagnostic-${ts}.tar.gz"
+    bundle=$(mktemp "$diag_dir/A-Box-diagnostic-${ts}.XXXXXX.tar.gz") || { rm -rf "$work"; die 'Diagnostic bundle filename allocation failed.'; }
     tar -C "$work" -czf "$bundle" . || { rm -rf "$work"; die 'Diagnostic bundle creation failed.'; }
     chmod 600 "$bundle" 2>/dev/null || { rm -rf "$work"; rm -f "$bundle"; die 'Diagnostic bundle permission hardening failed.'; }
     checksum="${bundle}.sha256"
@@ -16429,7 +16464,21 @@ EOF_SVC_TEST_RCUPDATE
         echo "SELF_TEST_FAILED=$failures"
         selftest_cleanup
         return 1
-    fi
+    fi    assert_ok valid_network_mode ipv4
+    assert_ok valid_network_mode dual
+    assert_ok valid_network_mode ipv6
+    assert_bad valid_network_mode mixed
+    _sni_body=$(awk '/^sni_probe_domain\(\) \{/{p=1} /^sni_openssl_check\(\) \{/{p=0} p{print}' "$0") || { echo 'FAIL: SNI probe body extraction'; failures=$((failures + 1)); }
+    grep -Fq 'sni_domain_public_dns "$domain" || return 0' <<< "$_sni_body" || { echo 'FAIL: SNI public-DNS guard missing'; failures=$((failures + 1)); }
+    _diag_body=$(awk '/^export_diagnostic_bundle\(\) \{/{p=1} /^default_route_uses_warp\(\) \{/{p=0} p{print}' "$0") || { echo 'FAIL: diagnostic body extraction'; failures=$((failures + 1)); }
+    grep -Fq 'mktemp "$diag_dir/A-Box-diagnostic-${ts}.XXXXXX.tar.gz"' <<< "$_diag_body" || { echo 'FAIL: diagnostic collision-safe filename missing'; failures=$((failures + 1)); }
+    declare -F prepare_abox_runtime_config_dir >/dev/null 2>&1 || { echo 'FAIL: runtime config-dir hardening missing'; failures=$((failures + 1)); }
+    declare -F prepare_backup_runtime_identities >/dev/null 2>&1 || { echo 'FAIL: backup runtime prerequisite helper missing'; failures=$((failures + 1)); }
+    declare -F network_menu >/dev/null 2>&1 || { echo 'FAIL: network menu missing'; failures=$((failures + 1)); }
+    declare -F abox_dns_menu >/dev/null 2>&1 || { echo 'FAIL: DNS menu missing'; failures=$((failures + 1)); }
+    declare -F abox_region_menu >/dev/null 2>&1 || { echo 'FAIL: region menu missing'; failures=$((failures + 1)); }
+    grep -Fq 'main "$@"' "$0" || { echo 'FAIL: main invocation missing'; failures=$((failures + 1)); }
+
     echo 'SELF_TEST_OK'
     selftest_cleanup
     return 0
@@ -24834,7 +24883,7 @@ abox_region_ntp() {
 
 abox_region_write_state() {
     local label="$1" tz="$2" loc="$3" ntp="$4" locked="$5"
-    [[ "$label" =~ ^[A-Za-z0-9._@+:/ -]{0,64}$ ]] || return 1
+    [[ "$label" =~ ^[-A-Za-z0-9._@+:/[:space:]]{0,64}$ ]] || return 1
     ensure_abox_dir_owned "$ABOX_DIR" || return 1
     write_file_atomically_from_stdin "$ABOX_REGION_STATE" 600 <<EOF_REGION
 region_label=$label
