@@ -13736,9 +13736,17 @@ export_diagnostic_bundle() {
     tar -C "$work" -czf "$bundle" . || { rm -rf "$work"; die 'Diagnostic bundle creation failed.'; }
     chmod 600 "$bundle" 2>/dev/null || { rm -rf "$work"; rm -f "$bundle"; die 'Diagnostic bundle permission hardening failed.'; }
     checksum="${bundle}.sha256"
-    sha256sum "$bundle" > "$checksum" 2>/dev/null || { rm -rf "$work"; rm -f "$bundle"; die 'Diagnostic bundle checksum generation failed.'; }
-    chmod 600 "$checksum" 2>/dev/null || { rm -rf "$work"; rm -f "$bundle" "$checksum"; die 'Diagnostic checksum permission hardening failed.'; }
-    [[ -s "$checksum" ]] || { rm -rf "$work"; rm -f "$bundle" "$checksum"; die 'Diagnostic checksum verification failed.'; }
+    checksum_tmp=$(mktemp "$diag_dir/.A-Box-diagnostic-checksum.XXXXXX") || { rm -rf "$work"; rm -f "$bundle"; die 'Diagnostic checksum temporary file creation failed.'; }
+    if ! sha256sum "$bundle" > "$checksum_tmp" 2>/dev/null; then
+        rm -rf "$work"; rm -f "$bundle" "$checksum_tmp"
+        die 'Diagnostic checksum generation failed.'
+    fi
+    chmod 600 "$checksum_tmp" 2>/dev/null || { rm -rf "$work"; rm -f "$bundle" "$checksum_tmp"; die 'Diagnostic checksum permission hardening failed.'; }
+    if [[ $EUID -eq 0 ]]; then
+        chown root:root "$checksum_tmp" 2>/dev/null || { rm -rf "$work"; rm -f "$bundle" "$checksum_tmp"; die 'Diagnostic checksum ownership hardening failed.'; }
+    fi
+    mv -f -- "$checksum_tmp" "$checksum" 2>/dev/null || { rm -rf "$work"; rm -f "$bundle" "$checksum_tmp"; die 'Diagnostic checksum atomic commit failed.'; }
+    [[ -s "$checksum" && ! -L "$checksum" ]] || { rm -rf "$work"; rm -f "$bundle" "$checksum"; die 'Diagnostic checksum verification failed.'; }
     rm -rf "$work"
     msg "${GREEN}[*] Diagnostic bundle:${NC}" $bundle
     msg "${GREEN}[*] SHA256:${NC}" $checksum
