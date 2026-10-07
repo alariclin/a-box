@@ -14110,7 +14110,7 @@ vps_benchmark_menu() {
         msg "${YELLOW}11. IPv4 / IPv6 network mode${NC}"
         msg "${YELLOW}12. DNS Manager${NC}"
         msg "${YELLOW}13. VPS region / timezone / Locale / NTP${NC}"
-        msg "${GREEN}0. Back${NC}
+        msg "${GREEN}0. Back${NC}"
     else
         msg "${YELLOW}1. 本机配置和下载测速${NC}"
         msg "${YELLOW}2. IP纯净度、流媒体解锁与回程测试${NC}"
