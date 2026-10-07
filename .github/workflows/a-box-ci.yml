@@ -24,13 +24,20 @@ jobs:
         run: bash -n install.sh
       - name: Built-in self-test
         run: bash install.sh --self-test
-      - name: Release metadata regression
+      - name: Build epoch exactness
         run: |
-          grep -Eq "^ABOX_BUILD='[^']+'$" install.sh
+          grep -Fq "ABOX_BUILD='2026-10-07-fullfix-v144'" install.sh
+          grep -Eq '^ABOX_BUILD_EPOCH=20261007144        run: |
+          grep -Eq "^ABOX_BUILD='2026-10-07-fullfix-v144']+'$" install.sh
           grep -Eq '^ABOX_BUILD_EPOCH=[0-9]+$' install.sh
           grep -Fq "ABOX_XRAY_DEFAULT_VERSION='v26.6.27'" install.sh
           grep -Fq "ABOX_XRAY_REALITY_MLKEM_MIN_VERSION='v26.9.8'" install.sh
           grep -Fq 'v2.13.0' install.sh
-          grep -Fq "ABOX_BUILD='2026-10-07-fullfix-v144'" install.sh
-          grep -Fq '^ABOX_BUILD_EPOCH=20261007144
  install.sh
+      - name: Release metadata regression
+        run: |
+          grep -Eq "^ABOX_BUILD='2026-10-07-fullfix-v144']+'$" install.sh
+          grep -Eq '^ABOX_BUILD_EPOCH=[0-9]+$' install.sh
+          grep -Fq "ABOX_XRAY_DEFAULT_VERSION='v26.6.27'" install.sh
+          grep -Fq "ABOX_XRAY_REALITY_MLKEM_MIN_VERSION='v26.9.8'" install.sh
+          grep -Fq 'v2.13.0' install.sh
