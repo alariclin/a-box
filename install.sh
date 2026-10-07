@@ -33,8 +33,8 @@ PUBLIC_IP_CACHE_TTL=600
 BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-10}
 LOCK_FALLBACK_DIR='/run/A-Box.lock.d'
 ABOX_LANG='zh'
-ABOX_BUILD='2026-10-07-audit-v138'
-ABOX_BUILD_EPOCH=20261007138
+ABOX_BUILD='2026-10-07-fullfix-v141'
+ABOX_BUILD_EPOCH=20261007141
 # Current Xray compatibility pin for iOS Shadowrocket + XHTTP/REALITY as of 2026-10-05.
 # This pin is a prerelease upstream build; newer prereleases remain opt-in via ABOX_XRAY_VERSION.
 ABOX_XRAY_DEFAULT_VERSION='v26.6.27'
@@ -47,6 +47,14 @@ ABOX_RUNTIME_HYSTERIA_USER='abox-hysteria'
 ABOX_RUNTIME_HYSTERIA_GROUP='abox-hysteria'
 ABOX_DESIRED_STATE='/etc/ddr/.desired_state'
 ABOX_TRAFFIC_BLOCK_STATE='/etc/ddr/.traffic-block-state'
+ABOX_NETWORK_MODE_STATE='/etc/ddr/.network-mode'
+ABOX_NETWORK_SYSCTL_FILE='/etc/sysctl.d/99-A-Box-network-mode.conf'
+ABOX_NETWORK_IPV4_CHAIN='A-Box-NETWORK'
+ABOX_DNS_STATE='/etc/ddr/.dns-state'
+ABOX_DNS_RESOLVED_DROPIN='/etc/systemd/resolved.conf.d/99-A-Box-DNS.conf'
+ABOX_DNS_RESOLVED_BACKUP='/etc/ddr/.resolved-A-Box-previous.conf'
+ABOX_DNS_RESCONF_BACKUP='/etc/ddr/.resolv.conf.A-Box-backup'
+ABOX_REGION_STATE='/etc/ddr/.region-state'
 HY2_ACME_OWNER_MARKER='/etc/hysteria/acme/.A-Box-managed'
 PUBLIC_IP_CONNECT_TIMEOUT=${PUBLIC_IP_CONNECT_TIMEOUT:-3}
 PUBLIC_IP_MAX_TIME=${PUBLIC_IP_MAX_TIME:-6}
@@ -1930,6 +1938,8 @@ managed_auxiliary_paths() {
         /etc/sysctl.d/99-A-Box-tune.conf \
         /etc/security/limits.d/A-Box.conf \
         /etc/modules-load.d/A-Box-bbr.conf \
+        /etc/sysctl.d/99-A-Box-network-mode.conf \
+        /etc/systemd/resolved.conf.d/99-A-Box-DNS.conf \
         /etc/systemd/system/A-Box-firewall.service \
         /etc/init.d/A-Box-firewall
 }
@@ -7025,11 +7035,45 @@ manage_ss_whitelist() {
     esac
 }
 
+dns_restore_previous() {
+    ensure_abox_dir_owned "$ABOX_DIR" || return 1
+    if [[ -e "$ABOX_DNS_RESOLVED_BACKUP" || -L "$ABOX_DNS_RESOLVED_BACKUP" ]]; then
+        [[ -f "$ABOX_DNS_RESOLVED_BACKUP" && ! -L "$ABOX_DNS_RESOLVED_BACKUP" ]] || return 1
+        path_owned_by_root "$ABOX_DNS_RESOLVED_BACKUP" || return 1
+        path_mode_has_no_group_other_write "$ABOX_DNS_RESOLVED_BACKUP" || return 1
+        path_parent_chain_safe "$ABOX_DNS_RESOLVED_DROPIN" || return 1
+        install_file_atomically "$ABOX_DNS_RESOLVED_BACKUP" "$ABOX_DNS_RESOLVED_DROPIN" 600 || return 1
+    elif [[ -e "$ABOX_DNS_RESOLVED_DROPIN" || -L "$ABOX_DNS_RESOLVED_DROPIN" ]]; then
+        [[ -f "$ABOX_DNS_RESOLVED_DROPIN" && ! -L "$ABOX_DNS_RESOLVED_DROPIN" ]] || return 1
+        grep -Fq '# Managed by A-Box DNS Manager' "$ABOX_DNS_RESOLVED_DROPIN" 2>/dev/null || return 1
+        rm -f -- "$ABOX_DNS_RESOLVED_DROPIN" || return 1
+    fi
+    if [[ -e "$ABOX_DNS_RESCONF_BACKUP" || -L "$ABOX_DNS_RESCONF_BACKUP" ]]; then
+        [[ -f "$ABOX_DNS_RESCONF_BACKUP" && ! -L "$ABOX_DNS_RESCONF_BACKUP" ]] || return 1
+        path_owned_by_root "$ABOX_DNS_RESCONF_BACKUP" || return 1
+        path_tree_has_mountpoint /etc/resolv.conf && return 1
+        [[ -f /etc/resolv.conf && ! -L /etc/resolv.conf ]] || return 1
+        cp -a -- "$ABOX_DNS_RESCONF_BACKUP" /etc/resolv.conf || return 1
+    fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        systemctl restart systemd-resolved >/dev/null 2>&1 || return 1
+    fi
+    if [[ -e "$ABOX_DNS_STATE" || -L "$ABOX_DNS_STATE" ]]; then
+        [[ -f "$ABOX_DNS_STATE" && ! -L "$ABOX_DNS_STATE" ]] || return 1
+        path_owned_by_root "$ABOX_DNS_STATE" || return 1
+        rm -f -- "$ABOX_DNS_STATE" || return 1
+    fi
+    return 0
+}
+
 do_cleanup() {
     clear; msg "${RED}正在执行清理逻辑...${NC}"
     init_system_environment
     local uninstall_tx_dir='' uninstall_tx_key='' uninstall_tx_value=''
     if [[ "${1:-}" == full ]]; then
+        if [[ -e "$ABOX_DNS_STATE" || -e "$ABOX_DNS_RESCONF_BACKUP" || -e "$ABOX_DNS_RESOLVED_BACKUP" ]]; then dns_restore_previous || die '恢复 A-Box DNS 前状态失败；清理未完成。'; fi
+        network_remove_ipv4_block || die '删除 A-Box IPv4 isolation rule failed; cleanup aborted.'
+        remove_owned_auxiliary_path "$ABOX_NETWORK_SYSCTL_FILE" || die '删除 A-Box network sysctl file failed.'
         uninstall_tx_dir=$(mktemp -d /run/A-Box-uninstall-tx.XXXXXX) || die '无法创建完全卸载回滚事务目录。'
         chmod 700 "$uninstall_tx_dir" || { rm -rf -- "$uninstall_tx_dir"; die '完全卸载回滚事务目录权限设置失败。'; }
         ABOX_DEPLOY_TX_BACKUP_DIR="$uninstall_tx_dir"
@@ -7143,6 +7187,9 @@ check_virgin_state() {
     clean_input_rules || die '旧的 A-Box INPUT/原生防火墙规则无法完整删除。'
     save_firewall_rules || die 'A-Box 防火墙持久化失败。'
     remove_all_abox_cron_blocks || die '删除 A-Box cron 任务失败。'
+    if [[ -e "$ABOX_DNS_STATE" || -e "$ABOX_DNS_RESCONF_BACKUP" || -e "$ABOX_DNS_RESOLVED_BACKUP" ]]; then dns_restore_previous || die '环境重置时恢复 A-Box DNS 前状态失败。'; fi
+    network_remove_ipv4_block || die '环境重置时删除 A-Box IPv4 isolation rule failed.'
+    remove_owned_auxiliary_path "$ABOX_NETWORK_SYSCTL_FILE" || die '环境重置时删除 A-Box network sysctl file failed.'
     remove_all_owned_core_families || die '环境重置时删除 A-Box 托管核心文件失败。'
     remove_abox_env_file || die '环境重置时清理 A-Box .env 失败；检测到非托管或不安全状态文件。'
     for runtime_file in "$ABOX_DIR/traffic_monitor.sh" "$ABOX_DIR/geo_update.sh" "$ABOX_DIR/socket_probe.sh"; do
@@ -11762,6 +11809,7 @@ sni_probe_domain() {
 sni_openssl_check() {
     local domain="$1" timeout_s="${2:-5}" out cert sanext rest alpn='none' tls13=0 san=0
     command -v openssl >/dev/null 2>&1 || { printf 'tls13=unknown\talpn=unknown\tsan=unknown'; return 0; }
+    sni_domain_public_dns "$domain" || { printf 'tls13=0\talpn=none\tsan=0'; return 0; }
     out=$(printf '' | timeout "$timeout_s" openssl s_client -connect "${domain}:443" -servername "$domain" -alpn 'h2,http/1.1' -tls1_3 -showcerts 2>/dev/null | tr -d '\000') || out=''
     if [[ -n "$out" ]]; then
         grep -qiE 'Protocol *: *TLSv1\.3|New, TLSv1\.3' <<< "$out" && tls13=1
@@ -12931,6 +12979,35 @@ PY_LEGACY_EXTRACT
 }
 
 
+prepare_backup_runtime_identities() {
+    local archive="$1" need_sb=0 need_hy=0
+    [[ -s "$archive" ]] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    IFS=$'\t' read -r need_sb need_hy < <(python3 - "$archive" <<'PY_BACKUP_RUNTIME_SCAN'
+import posixpath,sys,tarfile
+fn=sys.argv[1]; sb=hy=0
+SB='root/etc/sing-box'; HY='root/etc/hysteria'
+try:
+    with tarfile.open(fn,'r:gz') as tf:
+        for m in tf.getmembers():
+            raw=m.name
+            if '\x00' in raw or raw.startswith('/'): raise SystemExit(1)
+            while raw.startswith('./'): raw=raw[2:]
+            n=posixpath.normpath(raw)
+            if n in ('','.') : continue
+            if n=='..' or n.startswith('../') or n.split('/',1)[0] not in ('root','meta'): raise SystemExit(1)
+            if (n == SB or n.startswith(SB + '/')) and (m.uid != 0 or m.gid != 0): sb=1
+            if (n == HY or n.startswith(HY + '/')) and (m.uid != 0 or m.gid != 0): hy=1
+    print(f'{sb}\t{hy}')
+except Exception:
+    raise SystemExit(1)
+PY_BACKUP_RUNTIME_SCAN
+    ) || return 1
+    [[ "$need_sb" =~ ^[01]$ && "$need_hy" =~ ^[01]$ ]] || return 1
+    if (( need_sb == 1 )); then ensure_abox_runtime_identity sing-box || return 1; fi
+    if (( need_hy == 1 )); then ensure_abox_runtime_identity hysteria || return 1; fi
+}
+
 validate_backup_archive() {
     local archive="$1"
     local sb_runtime_gid=0 hy_runtime_uid=0 hy_runtime_gid=0
@@ -13529,6 +13606,7 @@ restore_latest_backup_silent() {
     fi
     [[ -n "$selected" ]] || return 1
     backup_checksum_verify "$selected" "${selected}.sha256" || return 1
+    prepare_backup_runtime_identities "$selected" || return 1
     if [[ -n "$key_file" ]]; then
         backup_auth_verify_with_key_file "$selected" "${selected}.hmac" "$key_file" || return 1
     else
@@ -13590,6 +13668,7 @@ restore_from_backup() {
     fi
     selected="${backups[$((10#$choice-1))]}"
     backup_checksum_verify "$selected" "${selected}.sha256" || die 'Backup SHA256 is missing or invalid.'
+    prepare_backup_runtime_identities "$selected" || die 'Backup runtime identity preparation failed.'
     prepare_backup_auth_for_manual_restore "$selected" || die 'Backup HMAC/recovery-key authentication failed or was not authorized.'
     validate_backup_archive "$selected" || die 'Backup archive structure/link validation failed.'
     work=$(mktemp -d /tmp/A-Box-restore.XXXXXX) || die 'Restore temp directory creation failed.'
@@ -13729,7 +13808,7 @@ export_diagnostic_bundle() {
         [[ -r "$f" ]] && tail -n 200 "$f" 2>/dev/null | redact_secrets_stream > "$work/logs/$(basename "$f").tail.txt" || true
     done
 
-    bundle="$diag_dir/A-Box-diagnostic-${ts}.tar.gz"
+    bundle=$(mktemp "$diag_dir/A-Box-diagnostic-${ts}.XXXXXX.tar.gz") || { rm -rf "$work"; die 'Diagnostic bundle filename allocation failed.'; }
     tar -C "$work" -czf "$bundle" . || { rm -rf "$work"; die 'Diagnostic bundle creation failed.'; }
     chmod 600 "$bundle" 2>/dev/null || { rm -rf "$work"; rm -f "$bundle"; die 'Diagnostic bundle permission hardening failed.'; }
     checksum="${bundle}.sha256"
@@ -13943,6 +14022,9 @@ vps_benchmark_menu() {
         msg "${YELLOW}8. Export redacted diagnostic bundle${NC}"
         msg "${YELLOW}9. Full dry-run preflight check${NC}"
         msg "${YELLOW}10. SNI preference records${NC}"
+        msg "${YELLOW}11. IPv4 / IPv6 network mode${NC}"
+        msg "${YELLOW}12. DNS Manager${NC}"
+        msg "${YELLOW}13. VPS region / timezone / Locale / NTP${NC}"
         msg "${GREEN}0. Back${NC}"
     else
         msg "${YELLOW}1. 本机配置和下载测速${NC}"
@@ -13955,10 +14037,13 @@ vps_benchmark_menu() {
         msg "${YELLOW}8. 导出脱敏诊断包${NC}"
         msg "${YELLOW}9. 完整 Dry-run 预检查${NC}"
         msg "${YELLOW}10. SNI 优选记录${NC}"
+        msg "${YELLOW}11. IPv4 / IPv6 网络模式${NC}"
+        msg "${YELLOW}12. DNS 管理${NC}"
+        msg "${YELLOW}13. VPS 地区 / 时区 / Locale / NTP${NC}"
         msg "${GREEN}0. 返回主菜单${NC}"
     fi
     local bench_choice
-    read -r -p 'Select [0-10]: ' bench_choice
+    read -r -p 'Select [0-13]: ' bench_choice
     case "$bench_choice" in
         1)
             confirm_yes_no "$(tprintf confirm_remote 'System benchmark and download speed')" && run_remote_bash_script 'System benchmark and download speed' 'https://bench.sh'
@@ -13976,6 +14061,9 @@ vps_benchmark_menu() {
         8) export_diagnostic_bundle ;;
         9) preflight_check ;;
         10) show_sni_preference_records ;;
+        11) network_menu ;;
+        12) abox_dns_menu ;;
+        13) abox_region_menu ;;
         *) return 0 ;;
     esac
 }
@@ -14456,7 +14544,7 @@ show_usage() {
 
 [Operations]
 11 Toolbox
-   System benchmark/download speed; IP quality/streaming unlock/route test; built-in full SNI preference library; built-in mini-host SNI preference library; SNI preference record viewer; Cloudflare WARP manager; 2G Swap allocation; Backup/Restore; redacted diagnostic bundle export; full dry-run preflight check. Lightweight preflight runs automatically before protocol deployment; backups are offered or created before destructive maintenance/core upgrade actions.
+   System benchmark/download speed; IP quality/streaming unlock/route test; built-in full SNI preference library; built-in mini-host SNI preference library; SNI preference record viewer; IPv4/IPv6 network mode; DNS manager; VPS region/timezone/Locale/NTP; Cloudflare WARP manager; 2G Swap; Backup/Restore; redacted diagnostic bundle export; full dry-run preflight check. Lightweight preflight runs automatically before protocol deployment; backups are offered or created before destructive maintenance/core upgrade actions.
 12 VPS One-click Optimization
    BBR/FQ, file descriptor limits, KeepAlive injection, health probe, logrotate/fail2ban defense.
 13 Display Node Parameters
@@ -14502,7 +14590,7 @@ EOF_USAGE
 
 【运维类】
 11 综合工具箱
-   本机配置/下载测速；IP纯净度/流媒体解锁/回程测试；内置全量SNI优选库；内置微型主机SNI优选库；SNI 优选记录查看；Cloudflare WARP接管；2G Swap划拨；配置备份/恢复；脱敏诊断包导出；完整 Dry-run 预检查。
+   本机配置/下载测速；IP纯净度/流媒体解锁/回程测试；内置全量SNI优选库；内置微型主机SNI优选库；SNI 优选记录查看；IPv4/IPv6 网络模式；DNS 管理；VPS 地区/时区/Locale/NTP；Cloudflare WARP接管；2G Swap；配置备份/恢复；脱敏诊断包导出；完整 Dry-run 预检查。
 12 VPS 一键优化
    BBR/FQ、文件句柄、KeepAlive、健康探针、logrotate/fail2ban防御。
 13 全部节点参数显示
@@ -15262,6 +15350,842 @@ Usage:
 EOF_HELP
 }
 
+valid_network_mode() {
+    case "$1" in ipv4|dual|ipv6) return 0 ;; *) return 1 ;; esac
+}
+
+
+
+network_mode_label() {
+    case "$1" in
+        ipv4) printf '%s\n' 'IPv4-only' ;;
+        dual) printf '%s\n' 'IPv4 + IPv6 双栈' ;;
+        ipv6) printf '%s\n' 'IPv6-only' ;;
+        *) printf '%s\n' '未知' ;;
+    esac
+}
+
+
+
+network_global_ipv4_ok() {
+    ip -4 addr show scope global 2>/dev/null | awk '/inet / { found=1 } END { exit !found }'
+}
+
+
+
+network_global_ipv6_ok() {
+    has_ipv6
+}
+
+
+
+network_default_ipv4_ok() {
+    ip -4 route show default 2>/dev/null | awk '/^default/ { found=1 } END { exit !found }'
+}
+
+
+
+network_default_ipv6_ok() {
+    ip -6 route show default 2>/dev/null | awk '/^default/ { found=1 } END { exit !found }'
+}
+
+
+
+network_curl_family_ok() {
+    case "$1" in
+        4) curl -4 -fsS --proto '=https' --proto-redir '=https' --max-redirs 0 --connect-timeout 4 --max-time 8 https://api.github.com/zen >/dev/null 2>&1 ;;
+        6) curl -6 -fsS --proto '=https' --proto-redir '=https' --max-redirs 0 --connect-timeout 4 --max-time 8 https://api.github.com/zen >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+
+
+network_ssh_family() {
+    local remote=''
+    if [[ -n "$SSH_CONNECTION" ]]; then
+        remote=$(printf '%s\n' "$SSH_CONNECTION" | awk '{print $1}')
+        [[ "$remote" == *:* ]] && printf 'ipv6\n' || printf 'ipv4\n'
+    else
+        printf 'none\n'
+    fi
+}
+
+
+
+network_ipv4_block_chain_exists() {
+    command -v iptables >/dev/null 2>&1 || return 1
+    iptables -w -S "$ABOX_NETWORK_IPV4_CHAIN" >/dev/null 2>&1
+}
+
+
+
+network_ipv4_block_rule_is_ours() {
+    network_ipv4_block_chain_exists || return 1
+    iptables -w -S "$ABOX_NETWORK_IPV4_CHAIN" 2>/dev/null | grep -Fq -- '-A A-Box-NETWORK -m comment --comment A-Box-IPv4-LOCK -j DROP'
+}
+
+
+
+network_remove_ipv4_block() {
+    local chain="$ABOX_NETWORK_IPV4_CHAIN" parent
+    command -v iptables >/dev/null 2>&1 || return 0
+    for parent in INPUT OUTPUT FORWARD; do
+        while iptables -w -C "$parent" -j "$chain" >/dev/null 2>&1; do
+            iptables -w -D "$parent" -j "$chain" >/dev/null 2>&1 || return 1
+        done
+    done
+    while iptables -w -C INPUT -i lo -m comment --comment A-Box-NETWORK-LO -j ACCEPT >/dev/null 2>&1; do
+        iptables -w -D INPUT -i lo -m comment --comment A-Box-NETWORK-LO -j ACCEPT >/dev/null 2>&1 || return 1
+    done
+    while iptables -w -C OUTPUT -o lo -m comment --comment A-Box-NETWORK-LO -j ACCEPT >/dev/null 2>&1; do
+        iptables -w -D OUTPUT -o lo -m comment --comment A-Box-NETWORK-LO -j ACCEPT >/dev/null 2>&1 || return 1
+    done
+    if network_ipv4_block_chain_exists; then
+        network_ipv4_block_rule_is_ours || return 1
+        iptables -w -F "$chain" >/dev/null 2>&1 || return 1
+        iptables -w -X "$chain" >/dev/null 2>&1 || return 1
+    fi
+}
+
+
+
+network_apply_ipv4_block() {
+    local chain="$ABOX_NETWORK_IPV4_CHAIN" parent position
+    command -v iptables >/dev/null 2>&1 || return 1
+    [[ "$(firewall_backend 2>/dev/null || printf 'iptables')" == iptables ]] || return 1
+    if network_ipv4_block_chain_exists; then
+        network_ipv4_block_rule_is_ours || return 1
+        iptables -w -F "$chain" >/dev/null 2>&1 || return 1
+    else
+        iptables -w -N "$chain" >/dev/null 2>&1 || return 1
+    fi
+    iptables -w -F "$chain" >/dev/null 2>&1 || return 1
+    iptables -w -A "$chain" -m comment --comment A-Box-IPv4-LOCK -j DROP >/dev/null 2>&1 || return 1
+    iptables -w -C INPUT -i lo -m comment --comment A-Box-NETWORK-LO -j ACCEPT >/dev/null 2>&1 || \
+        iptables -w -I INPUT 1 -i lo -m comment --comment A-Box-NETWORK-LO -j ACCEPT >/dev/null 2>&1 || return 1
+    iptables -w -C OUTPUT -o lo -m comment --comment A-Box-NETWORK-LO -j ACCEPT >/dev/null 2>&1 || \
+        iptables -w -I OUTPUT 1 -o lo -m comment --comment A-Box-NETWORK-LO -j ACCEPT >/dev/null 2>&1 || return 1
+    for parent in INPUT OUTPUT FORWARD; do
+        position=1
+        [[ "$parent" == INPUT || "$parent" == OUTPUT ]] && position=2
+        iptables -w -C "$parent" -j "$chain" >/dev/null 2>&1 || \
+            iptables -w -I "$parent" "$position" -j "$chain" >/dev/null 2>&1 || return 1
+    done
+}
+
+
+
+network_try_reconfigure_interface() {
+    local iface
+    iface=$(get_active_interface 2>/dev/null || true)
+    [[ -n "$iface" ]] || return 0
+    if command -v networkctl >/dev/null 2>&1; then
+        networkctl reconfigure "$iface" >/dev/null 2>&1 || true
+    fi
+    if command -v nmcli >/dev/null 2>&1; then
+        nmcli device reapply "$iface" >/dev/null 2>&1 || true
+    fi
+}
+
+
+
+network_current_mode() {
+    local v4=0 v6=0 dis6=0 bind6=0 blocked=0
+    network_global_ipv4_ok && v4=1 || true
+    network_global_ipv6_ok && v6=1 || true
+    dis6=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || printf 'unknown')
+    bind6=$(sysctl -n net.ipv6.bindv6only 2>/dev/null || printf 'unknown')
+    [[ "$dis6" =~ ^[01]$ && "$bind6" =~ ^[01]$ ]] || { printf 'mixed\n'; return 0; }
+    network_ipv4_block_rule_is_ours && blocked=1 || true
+    if [[ "$dis6" == 1 && "$v4" == 1 ]]; then
+        printf 'ipv4\n'
+    elif [[ "$blocked" == 1 && "$v6" == 1 ]]; then
+        printf 'ipv6\n'
+    elif [[ "$dis6" == 0 && "$bind6" == 0 && "$v4" == 1 && "$v6" == 1 ]]; then
+        printf 'dual\n'
+    else
+        printf 'mixed\n'
+    fi
+}
+
+
+
+network_precheck_target() {
+    case "$1" in
+        ipv4) network_global_ipv4_ok && network_default_ipv4_ok && network_curl_family_ok 4 ;;
+        dual) network_global_ipv4_ok && network_default_ipv4_ok && network_curl_family_ok 4 && network_global_ipv6_ok && network_default_ipv6_ok && network_curl_family_ok 6 ;;
+        ipv6) network_global_ipv6_ok && network_default_ipv6_ok && network_curl_family_ok 6 ;;
+        *) return 1 ;;
+    esac
+}
+
+
+
+network_precheck_transition() {
+    local current="$1" target="$2"
+    case "$current:$target" in
+        ipv4:dual|ipv4:ipv6) network_global_ipv4_ok && network_default_ipv4_ok && network_curl_family_ok 4 ;;
+        ipv6:dual|ipv6:ipv4) network_global_ipv6_ok && network_default_ipv6_ok && network_curl_family_ok 6 ;;
+        *) network_precheck_target "$target" ;;
+    esac
+}
+
+
+network_write_sysctl() {
+    local target="$1" content=''
+    case "$target" in
+        ipv4) content=$'# Managed by A-Box\nnet.ipv6.conf.all.disable_ipv6=1\nnet.ipv6.conf.default.disable_ipv6=1\nnet.ipv6.bindv6only=0\n# Managed by A-Box Network Manager\n' ;;
+        dual) content=$'# Managed by A-Box\nnet.ipv6.conf.all.disable_ipv6=0\nnet.ipv6.conf.default.disable_ipv6=0\nnet.ipv6.bindv6only=0\n# Managed by A-Box Network Manager\n' ;;
+        ipv6) content=$'# Managed by A-Box\nnet.ipv6.conf.all.disable_ipv6=0\nnet.ipv6.conf.default.disable_ipv6=0\nnet.ipv6.bindv6only=1\n# Managed by A-Box Network Manager\n' ;;
+        *) return 1 ;;
+    esac
+    ensure_abox_dir_owned "$ABOX_DIR" || return 1
+    path_parent_chain_safe "$ABOX_NETWORK_SYSCTL_FILE" || return 1
+    if [[ -e "$ABOX_NETWORK_SYSCTL_FILE" || -L "$ABOX_NETWORK_SYSCTL_FILE" ]]; then
+        [[ -f "$ABOX_NETWORK_SYSCTL_FILE" && ! -L "$ABOX_NETWORK_SYSCTL_FILE" ]] || return 1
+        grep -Fq '# Managed by A-Box Network Manager' "$ABOX_NETWORK_SYSCTL_FILE" || return 1
+    fi
+    write_file_atomically_from_stdin "$ABOX_NETWORK_SYSCTL_FILE" 600 <<< "$content"
+}
+
+
+
+
+network_validate_managed_services() {
+    managed_services_active
+    case $? in
+        0|1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+
+network_sync_core_listeners() {
+    local target="$1" work="$2" desired cfg tmp
+    case "$target" in ipv4) desired='0.0.0.0' ;; dual|ipv6) desired='::' ;; *) return 1 ;; esac
+    [[ -d "$work" && ! -L "$work" ]] || return 1
+
+    if abox_owns_service xray && [[ -f /usr/local/etc/xray/config.json && ! -L /usr/local/etc/xray/config.json ]]; then
+        cfg=/usr/local/etc/xray/config.json
+        cp -a -- "$cfg" "$work/xray-config.json" || return 1
+        tmp=$(mktemp "/usr/local/etc/xray/.A-Box-network-xray.XXXXXX") || return 1
+        jq --arg addr "$desired" '
+            if (.inbounds|type)=="array" then
+              .inbounds |= map(if has("listen") then .listen=$addr else . end)
+            else . end
+        ' "$cfg" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+        chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+        [[ $EUID -eq 0 ]] && chown root:root "$tmp" || true
+        XRAY_LOCATION_ASSET=/usr/local/share/xray /usr/local/bin/xray run -test -config "$tmp" >/dev/null 2>&1 || { rm -f -- "$tmp"; return 1; }
+        mv -f -- "$tmp" "$cfg" || { rm -f -- "$tmp"; return 1; }
+    fi
+
+    if abox_owns_service sing-box && [[ -f /etc/sing-box/config.json && ! -L /etc/sing-box/config.json ]]; then
+        cfg=/etc/sing-box/config.json
+        cp -a -- "$cfg" "$work/singbox-config.json" || return 1
+        tmp=$(mktemp "/etc/sing-box/.A-Box-network-singbox.XXXXXX") || return 1
+        jq --arg addr "$desired" '
+            if (.inbounds|type)=="array" then
+              .inbounds |= map(if has("listen") then .listen=$addr else . end)
+            else . end
+        ' "$cfg" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+        chmod 600 "$tmp" || { rm -f -- "$tmp"; return 1; }
+        [[ $EUID -eq 0 ]] && chown root:root "$tmp" || true
+        /usr/local/bin/sing-box check -c "$tmp" >/dev/null 2>&1 || { rm -f -- "$tmp"; return 1; }
+        mv -f -- "$tmp" "$cfg" || { rm -f -- "$tmp"; return 1; }
+    fi
+}
+
+
+
+network_restore_core_listeners() {
+    local work="$1"
+    if [[ -f "$work/xray-config.json" && -f /usr/local/etc/xray/config.json ]]; then
+        cp -a -- "$work/xray-config.json" /usr/local/etc/xray/config.json || return 1
+        chmod 600 /usr/local/etc/xray/config.json 2>/dev/null || true
+    fi
+    if [[ -f "$work/singbox-config.json" && -f /etc/sing-box/config.json ]]; then
+        cp -a -- "$work/singbox-config.json" /etc/sing-box/config.json || return 1
+        chmod 600 /etc/sing-box/config.json 2>/dev/null || true
+    fi
+}
+
+
+
+network_restart_snapshot() {
+    local snapshot="$1" srv
+    for srv in $snapshot; do
+        restart_service_soft "$srv" || return 1
+    done
+}
+
+
+
+network_restore_runtime() {
+    local old_dis6="$1" old_dis6_default="$2" old_bind6="$3" old_block="$4" old_sysctl_present="$5" work="$6" active="$7" rc=0
+    network_restore_core_listeners "$work" || rc=1
+    if [[ "$old_block" == 1 ]]; then network_apply_ipv4_block || rc=1; else network_remove_ipv4_block || rc=1; fi
+    [[ "$old_dis6" =~ ^[01]$ ]] && sysctl -w "net.ipv6.conf.all.disable_ipv6=$old_dis6" >/dev/null 2>&1 || rc=1
+    [[ "$old_dis6_default" =~ ^[01]$ ]] && sysctl -w "net.ipv6.conf.default.disable_ipv6=$old_dis6_default" >/dev/null 2>&1 || rc=1
+    [[ "$old_bind6" =~ ^[01]$ ]] && sysctl -w "net.ipv6.bindv6only=$old_bind6" >/dev/null 2>&1 || rc=1
+    network_try_reconfigure_interface || true
+    network_restart_snapshot "$active" || rc=1
+    if [[ "$old_sysctl_present" == 1 ]]; then
+        if [[ -f "$work/network-sysctl.conf" ]]; then
+            path_parent_chain_safe "$ABOX_NETWORK_SYSCTL_FILE" || rc=1
+            if [[ -e "$ABOX_NETWORK_SYSCTL_FILE" || -L "$ABOX_NETWORK_SYSCTL_FILE" ]]; then
+                [[ -f "$ABOX_NETWORK_SYSCTL_FILE" && ! -L "$ABOX_NETWORK_SYSCTL_FILE" ]] || rc=1
+                grep -Fq "# Managed by A-Box Network Manager" "$ABOX_NETWORK_SYSCTL_FILE" 2>/dev/null || rc=1
+            fi
+            if (( rc == 0 )); then install_file_atomically "$work/network-sysctl.conf" "$ABOX_NETWORK_SYSCTL_FILE" 600 || rc=1; fi
+        fi
+    else
+        if [[ -e "$ABOX_NETWORK_SYSCTL_FILE" || -L "$ABOX_NETWORK_SYSCTL_FILE" ]]; then
+            [[ ! -L "$ABOX_NETWORK_SYSCTL_FILE" ]] && rm -f -- "$ABOX_NETWORK_SYSCTL_FILE" || rc=1
+        fi
+    fi
+    return "$rc"
+}
+
+network_snapshot_persisted_sysctl() {
+    local work="$1"
+    path_parent_chain_safe "$ABOX_NETWORK_SYSCTL_FILE" || return 1
+    if [[ -e "$ABOX_NETWORK_SYSCTL_FILE" || -L "$ABOX_NETWORK_SYSCTL_FILE" ]]; then
+        [[ -f "$ABOX_NETWORK_SYSCTL_FILE" && ! -L "$ABOX_NETWORK_SYSCTL_FILE" ]] || return 1
+        grep -Fq '# Managed by A-Box Network Manager' "$ABOX_NETWORK_SYSCTL_FILE" 2>/dev/null || return 1
+        cp -a -- "$ABOX_NETWORK_SYSCTL_FILE" "$work/network-sysctl.conf" || return 1
+        printf '1\n' > "$work/network-sysctl.present" || return 1
+    else
+        printf '0\n' > "$work/network-sysctl.present" || return 1
+    fi
+}
+
+network_apply_runtime() {
+    local target="$1"
+    network_write_sysctl "$target" || return 1
+    sysctl -p "$ABOX_NETWORK_SYSCTL_FILE" >/dev/null 2>&1 || return 1
+    network_try_reconfigure_interface || return 1
+}
+
+network_persist_target() {
+    local target="$1" previous="$2"
+    valid_network_mode "$target" || return 1
+    valid_network_mode "$previous" || return 1
+    ensure_abox_dir_owned "$ABOX_DIR" || return 1
+    write_file_atomically_from_stdin "$ABOX_NETWORK_MODE_STATE" 600 <<EOF_NETSTATE
+mode=$target
+previous=$previous
+updated=$(now_iso)
+EOF_NETSTATE
+}
+
+network_switch() {
+    local target="$1" current ssh work old_dis6 old_dis6_default old_bind6 old_block=0 old_sysctl_present=0 active='' answer srv
+    valid_network_mode "$target" || return 1
+    current=$(network_current_mode)
+    [[ "$current" != mixed ]] || return 1
+    if [[ "$current" == "$target" ]]; then network_precheck_target "$target" || return 1; network_persist_target "$target" "$current" || return 1; return 0; fi
+    ssh=$(network_ssh_family)
+    if [[ "$target" == ipv4 && "$ssh" == ipv6 ]]; then return 1; fi
+    if [[ "$target" == ipv6 && "$ssh" == ipv4 ]]; then return 1; fi
+    network_precheck_transition "$current" "$target" || return 1
+    network_validate_managed_services || return 1
+    work=$(mktemp -d /tmp/A-Box-network-switch.XXXXXX) || return 1
+    chmod 700 "$work" || { rm -rf -- "$work"; return 1; }
+    old_dis6=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null) || { rm -rf -- "$work"; return 1; }
+    old_dis6_default=$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null) || { rm -rf -- "$work"; return 1; }
+    old_bind6=$(sysctl -n net.ipv6.bindv6only 2>/dev/null) || { rm -rf -- "$work"; return 1; }
+    network_ipv4_block_rule_is_ours && old_block=1 || true
+    network_snapshot_persisted_sysctl "$work" || { rm -rf -- "$work"; return 1; }
+    old_sysctl_present=$(cat "$work/network-sysctl.present" 2>/dev/null || printf '0')
+    for srv in xray sing-box hysteria; do if abox_owns_service "$srv" && is_service_running "$srv" 2>/dev/null; then [[ -z "$active" ]] && active="$srv" || active="$active $srv"; fi; done
+    read -r -p '确认执行网络模式切换？[Y/N]: ' answer || { rm -rf -- "$work"; return 1; }
+    is_yes "$answer" || { rm -rf -- "$work"; return 0; }
+    network_apply_runtime "$target" || { network_restore_runtime "$old_dis6" "$old_dis6_default" "$old_bind6" "$old_block" "$old_sysctl_present" "$work" "$active" || true; rm -rf -- "$work"; return 1; }
+    if [[ "$target" == ipv6 ]]; then network_apply_ipv4_block || { network_restore_runtime "$old_dis6" "$old_dis6_default" "$old_bind6" "$old_block" "$old_sysctl_present" "$work" "$active" || true; rm -rf -- "$work"; return 1; }; else network_remove_ipv4_block || { network_restore_runtime "$old_dis6" "$old_dis6_default" "$old_bind6" "$old_block" "$old_sysctl_present" "$work" "$active" || true; rm -rf -- "$work"; return 1; }; fi
+    network_sync_core_listeners "$target" "$work" || { network_restore_runtime "$old_dis6" "$old_dis6_default" "$old_bind6" "$old_block" "$old_sysctl_present" "$work" "$active" || true; rm -rf -- "$work"; return 1; }
+    network_restart_snapshot "$active" || { network_restore_runtime "$old_dis6" "$old_dis6_default" "$old_bind6" "$old_block" "$old_sysctl_present" "$work" "$active" || true; rm -rf -- "$work"; return 1; }
+    network_precheck_target "$target" || { network_restore_runtime "$old_dis6" "$old_dis6_default" "$old_bind6" "$old_block" "$old_sysctl_present" "$work" "$active" || true; rm -rf -- "$work"; return 1; }
+    network_persist_target "$target" "$current" || { network_restore_runtime "$old_dis6" "$old_dis6_default" "$old_bind6" "$old_block" "$old_sysctl_present" "$work" "$active" || true; rm -rf -- "$work"; return 1; }
+    save_firewall_rules || { network_restore_runtime "$old_dis6" "$old_dis6_default" "$old_bind6" "$old_block" "$old_sysctl_present" "$work" "$active" || true; rm -rf -- "$work"; return 1; }
+    rm -rf -- "$work"
+    return 0
+}
+
+network_status() {
+    local cur desired ssh
+    cur=$(network_current_mode)
+    desired=$(awk -F= '$1=="mode"{print $2; exit}' "$ABOX_NETWORK_MODE_STATE" 2>/dev/null || true)
+    valid_network_mode "$desired" || desired='未保存'
+    ssh=$(network_ssh_family)
+    msg "当前网络：$(network_mode_label "$cur") | A-Box 目标：$(network_mode_label "$desired") | SSH：$ssh"
+    network_global_ipv4_ok && msg 'IPv4 地址：OK' || msg 'IPv4 地址：FAIL'
+    network_default_ipv4_ok && msg 'IPv4 默认路由：OK' || msg 'IPv4 默认路由：FAIL'
+    network_curl_family_ok 4 && msg 'IPv4 HTTPS：OK' || msg 'IPv4 HTTPS：FAIL'
+    network_global_ipv6_ok && msg 'IPv6 地址：OK' || msg 'IPv6 地址：FAIL'
+    network_default_ipv6_ok && msg 'IPv6 默认路由：OK' || msg 'IPv6 默认路由：FAIL'
+    network_curl_family_ok 6 && msg 'IPv6 HTTPS：OK' || msg 'IPv6 HTTPS：FAIL'
+}
+
+network_menu() {
+    clear
+    msg '======================================================================'
+    msg 'IPv4 / IPv6 网络模式切换'
+    msg '======================================================================'
+    msg '1. 仅 IPv4（关闭 IPv6）'
+    msg '2. IPv4 + IPv6 双栈'
+    msg '3. 仅 IPv6（阻断 IPv4）'
+    msg '4. 查看状态'
+    msg '0. 返回'
+    local c
+    read -r -p 'Select [0-4]: ' c || return 1
+    case "$c" in 1) network_switch ipv4; pause_return ;; 2) network_switch dual; pause_return ;; 3) network_switch ipv6; pause_return ;; 4) network_status; pause_return ;; *) return 0 ;; esac
+}
+
+abox_dns_profile() {
+    case "$1" in
+        cloudflare) printf '%s\n' '1.1.1.1|1.0.0.1|2606:4700:4700::1111,2606:4700:4700::1001|one.one.one.one|https://cloudflare-dns.com/dns-query' ;;
+        google) printf '%s\n' '8.8.8.8|8.8.4.4|2001:4860:4860::8888,2001:4860:4860::8844|dns.google|https://dns.google/dns-query' ;;
+        quad9) printf '%s\n' '9.9.9.9|149.112.112.112|2620:fe::fe,2620:fe::9|dns.quad9.net|https://dns.quad9.net/dns-query' ;;
+        alibaba) printf '%s\n' '223.5.5.5|223.6.6.6|2400:3200::1,2400:3200:baba::1|dns.alidns.com|https://dns.alidns.com/dns-query' ;;
+        *) return 1 ;;
+    esac
+}
+
+
+abox_dns_family() {
+    case "$(network_current_mode)" in
+        ipv4) printf 'ipv4\n' ;;
+        ipv6) printf 'ipv6\n' ;;
+        *) printf 'dual\n' ;;
+    esac
+}
+
+
+abox_dns_current_nameservers() {
+    if command -v resolvectl >/dev/null 2>&1; then
+        resolvectl dns 2>/dev/null | awk '
+            /^[^[:space:]]/ {iface=$1; next}
+            iface!="" {for(i=1;i<=NF;i++) if($i ~ /^[0-9A-Fa-f:.]+(%[A-Za-z0-9_.-]+)?$/) print $i}
+        ' | sed 's/%.*$//' | sort -u
+        return 0
+    fi
+    [[ -r /etc/resolv.conf ]] || return 1
+    awk '/^[[:space:]]*nameserver[[:space:]]+/{print $2}' /etc/resolv.conf | sort -u
+}
+
+
+abox_dns_write_resolved() {
+    local provider="$1" transport="$2" family="$3" dns4a dns4b dns6 dothost d6a d6b line
+    IFS='|' read -r dns4a dns4b dns6 dothost _ < <(abox_dns_profile "$provider")
+    d6a=$(printf '%s' "$dns6" | cut -d, -f1)
+    d6b=$(printf '%s' "$dns6" | cut -d, -f2)
+    case "$family" in
+        ipv4) line="$dns4a $dns4b" ;;
+        ipv6) line="$d6a $d6b" ;;
+        dual) line="$dns4a $dns4b $d6a $d6b" ;;
+        *) return 1 ;;
+    esac
+    if [[ "$transport" == dot ]]; then
+        case "$family" in
+            ipv4) line="$dns4a#$dothost $dns4b#$dothost" ;;
+            ipv6) line="$d6a#$dothost $d6b#$dothost" ;;
+            dual) line="$dns4a#$dothost $dns4b#$dothost $d6a#$dothost $d6b#$dothost" ;;
+            *) return 1 ;;
+        esac
+    fi
+    path_parent_chain_safe "$ABOX_DNS_RESOLVED_DROPIN" || return 1
+    [[ ! -L /etc/systemd/resolved.conf.d ]] || return 1
+    mkdir -p /etc/systemd/resolved.conf.d || return 1
+    if [[ -e "$ABOX_DNS_RESOLVED_DROPIN" || -L "$ABOX_DNS_RESOLVED_DROPIN" ]]; then
+        [[ -f "$ABOX_DNS_RESOLVED_DROPIN" && ! -L "$ABOX_DNS_RESOLVED_DROPIN" ]] || return 1
+        grep -Fq '# Managed by A-Box DNS Manager' "$ABOX_DNS_RESOLVED_DROPIN" || return 1
+    fi
+    if [[ -f "$ABOX_DNS_RESOLVED_DROPIN" && ! -f "$ABOX_DNS_RESOLVED_BACKUP" ]]; then
+        cp -a -- "$ABOX_DNS_RESOLVED_DROPIN" "$ABOX_DNS_RESOLVED_BACKUP" || return 1
+        chmod 600 "$ABOX_DNS_RESOLVED_BACKUP" || return 1
+    fi
+    local overtls='no'
+    [[ "$transport" == dot ]] && overtls='yes'
+    write_file_atomically_from_stdin "$ABOX_DNS_RESOLVED_DROPIN" 600 <<EOF_DNS
+[Resolve]
+# Managed by A-Box DNS Manager
+DNS=$line
+DNSOverTLS=$overtls
+EOF_DNS
+}
+
+
+abox_dns_write_resolv_conf() {
+    local provider="$1" family="$2" dns4a dns4b dns6 d6a d6b content
+    IFS='|' read -r dns4a dns4b dns6 _ _ < <(abox_dns_profile "$provider")
+    d6a=$(printf '%s' "$dns6" | cut -d, -f1)
+    d6b=$(printf '%s' "$dns6" | cut -d, -f2)
+    case "$family" in
+        ipv4) content="nameserver $dns4a
+nameserver $dns4b
+" ;;
+        ipv6) content="nameserver $d6a
+nameserver $d6b
+" ;;
+        dual) content="nameserver $dns4a
+nameserver $dns4b
+nameserver $d6a
+nameserver $d6b
+" ;;
+        *) return 1 ;;
+    esac
+    [[ -f /etc/resolv.conf && ! -L /etc/resolv.conf ]] || return 1
+    path_is_mountpoint /etc/resolv.conf && return 1
+    if [[ ! -f "$ABOX_DNS_RESCONF_BACKUP" ]]; then
+        cp -a -- /etc/resolv.conf "$ABOX_DNS_RESCONF_BACKUP" || return 1
+        chmod 600 "$ABOX_DNS_RESCONF_BACKUP" || return 1
+        chown root:root "$ABOX_DNS_RESCONF_BACKUP" 2>/dev/null || true
+    fi
+    write_file_atomically_from_stdin /etc/resolv.conf 644 <<< "$content"
+}
+
+
+abox_dns_test() {
+    getent ahosts example.com >/dev/null 2>&1
+}
+
+
+abox_dns_restore() {
+    dns_restore_previous || return 1
+    msg 'A-Box DNS 接管已恢复/移除。'
+}
+
+abox_dns_apply() {
+    local provider="$1" transport="$2" family method='resolved'
+    abox_dns_profile "$provider" >/dev/null 2>&1 || return 1
+    case "$transport" in plain|dot) ;; *) return 1 ;; esac
+    family=$(abox_dns_family)
+    ensure_abox_dir_owned "$ABOX_DIR" || return 1
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null && command -v resolvectl >/dev/null 2>&1; then
+        abox_dns_write_resolved "$provider" "$transport" "$family" || return 1
+        systemctl restart systemd-resolved >/dev/null 2>&1 || { abox_dns_restore; return 1; }
+        resolvectl flush-caches >/dev/null 2>&1 || true
+    else
+        [[ "$transport" == plain ]] || {
+            msg "当前系统没有可用的 systemd-resolved，拒绝把 DoT 降级为明文。"
+            return 1
+        }
+        method='resolv.conf'
+        abox_dns_write_resolv_conf "$provider" "$family" || return 1
+    fi
+    abox_dns_test || {
+        msg "DNS 修改后解析测试失败，恢复原配置。"
+        [[ "$method" == resolved ]] && abox_dns_restore || true
+        [[ "$method" == resolv.conf && -f "$ABOX_DNS_RESCONF_BACKUP" ]] && cp -a -- "$ABOX_DNS_RESCONF_BACKUP" /etc/resolv.conf || true
+        return 1
+    }
+    write_file_atomically_from_stdin "$ABOX_DNS_STATE" 600 <<EOF_DNSSTATE
+provider=$provider
+transport=$transport
+family=$family
+updated=$(now_iso)
+EOF_DNSSTATE
+    msg "DNS 已设置：$provider / $transport / $family"
+}
+
+
+abox_dns_status() {
+    clear
+    msg "======================================================================"
+    msg "DNS 管理 / DNS Manager"
+    msg "======================================================================"
+    local provider transport family
+    provider=$(awk -F= '$1=="provider"{print $2; exit}' "$ABOX_DNS_STATE" 2>/dev/null || true)
+    transport=$(awk -F= '$1=="transport"{print $2; exit}' "$ABOX_DNS_STATE" 2>/dev/null || true)
+    family=$(awk -F= '$1=="family"{print $2; exit}' "$ABOX_DNS_STATE" 2>/dev/null || true)
+    [[ -n "$provider" ]] || provider='未接管'
+    [[ -n "$transport" ]] || transport='unknown'
+    [[ -n "$family" ]] || family='当前模式'
+    msg "A-Box DNS：$provider / $transport / $family"
+    msg "当前 nameserver："
+    while IFS= read -r line; do [[ -n "$line" ]] && msg "  $line"; done < <(abox_dns_current_nameservers 2>/dev/null || true)
+    msg "公共 DNS：Cloudflare / Google / Quad9 / 阿里公共 DNS"
+    msg "加密模式：DNS-over-TLS (DoT)"
+    msg "DoH：仅显示官方端点，不伪装为已启用的系统 DoH。"
+    pause_return
+}
+
+
+abox_dns_menu() {
+    clear
+    msg "======================================================================"
+    msg "DNS 管理 / DNS Manager"
+    msg "======================================================================"
+    msg "1. Cloudflare"
+    msg "2. Google 公共 DNS"
+    msg "3. Quad9"
+    msg "4. 阿里公共 DNS"
+    msg "5. 查看当前 DNS"
+    msg "6. 恢复 A-Box DNS 接管前状态"
+    msg "7. 查看 DoH 官方端点"
+    msg "0. 返回"
+    local c provider transport answer
+    read -r -p 'Select [0-7]: ' c
+    case "$c" in
+        1) provider=cloudflare ;;
+        2) provider=google ;;
+        3) provider=quad9 ;;
+        4) provider=alibaba ;;
+        5) abox_dns_status; return 0 ;;
+        6) abox_dns_restore; pause_return; return 0 ;;
+        7)
+            msg "Cloudflare: https://cloudflare-dns.com/dns-query"
+            msg "Google: https://dns.google/dns-query"
+            msg "Quad9: https://dns.quad9.net/dns-query"
+            msg "阿里公共 DNS: https://dns.alidns.com/dns-query"
+            pause_return
+            return 0
+            ;;
+        *) return 0 ;;
+    esac
+    msg "1. 明文 DNS"
+    msg "2. DNS-over-TLS (DoT)"
+    read -r -p 'Select [1-2]: ' transport
+    case "$transport" in 1) transport=plain ;; 2) transport=dot ;; *) return 0 ;; esac
+    read -r -p '确认修改系统 DNS？[Y/N]: ' answer
+    is_yes "$answer" || return 0
+    abox_dns_apply "$provider" "$transport"
+    pause_return
+}
+
+
+abox_region_state_get() {
+    [[ -f "$ABOX_REGION_STATE" && ! -L "$ABOX_REGION_STATE" ]] || return 1
+    awk -F= -v k="$1" '$1==k{print substr($0,index($0,"=")+1); exit}' "$ABOX_REGION_STATE" 2>/dev/null
+}
+
+
+abox_region_validate_timezone() {
+    local tz="$1"
+    [[ "$tz" == UTC || "$tz" == GMT || "$tz" =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+@-]+)+$ ]] || return 1
+    [[ -f "/usr/share/zoneinfo/$tz" && ! -L "/usr/share/zoneinfo/$tz" ]]
+}
+
+
+abox_region_validate_locale() {
+    local loc="$1"
+    [[ "$loc" =~ ^[A-Za-z0-9._@+-]+$ ]] || return 1
+    command -v locale >/dev/null 2>&1 || return 1
+    locale -a 2>/dev/null | grep -Fxq "$loc"
+}
+
+
+abox_region_timezone() {
+    if command -v timedatectl >/dev/null 2>&1; then timedatectl show -p Timezone --value 2>/dev/null && return 0; fi
+    if [[ -r /etc/timezone ]]; then tr -d '[:space:]' < /etc/timezone; return 0; fi
+    readlink -f /etc/localtime 2>/dev/null | sed 's#^/usr/share/zoneinfo/##'
+}
+
+
+abox_region_locale() {
+    if command -v localectl >/dev/null 2>&1 && systemd_available; then
+        localectl status 2>/dev/null | awk -F': ' '/System Locale:/{print $2; exit}' | sed -n 's/^LANG=//p'
+        return
+    fi
+    locale 2>/dev/null | sed -n 's/^LANG=//p' | head -n1
+}
+
+
+abox_region_ntp() {
+    command -v timedatectl >/dev/null 2>&1 && timedatectl show -p NTPSynchronized --value 2>/dev/null || printf 'unknown\n'
+}
+
+
+abox_region_write_state() {
+    local label="$1" tz="$2" loc="$3" ntp="$4" locked="$5"
+    [[ "$label" =~ ^[A-Za-z0-9._@+:/ -]{0,64}$ ]] || return 1
+    ensure_abox_dir_owned "$ABOX_DIR" || return 1
+    write_file_atomically_from_stdin "$ABOX_REGION_STATE" 600 <<EOF_REGION
+region_label=$label
+timezone=$tz
+locale=$loc
+ntp=$ntp
+locked=$locked
+updated=$(now_iso)
+EOF_REGION
+}
+
+
+abox_region_set_timezone() {
+    local tz="$1"
+    abox_region_validate_timezone "$tz" || return 1
+    if command -v timedatectl >/dev/null 2>&1; then
+        timedatectl set-timezone "$tz" >/dev/null 2>&1 || return 1
+    else
+        path_is_mountpoint /etc/localtime && return 1
+        install -m 644 "/usr/share/zoneinfo/$tz" /etc/localtime || return 1
+    fi
+}
+
+
+abox_region_set_locale() {
+    local loc="$1" os_id=''
+    abox_region_validate_locale "$loc" || return 1
+    os_id=$(awk -F= '$1=="ID"{gsub(/"/,"",$2); print $2; exit}' /etc/os-release 2>/dev/null || true)
+    if command -v localectl >/dev/null 2>&1 && systemd_available; then
+        localectl set-locale "LANG=$loc" >/dev/null 2>&1 || return 1
+    else
+        case "$os_id" in
+            debian|ubuntu) write_file_atomically_from_stdin /etc/default/locale 644 <<< "LANG=$loc" || return 1 ;;
+            *) write_file_atomically_from_stdin /etc/locale.conf 644 <<< "LANG=$loc" || return 1 ;;
+        esac
+    fi
+}
+
+
+abox_region_set_ntp() {
+    command -v timedatectl >/dev/null 2>&1 || return 1
+    case "$1" in
+        on) timedatectl set-ntp true >/dev/null 2>&1 ;;
+        off) timedatectl set-ntp false >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+
+abox_region_status() {
+    local tz loc ntp label locked desired_tz desired_loc
+    tz=$(abox_region_timezone 2>/dev/null || printf unknown)
+    loc=$(abox_region_locale 2>/dev/null || printf unknown)
+    ntp=$(abox_region_ntp 2>/dev/null || printf unknown)
+    label=$(abox_region_state_get region_label 2>/dev/null || true)
+    locked=$(abox_region_state_get locked 2>/dev/null || printf 0)
+    desired_tz=$(abox_region_state_get timezone 2>/dev/null || true)
+    desired_loc=$(abox_region_state_get locale 2>/dev/null || true)
+    [[ -n "$loc" ]] || loc=unknown
+    [[ -n "$label" ]] || label='未设置'
+    msg "当前时区：$tz"
+    msg "当前 Locale：$loc"
+    msg "NTP：$ntp"
+    msg "自定义地区/国家标签：$label"
+    msg "锁定：$locked"
+    [[ -n "$desired_tz" && "$desired_tz" != "$tz" ]] && msg "时区漂移：期望 $desired_tz，当前 $tz"
+    [[ -n "$desired_loc" && "$desired_loc" != "$loc" ]] && msg "Locale 漂移：期望 $desired_loc，当前 $loc"
+    msg "说明：公网 IP 所属国家由 IP/ASN/GeoIP 决定；地区标签只是本机自定义标记。"
+}
+
+
+abox_region_repair() {
+    local locked tz loc ntp label
+    locked=$(abox_region_state_get locked 2>/dev/null || printf 0)
+    [[ "$locked" == 1 ]] || return 1
+    tz=$(abox_region_state_get timezone 2>/dev/null || true)
+    loc=$(abox_region_state_get locale 2>/dev/null || true)
+    ntp=$(abox_region_state_get ntp 2>/dev/null || true)
+    label=$(abox_region_state_get region_label 2>/dev/null || true)
+    [[ -n "$tz" ]] && abox_region_set_timezone "$tz" || return 1
+    if [[ -n "$loc" && "$loc" != unknown ]]; then abox_region_set_locale "$loc" || return 1; fi
+    if [[ "$ntp" == on || "$ntp" == off ]]; then abox_region_set_ntp "$ntp" || return 1; fi
+    abox_region_write_state "$label" "$tz" "$loc" "$ntp" 1
+}
+
+
+abox_region_menu() {
+    clear
+    msg "======================================================================"
+    msg "VPS 地区 / 时区 / Locale / NTP"
+    msg "======================================================================"
+    abox_region_status
+    msg "----------------------------------------------------------------------"
+    msg "1. 设置时区"
+    msg "2. 设置 Locale"
+    msg "3. 开启 NTP"
+    msg "4. 关闭 NTP"
+    msg "5. 设置自定义地区/国家标签"
+    msg "6. 锁定当前设置"
+    msg "7. 解锁"
+    msg "8. 修复到已锁定状态"
+    msg "0. 返回"
+    local c tz loc ntp label lockv
+    read -r -p 'Select [0-8]: ' c
+    case "$c" in
+        1)
+            read -r -p 'Timezone (e.g. UTC / Asia/Shanghai / America/Los_Angeles): ' tz
+            abox_region_set_timezone "$tz" || msg "时区设置失败或无效。"
+            pause_return
+            ;;
+        2)
+            read -r -p 'Locale (must exist in locale -a): ' loc
+            abox_region_set_locale "$loc" || msg "Locale 设置失败或不存在。"
+            pause_return
+            ;;
+        3) abox_region_set_ntp on || msg "NTP 开启失败。"; pause_return ;;
+        4) abox_region_set_ntp off || msg "NTP 关闭失败。"; pause_return ;;
+        5)
+            read -r -p 'Custom region/country label (informational only): ' label
+            tz=$(abox_region_timezone 2>/dev/null || printf unknown)
+            loc=$(abox_region_locale 2>/dev/null || printf unknown)
+            ntp=$(abox_region_ntp 2>/dev/null || printf unknown)
+            lockv=$(abox_region_state_get locked 2>/dev/null || printf 0)
+            abox_region_write_state "$label" "$tz" "$loc" "$ntp" "$lockv" || msg "地区标签保存失败。"
+            pause_return
+            ;;
+        6)
+            label=$(abox_region_state_get region_label 2>/dev/null || true)
+            tz=$(abox_region_timezone 2>/dev/null || printf unknown)
+            loc=$(abox_region_locale 2>/dev/null || printf unknown)
+            ntp=off
+            if command -v timedatectl >/dev/null 2>&1; then
+                timedatectl show -p NTP --value 2>/dev/null | grep -qi '^yes    clear
+    msg "${CYAN}======================================================================${NC}"
+    msg "${BOLD}${GREEN}$(tr_msg toolbox_title)${NC}"
+    msg "${CYAN}======================================================================${NC}"
+    if [[ "${ABOX_LANG:-zh}" == 'en' ]]; then
+        msg "${YELLOW}1. System benchmark and download speed${NC}"
+        msg "${YELLOW}2. IP quality, streaming unlock and route test${NC}"
+        msg "${YELLOW}3. Local SNI preference${NC}"
+        msg "${YELLOW}4. Mini host local SNI preference${NC}"
+        msg "${YELLOW}5. Cloudflare WARP manager (egress IP masking / streaming unlock)${NC}"
+        msg "${YELLOW}6. Allocate 2G Swap (prevent OOM crashes)${NC}"
+        msg "${YELLOW}7. Backup / Restore A-Box configuration${NC}"
+        msg "${YELLOW}8. Export redacted diagnostic bundle${NC}"
+        msg "${YELLOW}9. Full dry-run preflight check${NC}"
+        msg "${YELLOW}10. SNI preference records${NC}"
+        msg "${GREEN}0. Back${NC}"
+    else
+        msg "${YELLOW}1. 本机配置和下载测速${NC}"
+        msg "${YELLOW}2. IP纯净度、流媒体解锁与回程测试${NC}"
+        msg "${YELLOW}3. 本地 SNI 优选${NC}"
+        msg "${YELLOW}4. 微型主机本地 SNI 优选${NC}"
+        msg "${YELLOW}5. Cloudflare WARP 一键接管 (出站 IP 伪装/流媒体解锁)${NC}"
+        msg "${YELLOW}6. Swap 虚拟内存一键划拨 2G (防 OOM 宕机)${NC}"
+        msg "${YELLOW}7. 配置备份 / 恢复${NC}"
+        msg "${YELLOW}8. 导出脱敏诊断包${NC}"
+        msg "${YELLOW}9. 完整 Dry-run 预检查${NC}"
+        msg "${YELLOW}10. SNI 优选记录${NC}"
+        msg "${GREEN}0. 返回主菜单${NC}"
+    fi
+    local bench_choice
+    read -r -p 'Select [0-10]: ' bench_choice
+    case "$bench_choice" in
+        1)
+            confirm_yes_no "$(tprintf confirm_remote 'System benchmark and download speed')" && run_remote_bash_script 'System benchmark and download speed' 'https://bench.sh'
+            pause_return
+            ;;
+        2)
+            confirm_yes_no "$(tprintf confirm_remote 'IP quality, streaming unlock and route test')" && run_remote_bash_script 'IP quality, streaming unlock and route test' 'https://Check.Place' -I
+            pause_return
+            ;;
+        3) run_local_sni_benchmark ;;
+        4) run_local_sni_mini_benchmark ;;
+        5) run_warp_manager ;;
+        6) setup_swap_2g ;;
+        7) backup_restore_menu ;;
+        8) export_diagnostic_bundle ;;
+        9) preflight_check ;;
+        10) show_sni_preference_records ;;
+        *) return 0 ;;
+    esac
+}
+
+
 run_self_tests() {
     local tmp failures=0 real_abox_sig='' real_abox_exists=0 selftest_prev_exit_trap selftest_prev_umask
     selftest_prev_umask=$(umask)
@@ -15399,6 +16323,22 @@ run_self_tests() {
     grep -Fq 'mktemp "$ABOX_DIR/.A-Box-sni-report.' "$0" || { echo 'FAIL: SNI persistence atomic temporary file missing'; failures=$((failures + 1)); }
     declare -F backup_current_config >/dev/null 2>&1 || { echo 'FAIL: backup_current_config missing'; failures=$((failures + 1)); }
     declare -F export_diagnostic_bundle >/dev/null 2>&1 || { echo 'FAIL: export_diagnostic_bundle missing'; failures=$((failures + 1)); }
+    declare -F dns_restore_previous >/dev/null 2>&1 || { echo 'FAIL: legacy DNS restore helper missing'; failures=$((failures + 1)); }
+    declare -F prepare_backup_runtime_identities >/dev/null 2>&1 || { echo 'FAIL: backup runtime identity helper missing'; failures=$((failures + 1)); }
+    declare -F network_menu >/dev/null 2>&1 || { echo 'FAIL: IPv4/IPv6 network menu missing'; failures=$((failures + 1)); }
+    declare -F abox_dns_menu >/dev/null 2>&1 || { echo 'FAIL: DNS menu missing'; failures=$((failures + 1)); }
+    declare -F abox_region_menu >/dev/null 2>&1 || { echo 'FAIL: region menu missing'; failures=$((failures + 1)); }
+    assert_ok valid_network_mode ipv4
+    assert_ok valid_network_mode dual
+    assert_ok valid_network_mode ipv6
+    assert_bad valid_network_mode mixed
+    _sni_probe_body=$(awk '/^sni_probe_domain\(\) \{/{p=1} /^sni_openssl_check\(\) \{/{p=0} p{print}' "$0") || { echo 'FAIL: SNI probe body extraction'; failures=$((failures + 1)); }
+    grep -Fq 'sni_domain_public_dns "$domain" || return 0' <<< "$_sni_probe_body" || { echo 'FAIL: SNI public-DNS guard missing'; failures=$((failures + 1)); }
+    _diag_body=$(awk '/^export_diagnostic_bundle\(\) \{/{p=1} /^default_route_uses_warp\(\) \{/{p=0} p{print}' "$0") || { echo 'FAIL: diagnostic body extraction'; failures=$((failures + 1)); }
+    grep -Fq 'mktemp "$diag_dir/A-Box-diagnostic-${ts}.XXXXXX.tar.gz"' <<< "$_diag_body" || { echo 'FAIL: diagnostic collision-safe filename missing'; failures=$((failures + 1)); }
+    _net_body=$(awk '/^network_remove_ipv4_block\(\) \{/{p=1} /^network_apply_ipv4_block\(\) \{/{p=0} p{print}' "$0") || { echo 'FAIL: network body extraction'; failures=$((failures + 1)); }
+    grep -Fq 'network_ipv4_block_rule_is_ours || return 1' <<< "$_net_body" || { echo 'FAIL: network cleanup ownership guard missing'; failures=$((failures + 1)); }
+    grep -Fq 'main "$@"' "$0" || { echo 'FAIL: executable main invocation missing'; failures=$((failures + 1)); }
     grep -Fq 'refusing to report a false Saved state' "$0" || { echo 'FAIL: SNI persistence must fail closed'; failures=$((failures + 1)); }
     grep -Fq 'Diagnostic bundle checksum generation failed' "$0" || { echo 'FAIL: diagnostic checksum failures must be blocking'; failures=$((failures + 1)); }
     grep -Fq 'mktemp "$diag_dir/.A-Box-diagnostic-checksum.' "$0" || { echo 'FAIL: diagnostic checksum atomic temporary file missing'; failures=$((failures + 1)); }
