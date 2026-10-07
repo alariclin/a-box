@@ -13,6 +13,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: CLI entrypoint smoke
+        run: |
+          bash install.sh --version
+          bash install.sh --help >/dev/null
+          grep -Fq 'main "$@"' install.sh
+          grep -Fq 'main_loop() {' install.sh
+          grep -Fq 'run_self_tests() {' install.sh
       - name: Bash syntax
         run: bash -n install.sh
       - name: Built-in self-test
@@ -24,3 +31,6 @@ jobs:
           grep -Fq "ABOX_XRAY_DEFAULT_VERSION='v26.6.27'" install.sh
           grep -Fq "ABOX_XRAY_REALITY_MLKEM_MIN_VERSION='v26.9.8'" install.sh
           grep -Fq 'v2.13.0' install.sh
+          grep -Fq "ABOX_BUILD='2026-10-07-fullfix-v144'" install.sh
+          grep -Fq '^ABOX_BUILD_EPOCH=20261007144
+ install.sh
