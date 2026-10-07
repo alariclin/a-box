@@ -15387,10 +15387,22 @@ run_self_tests() {
     assert_ok valid_ip_address 2001:db8::1
     assert_bad valid_ip_address 192.0.2.1/24
     assert_bad valid_ip_address 2001:db8::1/64
+    declare -F sni_domain_public_dns >/dev/null 2>&1 || { echo 'FAIL: SNI public-DNS guard missing'; failures=$((failures + 1)); }
+    getent() { printf '%s\n' '1.1.1.1 STREAM example.com'; }
+    assert_ok sni_domain_public_dns example.com
+    getent() { printf '%s\n' '10.0.0.1 STREAM example.com'; }
+    assert_bad sni_domain_public_dns example.com
+    unset -f getent
+    grep -Fq 'sni_domain_public_dns "$domain" || return 0' "$0" || { echo 'FAIL: SNI probe must enforce public DNS target guard'; failures=$((failures + 1)); }
+    grep -Fq "curl -sSI --proto '=https' --proto-redir '=https' --max-redirs 0" "$0" || { echo 'FAIL: SNI probe redirect hardening missing'; failures=$((failures + 1)); }
+    grep -Fq 'ensure_abox_dir_owned "$ABOX_DIR" || die' "$0" || { echo 'FAIL: SNI persistence ownership gate missing'; failures=$((failures + 1)); }
+    grep -Fq 'mktemp "$ABOX_DIR/.A-Box-sni-report.' "$0" || { echo 'FAIL: SNI persistence atomic temporary file missing'; failures=$((failures + 1)); }
     declare -F backup_current_config >/dev/null 2>&1 || { echo 'FAIL: backup_current_config missing'; failures=$((failures + 1)); }
     declare -F export_diagnostic_bundle >/dev/null 2>&1 || { echo 'FAIL: export_diagnostic_bundle missing'; failures=$((failures + 1)); }
     grep -Fq 'refusing to report a false Saved state' "$0" || { echo 'FAIL: SNI persistence must fail closed'; failures=$((failures + 1)); }
     grep -Fq 'Diagnostic bundle checksum generation failed' "$0" || { echo 'FAIL: diagnostic checksum failures must be blocking'; failures=$((failures + 1)); }
+    grep -Fq 'mktemp "$diag_dir/.A-Box-diagnostic-checksum.' "$0" || { echo 'FAIL: diagnostic checksum atomic temporary file missing'; failures=$((failures + 1)); }
+    grep -Fq '[[ -s "$checksum" && ! -L "$checksum" ]]' "$0" || { echo 'FAIL: diagnostic checksum symlink protection missing'; failures=$((failures + 1)); }
     declare -F preflight_check >/dev/null 2>&1 || { echo 'FAIL: preflight_check missing'; failures=$((failures + 1)); }
     bash -n "$0" >/dev/null 2>&1 || { echo 'FAIL: installer source must pass bash -n'; failures=$((failures + 1)); }
     declare -F confirm_remote_script_hash >/dev/null 2>&1 || { echo 'FAIL: remote script hash gate missing'; failures=$((failures + 1)); }
@@ -15804,6 +15816,21 @@ PY_SELFTEST_ARCHIVE_CREATE
     assert_ok create_backup_manifest "$tmp/archive-good" "$tmp/archive-good/meta/manifest.sha256"
     tar -C "$tmp/archive-good" --owner=0 --group=0 --numeric-owner -czf "$tmp/good.tar.gz" root meta
     assert_ok validate_backup_archive "$tmp/good.tar.gz"
+    local _saved_sb_user _saved_sb_group _saved_hy_user _saved_hy_group
+    _saved_sb_user="$ABOX_RUNTIME_SINGBOX_USER"
+    _saved_sb_group="$ABOX_RUNTIME_SINGBOX_GROUP"
+    _saved_hy_user="$ABOX_RUNTIME_HYSTERIA_USER"
+    _saved_hy_group="$ABOX_RUNTIME_HYSTERIA_GROUP"
+    ABOX_RUNTIME_SINGBOX_USER='__A_BOX_NONEXISTENT_SINGBOX_USER__'
+    ABOX_RUNTIME_SINGBOX_GROUP='__A_BOX_NONEXISTENT_SINGBOX_GROUP__'
+    ABOX_RUNTIME_HYSTERIA_USER='__A_BOX_NONEXISTENT_HYSTERIA_USER__'
+    ABOX_RUNTIME_HYSTERIA_GROUP='__A_BOX_NONEXISTENT_HYSTERIA_GROUP__'
+    assert_ok validate_backup_archive "$tmp/good.tar.gz"
+    ABOX_RUNTIME_SINGBOX_USER="$_saved_sb_user"
+    ABOX_RUNTIME_SINGBOX_GROUP="$_saved_sb_group"
+    ABOX_RUNTIME_HYSTERIA_USER="$_saved_hy_user"
+    ABOX_RUNTIME_HYSTERIA_GROUP="$_saved_hy_group"
+    unset _saved_sb_user _saved_sb_group _saved_hy_user _saved_hy_group
     if (( EUID == 0 )) && id nobody >/dev/null 2>&1 && getent group nogroup >/dev/null 2>&1; then
         old_hy_user="$ABOX_RUNTIME_HYSTERIA_USER"
         old_hy_group="$ABOX_RUNTIME_HYSTERIA_GROUP"
