@@ -20,11 +20,7 @@ jobs:
       - name: Release metadata regression
         run: |
           grep -Eq "^ABOX_BUILD='[^']+'$" install.sh
-          grep -Eq '^ABOX_BUILD_EPOCH=[0-9]+
-          grep -Fq "ABOX_XRAY_DEFAULT_VERSION='v26.6.27'" install.sh
-          grep -Fq "ABOX_XRAY_REALITY_MLKEM_MIN_VERSION='v26.9.8'" install.sh
-          grep -Fq 'v2.13.0' install.sh
- install.sh
+          grep -Eq '^ABOX_BUILD_EPOCH=[0-9]+$' install.sh
           grep -Fq "ABOX_XRAY_DEFAULT_VERSION='v26.6.27'" install.sh
           grep -Fq "ABOX_XRAY_REALITY_MLKEM_MIN_VERSION='v26.9.8'" install.sh
           grep -Fq 'v2.13.0' install.sh
