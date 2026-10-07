@@ -11754,6 +11754,7 @@ sni_domain_public_dns() {
 sni_probe_domain() {
     local domain="$1" raw="$2" timeout_s="${3:-6}" metrics code t_connect t_app t_start t_total http_version remote_ip penalty score tls_args=()
     [[ "$domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]] || return 0
+    sni_domain_public_dns "$domain" || return 0
     # Fast path: detect curl TLS 1.3 capability once in run_builtin_sni_radar.
     # This preserves probe semantics while avoiding one `curl --help all | grep`
     # subprocess chain per candidate domain on large libraries.
@@ -11778,6 +11779,7 @@ sni_probe_domain() {
 sni_openssl_check() {
     local domain="$1" timeout_s="${2:-5}" out cert sanext rest alpn='none' tls13=0 san=0
     command -v openssl >/dev/null 2>&1 || { printf 'tls13=unknown\talpn=unknown\tsan=unknown'; return 0; }
+    sni_domain_public_dns "$domain" || { printf 'tls13=0\talpn=none\tsan=0'; return 0; }
     out=$(printf '' | timeout "$timeout_s" openssl s_client -connect "${domain}:443" -servername "$domain" -alpn 'h2,http/1.1' -tls1_3 -showcerts 2>/dev/null | tr -d '\000') || out=''
     if [[ -n "$out" ]]; then
         grep -qiE 'Protocol *: *TLSv1\.3|New, TLSv1\.3' <<< "$out" && tls13=1
@@ -13745,7 +13747,7 @@ export_diagnostic_bundle() {
         [[ -r "$f" ]] && tail -n 200 "$f" 2>/dev/null | redact_secrets_stream > "$work/logs/$(basename "$f").tail.txt" || true
     done
 
-    bundle="$diag_dir/A-Box-diagnostic-${ts}.tar.gz"
+    bundle=$(mktemp "$diag_dir/A-Box-diagnostic-${ts}.XXXXXX.tar.gz") || { rm -rf "$work"; die 'Diagnostic bundle filename allocation failed.'; }
     tar -C "$work" -czf "$bundle" . || { rm -rf "$work"; die 'Diagnostic bundle creation failed.'; }
     chmod 600 "$bundle" 2>/dev/null || { rm -rf "$work"; rm -f "$bundle"; die 'Diagnostic bundle permission hardening failed.'; }
     checksum="${bundle}.sha256"
@@ -14013,6 +14015,9 @@ network_ipv4_block_rule_is_ours() {
 network_remove_ipv4_block() {
     local chain="$ABOX_NETWORK_IPV4_CHAIN" parent
     command -v iptables >/dev/null 2>&1 || return 0
+    if network_ipv4_block_chain_exists; then
+        network_ipv4_block_rule_is_ours || return 1
+    fi
     for parent in INPUT OUTPUT FORWARD; do
         while iptables -w -C "$parent" -j "$chain" >/dev/null 2>&1; do
             iptables -w -D "$parent" -j "$chain" >/dev/null 2>&1 || return 1
