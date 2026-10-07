@@ -1795,7 +1795,7 @@ hysteria_acme_dir_runtime_permissions_valid() {
     [[ "$(stat -c %u:%g "$dir" 2>/dev/null || true)" == "0:$gid" ]] || return 1
     mode=$(stat -c %a "$dir" 2>/dev/null) || return 1
     nlink=$(stat -c %h "$dir" 2>/dev/null) || return 1
-    [[ "$nlink" == 1 && "$mode" =~ ^0?770$ ]] || return 1
+    [[ "$nlink" =~ ^[2-9][0-9]*$ && "$mode" =~ ^0?770$ ]] || return 1
     return 0
 }
 
@@ -4487,6 +4487,25 @@ ensure_abox_runtime_identity() {
     [[ "$shell" == '/usr/sbin/nologin' || "$shell" == '/sbin/nologin' || "$shell" == '/bin/false' ]] || return 1
 }
 
+prepare_abox_runtime_config_dir() {
+    local family="$1" dir="$2" user group gid mode nlink
+    case "$family:$dir" in
+        sing-box:/etc/sing-box|hysteria:/etc/hysteria) ;;
+        *) return 1 ;;
+    esac
+    ensure_abox_runtime_identity "$family" || return 1
+    IFS=$'\t' read -r user group < <(abox_runtime_identity "$family") || return 1
+    path_parent_chain_safe "$dir/.A-Box-config" || return 1
+    [[ ! -L "$dir" && (! -e "$dir" || -d "$dir") ]] || return 1
+    install -d -o root -g "$group" -m 750 -- "$dir" || return 1
+    gid=$(getent group "$group" 2>/dev/null | awk -F: '{print $3}')
+    [[ "$gid" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ "$(stat -c %u:%g "$dir" 2>/dev/null || true)" == "0:$gid" ]] || return 1
+    mode=$(stat -c %a "$dir" 2>/dev/null) || return 1
+    nlink=$(stat -c %h "$dir" 2>/dev/null) || return 1
+    [[ "$nlink" =~ ^[2-9][0-9]*$ && "$mode" =~ ^0?750$ ]] || return 1
+}
+
 prepare_abox_runtime_read_file() {
     local path="$1" family="$2" user group
     IFS=$'\t' read -r user group < <(abox_runtime_identity "$family") || return 1
@@ -4523,12 +4542,14 @@ prepare_abox_runtime_permissions() {
             prepare_abox_runtime_write_file /var/log/A-Box-xray-error.log xray || return 1
             ;;
         sing-box)
+            prepare_abox_runtime_config_dir sing-box /etc/sing-box || return 1
             prepare_abox_runtime_read_file /etc/sing-box/config.json sing-box || return 1
             [[ ! -e /etc/sing-box/hy2.crt ]] || prepare_abox_runtime_read_file /etc/sing-box/hy2.crt sing-box || return 1
             [[ ! -e /etc/sing-box/hy2.key ]] || prepare_abox_runtime_read_file /etc/sing-box/hy2.key sing-box || return 1
             prepare_abox_runtime_write_file /var/log/A-Box-singbox.log sing-box || return 1
             ;;
         hysteria)
+            prepare_abox_runtime_config_dir hysteria /etc/hysteria || return 1
             [[ ! -e /etc/hysteria/acme ]] || prepare_hysteria_acme_dir_ownership || return 1
             prepare_abox_runtime_read_file /etc/hysteria/config.yaml hysteria || return 1
             [[ ! -e /etc/hysteria/server.crt ]] || prepare_abox_runtime_read_file /etc/hysteria/server.crt hysteria || return 1
@@ -5412,7 +5433,11 @@ build_singbox_config() {
     out_dir=$(dirname -- "$out")
     [[ ! -L "$out_dir" && ! -L "$out" ]] || die 'Sing-box 配置路径存在符号链接，拒绝写入。'
     [[ ! -e "$out_dir" || -d "$out_dir" ]] || die 'Sing-box 配置父路径不是目录，拒绝写入。'
-    [[ -d "$out_dir" ]] || install -d -m 755 -- "$out_dir" || die 'Sing-box 配置目录创建失败。'
+    if [[ "$out" == /etc/sing-box/config.json ]]; then
+        prepare_abox_runtime_config_dir sing-box /etc/sing-box || die 'Sing-box 配置目录权限准备失败。'
+    else
+        [[ -d "$out_dir" ]] || install -d -m 755 -- "$out_dir" || die 'Sing-box 配置目录创建失败。'
+    fi
     tmp_out=$(mktemp "$out_dir/.A-Box-singbox-config.XXXXXX") || die 'Sing-box 配置临时文件创建失败。'
     umask 077
     jq -n --argjson inbounds "$inbounds_json" '{
@@ -5432,7 +5457,17 @@ generate_self_signed_cert_atomically() {
     [[ "$dir" == "$(dirname "$cert")" ]] || return 1
     path_parent_chain_safe "$key" || return 1
     path_parent_chain_safe "$cert" || return 1
-    install -d -m 700 "$dir" || return 1
+    case "$dir" in
+        /etc/sing-box)
+            prepare_abox_runtime_config_dir sing-box /etc/sing-box || return 1
+            ;;
+        /etc/hysteria)
+            prepare_abox_runtime_config_dir hysteria /etc/hysteria || return 1
+            ;;
+        *)
+            install -d -m 700 "$dir" || return 1
+            ;;
+    esac
     [[ ! -L "$key" && ! -L "$cert" ]] || return 1
     [[ ! -e "$key" || -f "$key" ]] || return 1
     [[ ! -e "$cert" || -f "$cert" ]] || return 1
@@ -5465,11 +5500,14 @@ generate_self_signed_cert_atomically() {
 }
 
 build_hysteria_config() {
-    local out="$1" tls_config="$2" listen_spec="$3" tmp pass_yaml obfs_yaml masq_yaml
+    local out="$1" tls_config="$2" listen_spec="$3" tmp pass_yaml obfs_yaml masq_yaml out_dir
     [[ -n "$out" && -n "$listen_spec" ]] || return 1
+    [[ "$out" == /etc/hysteria/config.yaml ]] || return 1
     path_parent_chain_safe "$out" || return 1
-    [[ ! -L "$(dirname "$out")" && ! -L "$out" ]] || return 1
-    install -d -m 700 "$(dirname "$out")" || return 1
+    out_dir=$(dirname "$out")
+    [[ "$out_dir" == /etc/hysteria ]] || return 1
+    [[ ! -L "$out_dir" && ! -L "$out" ]] || return 1
+    prepare_abox_runtime_config_dir hysteria "$out_dir" || return 1
     pass_yaml=$(json_escape "$HY2_PASS") || return 1
     obfs_yaml=$(json_escape "$HY2_OBFS") || return 1
     masq_yaml=$(json_escape "$HY2_MASQ_URL") || return 1
@@ -6005,7 +6043,7 @@ deploy_singbox() {
     ABOX_DEPLOY_TX_TMP=''
     /usr/local/bin/sing-box version >/dev/null 2>&1 || die 'Sing-box 执行校验失败。'
 
-    install -d -m 700 /etc/sing-box || die 'Sing-box config directory creation failed.'
+    prepare_abox_runtime_config_dir sing-box /etc/sing-box || die 'Sing-box config directory preparation failed.'
     KEYPAIR=$(/usr/local/bin/sing-box generate reality-keypair)
     PK=$(awk '/Private/{print $NF; found=1; exit} /Password/{fallback=$NF} END{if (!found && fallback != "") print fallback}' <<< "$KEYPAIR")
     PBK=$(awk '/Public/{print $NF; exit}' <<< "$KEYPAIR")
@@ -12875,14 +12913,33 @@ PY_LEGACY_EXTRACT
 
 validate_backup_archive() {
     local archive="$1"
+    local sb_runtime_uid=0 sb_runtime_gid=0 hy_runtime_uid=0 hy_runtime_gid=0
     [[ -s "$archive" ]] || return 1
     command -v python3 >/dev/null 2>&1 || return 1
-    python3 - "$archive" <<'PY_VALIDATE'
+    if getent passwd "$ABOX_RUNTIME_SINGBOX_USER" >/dev/null 2>&1; then
+        sb_runtime_uid=$(id -u "$ABOX_RUNTIME_SINGBOX_USER" 2>/dev/null || printf '0')
+    fi
+    if getent group "$ABOX_RUNTIME_SINGBOX_GROUP" >/dev/null 2>&1; then
+        sb_runtime_gid=$(getent group "$ABOX_RUNTIME_SINGBOX_GROUP" 2>/dev/null | awk -F: '{print $3}')
+    fi
+    if getent passwd "$ABOX_RUNTIME_HYSTERIA_USER" >/dev/null 2>&1; then
+        hy_runtime_uid=$(id -u "$ABOX_RUNTIME_HYSTERIA_USER" 2>/dev/null || printf '0')
+    fi
+    if getent group "$ABOX_RUNTIME_HYSTERIA_GROUP" >/dev/null 2>&1; then
+        hy_runtime_gid=$(getent group "$ABOX_RUNTIME_HYSTERIA_GROUP" 2>/dev/null | awk -F: '{print $3}')
+    fi
+    [[ "$sb_runtime_uid" =~ ^[0-9]+$ && "$sb_runtime_gid" =~ ^[0-9]+$ && "$hy_runtime_uid" =~ ^[0-9]+$ && "$hy_runtime_gid" =~ ^[0-9]+$ ]] || return 1
+    python3 - "$archive" "$sb_runtime_uid" "$sb_runtime_gid" "$hy_runtime_uid" "$hy_runtime_gid" <<'PY_VALIDATE'
 import posixpath,stat,sys,tarfile
 fn=sys.argv[1]
+sb_runtime_uid=int(sys.argv[2]); sb_runtime_gid=int(sys.argv[3])
+hy_runtime_uid=int(sys.argv[4]); hy_runtime_gid=int(sys.argv[5])
 MAX_MEMBERS=10000
 MAX_FILE=512*1024*1024
 MAX_TOTAL=1024*1024*1024
+SB_DIR='root/etc/sing-box'
+HY_DIR='root/etc/hysteria'
+HY_ACME=HY_DIR + '/acme'
 try: tf=tarfile.open(fn,'r:gz')
 except Exception: raise SystemExit(1)
 seen=set(); total=0
@@ -12901,9 +12958,47 @@ for m in members:
     # links and special members to avoid re-rooting and extraction ambiguity.
     if m.issym() or m.islnk() or m.ischr() or m.isblk() or m.isfifo() or m.isdev(): raise SystemExit(1)
     if not (m.isfile() or m.isdir()): raise SystemExit(1)
-    if m.uid != 0 or m.gid != 0: raise SystemExit(1)
     mode=m.mode & 0o7777
-    if mode & 0o7000 or mode & 0o022: raise SystemExit(1)
+    if mode & 0o7000 or mode & 0o002: raise SystemExit(1)
+    in_sb = n == SB_DIR or n.startswith(SB_DIR + '/')
+    in_hy = n == HY_DIR or n.startswith(HY_DIR + '/')
+    in_hy_acme = n == HY_ACME or n.startswith(HY_ACME + '/')
+    if in_sb:
+        # Sing-box config data may be group-readable by its dedicated runtime
+        # service account. Legacy root:root backups remain valid; runtime-group
+        # ownership is accepted only when the named group exists on this host.
+        if m.uid != 0: raise SystemExit(1)
+        if m.gid == 0:
+            if mode & 0o077: raise SystemExit(1)
+        elif sb_runtime_gid == 0 or m.gid != sb_runtime_gid:
+            raise SystemExit(1)
+        if n == SB_DIR and not ((m.gid == sb_runtime_gid and mode == 0o750) or (m.gid == 0 and (mode & 0o077) == 0)): raise SystemExit(1)
+        if mode & 0o020: raise SystemExit(1)
+    elif in_hy_acme:
+        # Hysteria ACME state is runtime-owned to allow non-root renewal. Only
+        # this subtree may contain runtime-owned members.
+        if hy_runtime_uid == 0 or hy_runtime_gid == 0: raise SystemExit(1)
+        if m.uid not in (0, hy_runtime_uid) or m.gid not in (0, hy_runtime_gid): raise SystemExit(1)
+        if n == HY_ACME:
+            if not m.isdir(): raise SystemExit(1)
+            if not ((m.uid == 0 and m.gid == 0 and (mode & 0o077) == 0) or
+                    (m.uid == 0 and m.gid == hy_runtime_gid and mode == 0o770)): raise SystemExit(1)
+        elif mode & 0o020:
+            raise SystemExit(1)
+    elif in_hy:
+        # Hysteria's top-level config tree is group-readable by its dedicated
+        # runtime account; runtime uid ownership is confined to ACME above.
+        # Legacy root:root backups remain valid for restore compatibility.
+        if m.uid != 0: raise SystemExit(1)
+        if m.gid == 0:
+            if mode & 0o077: raise SystemExit(1)
+        elif hy_runtime_gid == 0 or m.gid != hy_runtime_gid:
+            raise SystemExit(1)
+        if n == HY_DIR and not ((m.gid == hy_runtime_gid and mode == 0o750) or (m.gid == 0 and (mode & 0o077) == 0)): raise SystemExit(1)
+        if mode & 0o020: raise SystemExit(1)
+    else:
+        if m.uid != 0 or m.gid != 0: raise SystemExit(1)
+        if mode & 0o020: raise SystemExit(1)
     if m.isfile():
         if m.size < 0 or m.size > MAX_FILE: raise SystemExit(1)
         total += m.size
@@ -14135,20 +14230,17 @@ generate_qr() {
 
 
 build_hy2_uri_endpoint() {
-    local raw="${HY2_URI_PORTS:-${HY2_BASE_PORT:-443}}" port query_prefix='' range=''
-    if [[ "$raw" =~ ^([0-9]+),([0-9]+-[0-9]+)$ ]]; then
-        port="${BASH_REMATCH[1]}"
-        query_prefix="mport=${BASH_REMATCH[2]}&"
-    else
-        port="$raw"
-        if [[ "${HY2_HOP:-false}" == true && "${HY2_HOP_IMPL:-none}" == manual && "${HY2_RANGE_START:-}" =~ ^[0-9]+$ && "${HY2_RANGE_END:-}" =~ ^[0-9]+$ ]]; then
+    local raw="${HY2_URI_PORTS:-}" range
+    if [[ -z "$raw" ]]; then
+        if [[ "${HY2_HOP:-false}" == true && "${HY2_HOP_IMPL:-none}" == manual && "${HY2_BASE_PORT:-}" =~ ^[0-9]+$ && "${HY2_RANGE_START:-}" =~ ^[0-9]+$ && "${HY2_RANGE_END:-}" =~ ^[0-9]+$ ]]; then
             range="${HY2_RANGE_START}-${HY2_RANGE_END}"
-            [[ "$port" =~ ^[0-9]+$ ]] || return 1
-            query_prefix="mport=${range}&"
+            raw="${HY2_BASE_PORT},${range}"
+        else
+            raw="${HY2_BASE_PORT:-443}"
         fi
     fi
-    [[ "$port" =~ ^[0-9]+$ || "$port" =~ ^[0-9]+-[0-9]+$ ]] || return 1
-    printf '%s\t%s\n' "$port" "$query_prefix"
+    valid_hy2_uri_ports "$raw" || return 1
+    printf '%s\t%s\n' "$raw" ''
 }
 
 
@@ -15468,7 +15560,24 @@ run_self_tests() {
     grep -Eq 'aarch64\|arm64\) XRAY_ARCH=.*SB_ARCH=.*HY2_ARCH' "$0" || { echo 'FAIL: AArch64 architecture selector missing'; failures=$((failures + 1)); }
     ! grep -Eq 'armv8\*\)' "$0" || { echo 'FAIL: 32-bit armv8 wildcard must not map to arm64'; failures=$((failures + 1)); }
     unset _arch_case
-    assert_ok valid_hy2_uri_ports 443,20000-25000
+    for _hy2_uri_case in \
+        443 \
+        20000-25000 \
+        443,8443 \
+        443,20000-25000 \
+        443,20000-25000,30000-30010 \
+        1234,5678,9012 \
+        1234,5000-6000,7044,8000-9000; do
+        assert_ok valid_hy2_uri_ports "$_hy2_uri_case" || { echo "FAIL: HY2 multi-port validator rejected $_hy2_uri_case"; failures=$((failures + 1)); }
+        HY2_URI_PORTS="$_hy2_uri_case"
+        HY2_HOP=false
+        HY2_HOP_IMPL=none
+        if [[ "$(build_hy2_uri_endpoint)" != "$_hy2_uri_case"$'\t' ]]; then
+            echo "FAIL: HY2 URI builder mismatch for $_hy2_uri_case"
+            failures=$((failures + 1))
+        fi
+    done
+    unset _hy2_uri_case HY2_URI_PORTS HY2_HOP HY2_HOP_IMPL
     assert_bad valid_hy2_uri_ports 443,20000:25000
     assert_bad valid_hy2_uri_ports 443,65535-65536
     assert_ok valid_hy2_clash_ports 20000-25000
@@ -15482,12 +15591,14 @@ run_self_tests() {
     _x25519_pair=$'Private key: private-test-2\nPublic key: public-test-2\n'
     [[ "$(parse_x25519_keypair_output "$_x25519_pair")" == $'private-test-2\tpublic-test-2' ]] || { echo 'FAIL: Xray x25519 alternate-label parser'; failures=$((failures + 1)); }
     HY2_URI_PORTS='443,20000-25000'; HY2_HOP=true; HY2_HOP_IMPL=manual
-    [[ "$(build_hy2_uri_endpoint)" == $'443\tmport=20000-25000&' ]] || { echo 'FAIL: legacy/manual HY2 URI endpoint must use mport query'; failures=$((failures + 1)); }
-    HY2_URI_PORTS='443'; HY2_HOP=true; HY2_HOP_IMPL=manual; HY2_RANGE_START=20000; HY2_RANGE_END=25000
-    [[ "$(build_hy2_uri_endpoint)" == $'443\tmport=20000-25000&' ]] || { echo 'FAIL: new manual HY2 URI endpoint must derive mport from persisted range'; failures=$((failures + 1)); }
+    [[ "$(build_hy2_uri_endpoint)" == $'443,20000-25000\t' ]] || { echo 'FAIL: manual HY2 URI endpoint must serialize documented multi-port address directly'; failures=$((failures + 1)); }
+    HY2_URI_PORTS='443'; HY2_HOP=true; HY2_HOP_IMPL=manual; HY2_BASE_PORT=443; HY2_RANGE_START=20000; HY2_RANGE_END=25000
+    [[ "$(build_hy2_uri_endpoint)" == $'443\t' ]] || { echo 'FAIL: explicit persisted HY2 URI port must remain canonical'; failures=$((failures + 1)); }
+    unset HY2_URI_PORTS
+    [[ "$(build_hy2_uri_endpoint)" == $'443,20000-25000\t' ]] || { echo 'FAIL: manual HY2 URI endpoint must derive combined documented multi-port address'; failures=$((failures + 1)); }
     HY2_URI_PORTS='20000-25000'; HY2_HOP=true; HY2_HOP_IMPL=official
     [[ "$(build_hy2_uri_endpoint)" == $'20000-25000\t' ]] || { echo 'FAIL: official HY2 URI endpoint must preserve port range'; failures=$((failures + 1)); }
-    unset HY2_URI_PORTS HY2_HOP HY2_HOP_IMPL HY2_RANGE_START HY2_RANGE_END
+    unset HY2_URI_PORTS HY2_HOP HY2_HOP_IMPL HY2_RANGE_START HY2_RANGE_END HY2_BASE_PORT
     ( ip() { printf '%s\n' '8.8.8.8 dev wg0 src 192.0.2.2'; }; default_route_uses_warp ) || { echo 'FAIL: overlay default-route detector'; failures=$((failures + 1)); }
     ( ip() { printf '%s\n' '8.8.8.8 dev CloudflareWARP src 192.0.2.2'; }; default_route_uses_warp ) || { echo 'FAIL: CloudflareWARP default-route detector'; failures=$((failures + 1)); }
     ! ( ip() { printf '%s\n' '8.8.8.8 dev eth0 src 192.0.2.2'; }; default_route_uses_warp ) || { echo 'FAIL: ordinary default-route detector false positive'; failures=$((failures + 1)); }
@@ -15668,6 +15779,45 @@ PY_SELFTEST_ARCHIVE_CREATE
     assert_ok create_backup_manifest "$tmp/archive-good" "$tmp/archive-good/meta/manifest.sha256"
     tar -C "$tmp/archive-good" --owner=0 --group=0 --numeric-owner -czf "$tmp/good.tar.gz" root meta
     assert_ok validate_backup_archive "$tmp/good.tar.gz"
+    if (( EUID == 0 )) && id nobody >/dev/null 2>&1 && getent group nogroup >/dev/null 2>&1; then
+        old_hy_user="$ABOX_RUNTIME_HYSTERIA_USER"
+        old_hy_group="$ABOX_RUNTIME_HYSTERIA_GROUP"
+        ABOX_RUNTIME_HYSTERIA_USER=nobody
+        ABOX_RUNTIME_HYSTERIA_GROUP=nogroup
+        acme_runtime_fixture="$tmp/archive-acme-runtime"
+        mkdir -p "$acme_runtime_fixture/root/etc/ddr" "$acme_runtime_fixture/root/etc/hysteria/acme" "$acme_runtime_fixture/meta"
+        printf '%s\n' 'CORE=hysteria' > "$acme_runtime_fixture/root/etc/ddr/.env"
+        printf '%s\n' 'ACME-CERT' > "$acme_runtime_fixture/root/etc/hysteria/acme/fullchain.pem"
+        printf '%s\n' 'A-Box backup manifest v3' > "$acme_runtime_fixture/meta/manifest.version"
+        : > "$acme_runtime_fixture/meta/managed-paths.txt"
+        : > "$acme_runtime_fixture/meta/services.state"
+        printf '%s\n' iptables > "$acme_runtime_fixture/meta/firewall.backend"
+        : > "$acme_runtime_fixture/meta/iptables.snapshot"
+        : > "$acme_runtime_fixture/meta/ip6tables.snapshot"
+        : > "$acme_runtime_fixture/meta/cron.abox.txt"
+        chown root:nogroup "$acme_runtime_fixture/root/etc/hysteria" "$acme_runtime_fixture/root/etc/hysteria/acme"
+        chmod 750 "$acme_runtime_fixture/root/etc/hysteria"
+        chmod 770 "$acme_runtime_fixture/root/etc/hysteria/acme"
+        chown nobody:nogroup "$acme_runtime_fixture/root/etc/hysteria/acme/fullchain.pem"
+        chmod 600 "$acme_runtime_fixture/root/etc/hysteria/acme/fullchain.pem"
+        create_backup_manifest "$acme_runtime_fixture" "$acme_runtime_fixture/meta/manifest.sha256" || { echo 'FAIL: ACME runtime fixture manifest creation'; failures=$((failures + 1)); }
+        tar -C "$acme_runtime_fixture" --numeric-owner -czf "$tmp/acme-runtime-good.tar.gz" root meta
+        assert_ok validate_backup_archive "$tmp/acme-runtime-good.tar.gz" || { echo 'FAIL: legal Hysteria ACME runtime-owned backup rejected'; failures=$((failures + 1)); }
+        python3 - "$tmp/acme-runtime-good.tar.gz" <<'PY_TAMPER_ACME' >/dev/null 2>&1
+import os,sys,tarfile
+arc=sys.argv[1]; out=arc+'.bad'
+with tarfile.open(arc,'r:gz') as inp, tarfile.open(out,'w:gz') as outfp:
+    for m in inp.getmembers():
+        if m.name=='root/etc/hysteria/acme/fullchain.pem': m.uid=12345; m.gid=12345
+        outfp.addfile(m, inp.extractfile(m) if m.isfile() else None)
+os.replace(out,arc)
+PY_TAMPER_ACME
+        assert_bad validate_backup_archive "$tmp/acme-runtime-good.tar.gz"
+        ABOX_RUNTIME_HYSTERIA_USER="$old_hy_user"
+        ABOX_RUNTIME_HYSTERIA_GROUP="$old_hy_group"
+        unset old_hy_user old_hy_group
+    fi
+
     mkdir -p "$tmp/archive-bad/root/etc/ddr" "$tmp/archive-bad/meta"
     ln -s ../../../../etc/shadow "$tmp/archive-bad/root/etc/ddr/escape"
     tar -C "$tmp/archive-bad" --owner=0 --group=0 --numeric-owner -czf "$tmp/bad.tar.gz" root meta
@@ -15762,6 +15912,27 @@ EOF_SELFTEST_IPT
     [[ "$(cat "$tmp/sing-box/sentinel.txt" 2>/dev/null)" == 'sentinel' ]] || { echo 'FAIL: Sing-box config generation followed a predictable temp-file symlink'; failures=$((failures + 1)); }
     [[ -L "$tmp/sing-box/config.json.tmp.$$" ]] || { echo 'FAIL: Sing-box config generation touched the predictable temp symlink'; failures=$((failures + 1)); }
     rm -f "$tmp/sing-box/config.json.tmp.$$"
+    # Parent-directory traversal regression for the dedicated runtime user.
+    if (( EUID == 0 )) && id nobody >/dev/null 2>&1 && getent group nogroup >/dev/null 2>&1 && command -v runuser >/dev/null 2>&1; then
+        runtime_traverse=$(mktemp -d /tmp/A-Box-runtime-traverse.XXXXXX) || { echo 'FAIL: runtime traversal regression temp creation'; failures=$((failures + 1)); }
+        chmod 755 "$runtime_traverse"
+        mkdir -p "$runtime_traverse/sing-box" "$runtime_traverse/hysteria"
+        printf '%s\n' runtime-readable > "$runtime_traverse/sing-box/config.json"
+        printf '%s\n' runtime-readable > "$runtime_traverse/hysteria/config.yaml"
+        chown root:root "$runtime_traverse/sing-box" "$runtime_traverse/hysteria"
+        chmod 700 "$runtime_traverse/sing-box" "$runtime_traverse/hysteria"
+        chown root:nogroup "$runtime_traverse/sing-box/config.json" "$runtime_traverse/hysteria/config.yaml"
+        chmod 640 "$runtime_traverse/sing-box/config.json" "$runtime_traverse/hysteria/config.yaml"
+        runuser -u nobody -- cat "$runtime_traverse/sing-box/config.json" >/dev/null 2>&1 && { echo 'FAIL: 0700 Sing-box parent directory was readable by runtime user'; failures=$((failures + 1)); }
+        runuser -u nobody -- cat "$runtime_traverse/hysteria/config.yaml" >/dev/null 2>&1 && { echo 'FAIL: 0700 Hysteria parent directory was readable by runtime user'; failures=$((failures + 1)); }
+        chown root:nogroup "$runtime_traverse/sing-box" "$runtime_traverse/hysteria"
+        chmod 750 "$runtime_traverse/sing-box" "$runtime_traverse/hysteria"
+        runuser -u nobody -- cat "$runtime_traverse/sing-box/config.json" >/dev/null 2>&1 || { echo 'FAIL: 0750 Sing-box parent directory blocked runtime user'; failures=$((failures + 1)); }
+        runuser -u nobody -- cat "$runtime_traverse/hysteria/config.yaml" >/dev/null 2>&1 || { echo 'FAIL: 0750 Hysteria parent directory blocked runtime user'; failures=$((failures + 1)); }
+    fi
+    [[ -n "${runtime_traverse:-}" ]] && rm -rf -- "$runtime_traverse"
+    unset runtime_traverse
+
     jq empty "$tmp/sing-box/config.json" >/dev/null 2>&1 || { echo 'FAIL: build_singbox_config JSON'; failures=$((failures + 1)); }
     [[ "$(stat -c %a "$tmp/sing-box/config.json" 2>/dev/null)" == '600' ]] || { echo 'FAIL: Sing-box config permissions must be 0600'; failures=$((failures + 1)); }
     jq -e '.inbounds[] | select(.type=="shadowsocks" and .listen_port==2053 and (.network|not))' "$tmp/sing-box/config.json" >/dev/null 2>&1 || { echo 'FAIL: Sing-box SS-2022 2053 default network'; failures=$((failures + 1)); }
