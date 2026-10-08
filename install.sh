@@ -12811,154 +12811,13 @@ export_backup_recovery_key() {
 }
 
 validate_legacy_backup_archive() {
-    local archive="$1"
-    [[ -s "$archive" ]] || return 1
-    python3 - "$archive" <<'PY_LEGACY_VALIDATE'
-import posixpath, stat, sys, tarfile
-fn=sys.argv[1]; max_members=10000; max_file=512*1024*1024; max_total=1024*1024*1024
-allowed_prefixes=(
- 'root/etc/ddr','root/usr/local/bin/sb','root/usr/local/bin/xray','root/usr/local/bin/sing-box','root/usr/local/bin/hysteria',
- 'root/usr/local/etc/xray','root/usr/local/share/xray','root/etc/sing-box','root/etc/hysteria','root/etc/logrotate.d/A-Box',
- 'root/etc/fail2ban/filter.d/A-Box.conf','root/etc/fail2ban/jail.d/A-Box.local','root/etc/systemd/system/xray.service',
- 'root/etc/systemd/system/sing-box.service','root/etc/systemd/system/hysteria.service','root/etc/init.d/xray','root/etc/init.d/sing-box',
- 'root/etc/init.d/hysteria','meta/metadata.txt','meta/cron.abox.txt','meta/iptables.snapshot','meta/ip6tables.snapshot')
-def allowed(n):
- if n in {'root','root/etc','root/usr','root/usr/local','root/usr/local/bin','root/usr/local/etc','root/usr/local/share','root/etc/logrotate.d','root/etc/fail2ban','root/etc/fail2ban/filter.d','root/etc/fail2ban/jail.d','root/etc/systemd','root/etc/systemd/system','root/etc/init.d','root/etc/ddr','meta'}: return True
- prefix='root/etc/ddr/'
- if n.startswith(prefix):
-  rel=n[len(prefix):]
-  if '/' in rel or not rel: return False
-  exact={'.env','.firewall-native.rules','.lang','.desired_state','.traffic-block-state','.A-Box-owner','.public_ip.cache','.backup-hmac.key','.runtime.lock','.managed-core-files.tsv','A-Box.sh','socket_probe.sh','geo_update.sh','traffic_monitor.sh','firewall_restore.sh','iptables.v4','iptables.v6','A-Box-sni-full.tsv','A-Box-sni-mini.tsv'}
-  return rel in exact or rel.startswith('.deps.v')
- return any(n==x or n.startswith(x+'/') for x in allowed_prefixes if x!='root/etc/ddr')
-try: tf=tarfile.open(fn,'r:gz')
-except Exception: raise SystemExit(1)
-members=tf.getmembers(); seen=set(); total=0
-if len(members)>max_members: raise SystemExit(1)
-for m in members:
- raw=m.name
- while raw.startswith('./'): raw=raw[2:]
- n=posixpath.normpath(raw)
- if n in ('','.'): continue
- if raw.startswith('/') or n=='..' or n.startswith('../') or not allowed(n): raise SystemExit(1)
- if n in seen and not m.isdir(): raise SystemExit(1)
- seen.add(n)
- if m.issym() or m.islnk() or m.ischr() or m.isblk() or m.isfifo() or m.isdev(): raise SystemExit(1)
- if not (m.isfile() or m.isdir()) or m.uid!=0 or m.gid!=0: raise SystemExit(1)
- mode=m.mode & 0o7777
- if mode & 0o7000 or mode & 0o022: raise SystemExit(1)
- if m.isfile():
-  if m.size<0 or m.size>max_file: raise SystemExit(1)
-  total+=m.size
-  if total>max_total: raise SystemExit(1)
-if 'root/etc/ddr' not in seen or 'meta/metadata.txt' not in seen: raise SystemExit(1)
-if 'meta/manifest.version' in seen: raise SystemExit(1)
-PY_LEGACY_VALIDATE
-}
-
-convert_legacy_backup_archive() {
-    local selected="$1" out_dir="${2:-$(dirname "$1")}" work root out answer unit srv path
-    [[ -f "$selected" && ! -L "$selected" ]] || die 'Legacy backup path is invalid.'
-    if [[ -f "${selected}.sha256" && ! -L "${selected}.sha256" ]]; then
-        backup_checksum_verify "$selected" "${selected}.sha256" || die 'Legacy backup SHA256 verification failed.'
-    else
-        [[ -t 0 ]] || die 'Legacy backup has no checksum and conversion is non-interactive.'
-        confirm_yes_no 'Legacy backup has no trusted checksum. Import anyway? [Y/N]: ' || return 130
-    fi
-    validate_legacy_backup_archive "$selected" || die 'Legacy backup archive safety validation failed.'
-    work=$(mktemp -d /tmp/A-Box-legacy-import.XXXXXX) || die 'Legacy conversion temp directory failed.'
-    chmod 700 "$work"
-    python3 - "$selected" "$work" <<'PY_LEGACY_EXTRACT'
-import os, pathlib, tarfile, sys
-src,dst=sys.argv[1:]; base=pathlib.Path(dst).resolve()
-with tarfile.open(src,'r:gz') as tf:
- for m in tf.getmembers():
-  name=m.name
-  while name.startswith('./'): name=name[2:]
-  if not name or name=='.': continue
-  target=(base/name).resolve()
-  if base not in target.parents and target!=base: raise SystemExit(1)
-  if m.isdir(): target.mkdir(parents=True,exist_ok=True); os.chmod(target,m.mode & 0o777)
-  elif m.isfile():
-   target.parent.mkdir(parents=True,exist_ok=True)
-   f=tf.extractfile(m)
-   if f is None: raise SystemExit(1)
-   with open(target,'wb') as out:
-    while True:
-     chunk=f.read(1024*1024)
-     if not chunk: break
-     out.write(chunk)
-   os.chmod(target,m.mode & 0o777)
-  else: raise SystemExit(1)
-PY_LEGACY_EXTRACT
-    root="$work/root"
-    rm -rf -- "$root$ABOX_DIR/backups" "$root$ABOX_DIR/diagnostics" "$root$ABOX_DIR/preflight"
-    rm -f -- "$root$ABOX_DIR/A-Box.sh" "$root$ABOX_DIR/.backup-hmac.key" "$root$ABOX_DIR/.runtime.lock" \
-        "$root$ABOX_DIR/socket_probe.sh" "$root$ABOX_DIR/geo_update.sh" "$root$ABOX_DIR/traffic_monitor.sh" "$root$ABOX_DIR/firewall_restore.sh" \
-        "$root$ABOX_DIR/iptables.v4" "$root$ABOX_DIR/iptables.v6" "$root$ABOX_DIR/.managed-core-files.tsv" "$root$ABOX_DIR/.public_ip.cache"
-    find "$root$ABOX_DIR" -maxdepth 1 -type f -name '.deps.v*' -delete 2>/dev/null || true
-    install -d -m 700 "$root$ABOX_DIR" "$work/meta" || { rm -rf "$work"; die 'Legacy conversion directory normalization failed.'; }
-    printf '%s\n' 'A-Box managed directory v1' > "$root$ABOX_DIR/.A-Box-owner"
-    chmod 600 "$root$ABOX_DIR/.A-Box-owner"
-    for srv in xray sing-box hysteria; do
-        for unit in "$root/etc/systemd/system/${srv}.service" "$root/etc/init.d/${srv}"; do
-            [[ -e "$unit" ]] || continue
-            [[ -f "$unit" && ! -L "$unit" ]] || { rm -rf "$work"; die "Legacy service member is not a regular file: $unit"; }
-            case "$srv" in
-                xray) grep -Fq '/usr/local/bin/xray' "$unit" && grep -Fq '/usr/local/etc/xray/config.json' "$unit" || { rm -rf "$work"; die 'Legacy Xray unit fingerprint rejected.'; } ;;
-                sing-box) grep -Fq '/usr/local/bin/sing-box' "$unit" && grep -Fq '/etc/sing-box/config.json' "$unit" || { rm -rf "$work"; die 'Legacy sing-box unit fingerprint rejected.'; } ;;
-                hysteria) grep -Fq '/usr/local/bin/hysteria' "$unit" && grep -Fq '/etc/hysteria/config.yaml' "$unit" || { rm -rf "$work"; die 'Legacy Hysteria unit fingerprint rejected.'; } ;;
-            esac
-            if ! grep -Fxq '# Managed by A-Box' "$unit"; then
-                if head -n 1 "$unit" | grep -q '^#!'; then sed -i '1a# Managed by A-Box' "$unit"; else sed -i '1i# Managed by A-Box' "$unit"; fi
-            fi
-        done
-    done
-    [[ -f "$work/meta/cron.abox.txt" ]] || : > "$work/meta/cron.abox.txt"
-    validate_abox_cron_file "$work/meta/cron.abox.txt" || { rm -rf "$work"; die 'Legacy cron block is not compatible with the strict importer.'; }
-    [[ -f "$work/meta/iptables.snapshot" ]] || : > "$work/meta/iptables.snapshot"
-    [[ -f "$work/meta/ip6tables.snapshot" ]] || : > "$work/meta/ip6tables.snapshot"
-    printf 'iptables\n' > "$work/meta/firewall.backend"
-    : > "$work/meta/services.state"
-    for srv in xray sing-box hysteria; do
-        if backup_root_contains_service "$root" "$srv"; then printf '%s|0|0\n' "$srv" >> "$work/meta/services.state"; fi
-    done
-    { managed_auxiliary_paths; printf '%s\n' \
-        /usr/local/bin/xray /usr/local/etc/xray /usr/local/share/xray /etc/systemd/system/xray.service /etc/init.d/xray /etc/conf.d/xray \
-        /usr/local/bin/sing-box /etc/sing-box /etc/systemd/system/sing-box.service /etc/init.d/sing-box /etc/conf.d/sing-box \
-        /usr/local/bin/hysteria /etc/hysteria /etc/systemd/system/hysteria.service /etc/init.d/hysteria /etc/conf.d/hysteria; } | \
-        while IFS= read -r path; do [[ -e "$root$path" ]] && printf '%s\n' "$path"; done | awk 'NF && !seen[$0]++' > "$work/meta/managed-paths.txt"
-    local legacy_aux_paths=''
-    legacy_aux_paths=$(managed_auxiliary_paths) || { rm -rf "$work"; die 'Legacy auxiliary path enumeration failed.'; }
-    while IFS= read -r path; do
-        [[ -e "$root$path" ]] || continue
-        auxiliary_content_is_abox_managed "$root$path" "$path" || { rm -rf "$work"; die "Legacy auxiliary path fingerprint rejected: $path"; }
-        if ! grep -Fxq '# Managed by A-Box' "$root$path" 2>/dev/null; then
-            if head -n 1 "$root$path" | grep -q '^#!'; then sed -i '1a# Managed by A-Box' "$root$path"; else sed -i '1i# Managed by A-Box' "$root$path"; fi
-        fi
-    done <<< "$legacy_aux_paths"
-    printf '%s\n' 'A-Box backup manifest v3' > "$work/meta/manifest.version"
-    printf '\nConverted by %s from legacy archive: %s\n' "$ABOX_BUILD" "$(basename "$selected")" >> "$work/meta/metadata.txt"
-    create_backup_manifest "$work" "$work/meta/manifest.sha256" || { rm -rf "$work"; die 'Converted manifest creation failed.'; }
-    install -d -m 700 "$out_dir" || { rm -rf "$work"; die 'Legacy conversion output directory failed.'; }
-    out="$out_dir/$(basename "${selected%.tar.gz}")-v3-imported.tar.gz"
-    [[ ! -e "$out" && ! -L "$out" ]] || { rm -rf "$work"; die "Converted backup already exists: $out"; }
-    tar -C "$work" -czf "$out" root meta || { rm -rf "$work"; rm -f "$out"; die 'Converted backup archive creation failed.'; }
-    chmod 600 "$out"
-    validate_backup_archive "$out" || { rm -rf "$work"; rm -f "$out"; die 'Converted backup failed v3 structure validation.'; }
-    backup_checksum_write "$out" && backup_auth_write "$out" || { rm -rf "$work"; rm -f "$out" "${out}.sha256" "${out}.hmac"; die 'Converted backup authentication failed.'; }
-    rm -rf "$work"
-    msg "${GREEN}[*] Legacy backup converted safely:${NC} $out"
-    msg "${YELLOW}[*] Services are imported as stopped; review configuration before starting them.${NC}"
-}
-
-
+validate_backup_archive() {
     local archive="$1"
     [[ -s "$archive" ]] || return 1
     command -v python3 >/dev/null 2>&1 || return 1
-    # Runtime uid/gid numbers belong to the source host and are not portable.
-    # The authenticated archive is validated structurally here; restore-time
-    # ownership is canonicalized to the target host runtime identities.
+    # Runtime uid/gid values in an authenticated backup belong to the source
+    # host and are not portable. Restore canonicalizes runtime ownership on
+    # the target host before any managed service is started.
     python3 - "$archive" <<'PY_VALIDATE'
 import posixpath,stat,sys,tarfile
 fn=sys.argv[1]
@@ -12982,7 +12841,7 @@ for m in members:
     if n=='..' or n.startswith('../') or n.split('/',1)[0] not in ('root','meta'): raise SystemExit(1)
     if n in seen and not m.isdir(): raise SystemExit(1)
     seen.add(n)
-    # Backup contents are copied regular files/directories only.  Reject all
+    # Backup contents are copied regular files/directories only. Reject all
     # links and special members to avoid re-rooting and extraction ambiguity.
     if m.issym() or m.islnk() or m.ischr() or m.isblk() or m.isfifo() or m.isdev(): raise SystemExit(1)
     if not (m.isfile() or m.isdir()): raise SystemExit(1)
@@ -12992,19 +12851,13 @@ for m in members:
     in_hy = n == HY_DIR or n.startswith(HY_DIR + '/')
     in_hy_acme = n == HY_ACME or n.startswith(HY_ACME + '/')
     if in_sb:
-        # Sing-box config data may be group-readable by its dedicated runtime
-        # service account. Legacy root:root backups remain valid; runtime-group
-        # ownership is accepted only when the named group exists on this host.
         if m.uid != 0: raise SystemExit(1)
         if m.gid == 0:
             if mode & 0o077: raise SystemExit(1)
-        elif mode & 0o020: raise SystemExit(1)
+        elif mode & 0o020:
             raise SystemExit(1)
         if n == SB_DIR and not ((m.gid != 0 and mode == 0o750) or (m.gid == 0 and (mode & 0o077) == 0)): raise SystemExit(1)
-        if mode & 0o020: raise SystemExit(1)
     elif in_hy_acme:
-        # Hysteria ACME state is runtime-owned to allow non-root renewal. Only
-        # this subtree may contain runtime-owned members.
         if n == HY_ACME:
             if m.uid != 0 or not m.isdir(): raise SystemExit(1)
             if not ((m.gid != 0 and mode == 0o770) or
@@ -13012,16 +12865,12 @@ for m in members:
         elif mode & 0o020:
             raise SystemExit(1)
     elif in_hy:
-        # Hysteria's top-level config tree is group-readable by its dedicated
-        # runtime account; runtime uid ownership is confined to ACME above.
-        # Legacy root:root backups remain valid for restore compatibility.
         if m.uid != 0: raise SystemExit(1)
         if m.gid == 0:
             if mode & 0o077: raise SystemExit(1)
-        elif mode & 0o020: raise SystemExit(1)
+        elif mode & 0o020:
             raise SystemExit(1)
         if n == HY_DIR and not ((m.gid != 0 and mode == 0o750) or (m.gid == 0 and (mode & 0o077) == 0)): raise SystemExit(1)
-        if mode & 0o020: raise SystemExit(1)
     else:
         if m.uid != 0 or m.gid != 0: raise SystemExit(1)
         if mode & 0o020: raise SystemExit(1)
