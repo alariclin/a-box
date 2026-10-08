@@ -12953,14 +12953,15 @@ PY_LEGACY_EXTRACT
 }
 
 
-validate_backup_archive() {
     local archive="$1"
-    local sb_runtime_gid=0 hy_runtime_uid=0 hy_runtime_gid=0
     [[ -s "$archive" ]] || return 1
     command -v python3 >/dev/null 2>&1 || return 1
+    # Runtime uid/gid numbers belong to the source host and are not portable.
+    # The authenticated archive is validated structurally here; restore-time
+    # ownership is canonicalized to the target host runtime identities.
     python3 - "$archive" <<'PY_VALIDATE'
 import posixpath,stat,sys,tarfile
-hy_runtime_uid=int(sys.argv[3]); hy_runtime_gid=int(sys.argv[4])
+fn=sys.argv[1]
 MAX_MEMBERS=10000
 MAX_FILE=512*1024*1024
 MAX_TOTAL=1024*1024*1024
