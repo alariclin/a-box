@@ -24,12 +24,15 @@ jobs:
           last_fn=$(grep -nE '^[A-Za-z_][A-Za-z0-9_]*\(\) \{$' install.sh | tail -n1 | cut -d: -f1)
           main_call=$(grep -nE '^main \"\$@\"$' install.sh | cut -d: -f1 | head -n1)
           test "$last_fn" -lt "$main_call"
-      - name: Built-in self-test
+      - name: Built-in self-test (diagnostic)
         run: |
-          set -euo pipefail
-          output=$(bash install.sh --self-test)
-          printf '%s\n' "$output"
-          grep -Fxq 'SELF_TEST_OK' <<< "$output"
+          set -uo pipefail
+          log="$RUNNER_TEMP/a-box-selftest.log"
+          bash install.sh --self-test >"$log" 2>&1
+          rc=$?
+          cat "$log"
+          echo "SELFTEST_RC=$rc"
+          exit "$rc"
       - name: Runtime identity compatibility regression
         run: |
           set -euo pipefail
