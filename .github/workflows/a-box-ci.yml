@@ -15,9 +15,21 @@ jobs:
       - uses: actions/checkout@v4
       - name: Bash syntax
         run: bash -n install.sh
+      - name: Entrypoint integrity regression
+        run: |
+          set -euo pipefail
+          test "$(grep -Ec '^main\(\) \{$' install.sh)" -eq 1
+          test "$(grep -Ec '^main \"\$@\"$' install.sh)" -eq 1
+          grep -Eq '^run_self_tests\(\) \{$' install.sh
+          last_fn=$(grep -nE '^[A-Za-z_][A-Za-z0-9_]*\(\) \{$' install.sh | tail -n1 | cut -d: -f1)
+          main_call=$(grep -nE '^main \"\$@\"$' install.sh | cut -d: -f1 | head -n1)
+          test "$last_fn" -lt "$main_call"
       - name: Built-in self-test
-        run: bash install.sh --self-test
-      - name: Release metadata regression
+        run: |
+          set -euo pipefail
+          output=$(bash install.sh --self-test)
+          printf '%s\n' "$output"
+          grep -Fxq 'SELF_TEST_OK' <<< "$output"
         run: |
           grep -Eq "^ABOX_BUILD='[^']+'$" install.sh
           grep -Eq '^ABOX_BUILD_EPOCH=[0-9]+$' install.sh
