@@ -12958,20 +12958,8 @@ validate_backup_archive() {
     local sb_runtime_gid=0 hy_runtime_uid=0 hy_runtime_gid=0
     [[ -s "$archive" ]] || return 1
     command -v python3 >/dev/null 2>&1 || return 1
-    if getent group "$ABOX_RUNTIME_SINGBOX_GROUP" >/dev/null 2>&1; then
-        sb_runtime_gid=$(getent group "$ABOX_RUNTIME_SINGBOX_GROUP" 2>/dev/null | awk -F: '{print $3}')
-    fi
-    if getent passwd "$ABOX_RUNTIME_HYSTERIA_USER" >/dev/null 2>&1; then
-        hy_runtime_uid=$(id -u "$ABOX_RUNTIME_HYSTERIA_USER" 2>/dev/null || printf '0')
-    fi
-    if getent group "$ABOX_RUNTIME_HYSTERIA_GROUP" >/dev/null 2>&1; then
-        hy_runtime_gid=$(getent group "$ABOX_RUNTIME_HYSTERIA_GROUP" 2>/dev/null | awk -F: '{print $3}')
-    fi
-    [[ "$sb_runtime_gid" =~ ^[0-9]+$ && "$hy_runtime_uid" =~ ^[0-9]+$ && "$hy_runtime_gid" =~ ^[0-9]+$ ]] || return 1
-    python3 - "$archive" "$sb_runtime_gid" "$hy_runtime_uid" "$hy_runtime_gid" <<'PY_VALIDATE'
+    python3 - "$archive" <<'PY_VALIDATE'
 import posixpath,stat,sys,tarfile
-fn=sys.argv[1]
-sb_runtime_gid=int(sys.argv[2])
 hy_runtime_uid=int(sys.argv[3]); hy_runtime_gid=int(sys.argv[4])
 MAX_MEMBERS=10000
 MAX_FILE=512*1024*1024
@@ -13009,19 +12997,17 @@ for m in members:
         if m.uid != 0: raise SystemExit(1)
         if m.gid == 0:
             if mode & 0o077: raise SystemExit(1)
-        elif sb_runtime_gid == 0 or m.gid != sb_runtime_gid:
+        elif mode & 0o020: raise SystemExit(1)
             raise SystemExit(1)
-        if n == SB_DIR and not ((m.gid == sb_runtime_gid and mode == 0o750) or (m.gid == 0 and (mode & 0o077) == 0)): raise SystemExit(1)
+        if n == SB_DIR and not ((m.gid != 0 and mode == 0o750) or (m.gid == 0 and (mode & 0o077) == 0)): raise SystemExit(1)
         if mode & 0o020: raise SystemExit(1)
     elif in_hy_acme:
         # Hysteria ACME state is runtime-owned to allow non-root renewal. Only
         # this subtree may contain runtime-owned members.
-        if (m.uid != 0 or m.gid != 0) and (hy_runtime_uid == 0 or hy_runtime_gid == 0): raise SystemExit(1)
-        if m.uid not in (0, hy_runtime_uid) or m.gid not in (0, hy_runtime_gid): raise SystemExit(1)
         if n == HY_ACME:
-            if not m.isdir(): raise SystemExit(1)
-            if not ((m.uid == 0 and m.gid == 0 and (mode & 0o077) == 0) or
-                    (m.uid == 0 and m.gid == hy_runtime_gid and mode == 0o770)): raise SystemExit(1)
+            if m.uid != 0 or not m.isdir(): raise SystemExit(1)
+            if not ((m.gid != 0 and mode == 0o770) or
+                    (m.gid == 0 and (mode & 0o077) == 0)): raise SystemExit(1)
         elif mode & 0o020:
             raise SystemExit(1)
     elif in_hy:
@@ -13031,9 +13017,9 @@ for m in members:
         if m.uid != 0: raise SystemExit(1)
         if m.gid == 0:
             if mode & 0o077: raise SystemExit(1)
-        elif hy_runtime_gid == 0 or m.gid != hy_runtime_gid:
+        elif mode & 0o020: raise SystemExit(1)
             raise SystemExit(1)
-        if n == HY_DIR and not ((m.gid == hy_runtime_gid and mode == 0o750) or (m.gid == 0 and (mode & 0o077) == 0)): raise SystemExit(1)
+        if n == HY_DIR and not ((m.gid != 0 and mode == 0o750) or (m.gid == 0 and (mode & 0o077) == 0)): raise SystemExit(1)
         if mode & 0o020: raise SystemExit(1)
     else:
         if m.uid != 0 or m.gid != 0: raise SystemExit(1)
@@ -13287,11 +13273,42 @@ restore_abox_directory() {
     ensure_abox_dir_owned "$ABOX_DIR" || return 1
 }
 
+normalize_restored_runtime_ownership() {
+    local family="$1" user group
+    IFS=$'\t' read -r user group < <(abox_runtime_identity "$family") || return 1
+    ensure_abox_runtime_identity "$family" || return 1
+    case "$family" in
+        sing-box)
+            [[ -d /etc/sing-box && ! -L /etc/sing-box ]] || return 1
+            chown -R "root:$group" /etc/sing-box || return 1
+            ;;
+        hysteria)
+            [[ -d /etc/hysteria && ! -L /etc/hysteria ]] || return 1
+            chown -R "root:$group" /etc/hysteria || return 1
+            if [[ -d /etc/hysteria/acme ]]; then
+                [[ ! -L /etc/hysteria/acme ]] || return 1
+                chown -R "$user:$group" /etc/hysteria/acme || return 1
+                if [[ -f /etc/hysteria/acme/.A-Box-managed ]]; then
+                    chown root:root /etc/hysteria/acme/.A-Box-managed || return 1
+                    chmod 600 /etc/hysteria/acme/.A-Box-managed || return 1
+                fi
+                chown "root:$group" /etc/hysteria/acme || return 1
+            fi
+            ;;
+        xray)
+            [[ -d /usr/local/etc/xray && ! -L /usr/local/etc/xray ]] || return 1
+            chown -R root:root /usr/local/etc/xray || return 1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 regenerate_runtime_assets_after_restore() {
     clear_abox_env_vars
     load_abox_env "$ABOX_ENV" || return 1
     for srv in xray sing-box hysteria; do
         abox_owns_service "$srv" || continue
+        normalize_restored_runtime_ownership "$srv" || return 1
         prepare_abox_runtime_permissions "$srv" || return 1
     done
     setup_shortcut || return 1
