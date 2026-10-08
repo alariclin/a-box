@@ -14592,9 +14592,14 @@ region_state_get() {
 
 
 region_validate_timezone() {
-    local tz="$1"
+    local tz="$1" path resolved
     [[ "$tz" == UTC || "$tz" == GMT || "$tz" =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+@-]+)+$ ]] || return 1
-    [[ -f "/usr/share/zoneinfo/$tz" && ! -L "/usr/share/zoneinfo/$tz" ]]
+    path="/usr/share/zoneinfo/$tz"
+    [[ -f "$path" ]] || return 1
+    resolved=$(readlink -f -- "$path" 2>/dev/null) || return 1
+    [[ "$resolved" == /usr/share/zoneinfo/* && -f "$resolved" && ! -L "$resolved" ]] || return 1
+}
+
 }
 
 
