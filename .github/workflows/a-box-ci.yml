@@ -26,11 +26,12 @@ jobs:
           test "$last_fn" -lt "$main_call"
       - name: Built-in self-test (trace diagnostic)
         run: |
+          set +e
           set -uo pipefail
           log="$RUNNER_TEMP/a-box-selftest.log"
           bash -x install.sh --self-test >"$log" 2>&1
           rc=$?
-          tail -n 250 "$log" || true
+          tail -n 350 "$log" || true
           echo "SELFTEST_RC=$rc"
           exit "$rc"
       - name: Runtime identity compatibility regression
