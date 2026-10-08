@@ -34,11 +34,8 @@ curl -fsSL https://raw.githubusercontent.com/alariclin/a-box/main/install.sh -o 
 
 ### GitHub 访问困难或不稳定时的备用镜像（第三方）
 
-```bash
-curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/alariclin/a-box/main/install.sh -o A-Box.sh && sudo bash A-Box.sh
-```
+不要从第三方镜像获取脚本后直接以 root 执行。受限网络环境请使用可信传输方式获取文件，并在运行前根据官方不可变 commit 或签名 Release 校验下载文件。
 
-仅在 GitHub 官方源无法访问或连接不稳定时使用该第三方镜像；正常情况下请优先使用官方源。安装完成后输入 `sb` 打开菜单。
 
 ## 主要功能
 
