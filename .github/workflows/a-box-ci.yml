@@ -30,6 +30,56 @@ jobs:
           output=$(bash install.sh --self-test)
           printf '%s\n' "$output"
           grep -Fxq 'SELF_TEST_OK' <<< "$output"
+      - name: Runtime identity compatibility regression
+        run: |
+          set -euo pipefail
+          grep -Fq 'need_cmd_pkg groupadd passwd shadow shadow-utils' install.sh
+          grep -Fq 'need_cmd_pkg useradd passwd shadow shadow-utils' install.sh
+          grep -Fq 'deps=(bash curl jq openssl bc unzip iptables tar psmisc lsof ca-certificates iproute2 coreutils cronie logrotate util-linux bind-tools procps iptables-openrc python3 shadow)' install.sh
+          grep -Fq 'addgroup -S "$group"' install.sh
+          grep -Fq 'adduser -S -D -H -s /sbin/nologin -G "$group" "$user"' install.sh
+      - name: Backup portability regression
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          python3 - "$tmp/portable-backup.tar.gz" <<'PY_BACKUP_TEST'
+          import io, tarfile, sys
+          out=sys.argv[1]
+          required={
+              'root/etc/ddr': (True,0,0,0o700,b''),
+              'meta/manifest.version': (False,0,0,0o600,b'A-Box backup manifest v3\n'),
+              'meta/manifest.sha256': (False,0,0,0o600,b'placeholder\n'),
+              'meta/managed-paths.txt': (False,0,0,0o600,b''),
+              'meta/services.state': (False,0,0,0o600,b''),
+              'meta/firewall.backend': (False,0,0,0o600,b'iptables\n'),
+              'meta/iptables.snapshot': (False,0,0,0o600,b''),
+              'meta/ip6tables.snapshot': (False,0,0,0o600,b''),
+              'meta/cron.abox.txt': (False,0,0,0o600,b''),
+              'root/etc/sing-box': (True,0,1234,0o750,b''),
+              'root/etc/sing-box/config.json': (False,0,1234,0o640,b'{}\n'),
+              'root/etc/hysteria': (True,0,2345,0o750,b''),
+              'root/etc/hysteria/config.yaml': (False,0,2345,0o640,b'listen: :443\n'),
+              'root/etc/hysteria/acme': (True,0,2345,0o770,b''),
+              'root/etc/hysteria/acme/account.json': (False,3456,2345,0o640,b'{}\n'),
+          }
+          with tarfile.open(out,'w:gz') as tf:
+              dirs=sorted(k for k,v in required.items() if v[0])
+              files=sorted(k for k,v in required.items() if not v[0])
+              for name in dirs+files:
+                  is_dir,uid,gid,mode,data=required[name]
+                  ti=tarfile.TarInfo(name); ti.uid=uid; ti.gid=gid; ti.mode=mode
+                  if is_dir: ti.type=tarfile.DIRTYPE; ti.size=0
+                  else: ti.size=len(data)
+                  tf.addfile(ti, None if is_dir else io.BytesIO(data))
+          PY_BACKUP_TEST
+          lib=$(mktemp)
+          trap 'rm -f "$lib"; rm -rf "$tmp"' EXIT
+          sed '/^main "\$@"$/d' install.sh > "$lib"
+          # The validator must accept source-host runtime ids; target-host canonicalization occurs during restore.
+          source "$lib"
+          validate_backup_archive "$tmp/portable-backup.tar.gz"
+
       - name: Release metadata regression
         run: |
           set -euo pipefail
