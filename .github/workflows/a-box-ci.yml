@@ -30,7 +30,9 @@ jobs:
           output=$(bash install.sh --self-test)
           printf '%s\n' "$output"
           grep -Fxq 'SELF_TEST_OK' <<< "$output"
+      - name: Release metadata regression
         run: |
+          set -euo pipefail
           grep -Eq "^ABOX_BUILD='[^']+'$" install.sh
           grep -Eq '^ABOX_BUILD_EPOCH=[0-9]+$' install.sh
           grep -Fq "ABOX_XRAY_DEFAULT_VERSION='v26.6.27'" install.sh
