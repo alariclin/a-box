@@ -34,11 +34,8 @@ curl -fsSL https://raw.githubusercontent.com/alariclin/a-box/main/install.sh -o 
 
 ### Fallback mirror for restricted or unreliable GitHub access (third-party)
 
-```bash
-curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/alariclin/a-box/main/install.sh -o A-Box.sh && sudo bash A-Box.sh
-```
+Do not bootstrap or execute A-Box as root from a script obtained through a third-party mirror. For restricted networks, use a trusted transport, then verify the downloaded file against an official immutable commit or signed release before running it.
 
-Use the third-party mirror only when the official GitHub source is unavailable or unreliable. Prefer the official source whenever possible. After installation, run `sb` to open the menu.
 
 ## Main Features
 
