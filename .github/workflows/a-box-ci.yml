@@ -31,7 +31,7 @@ jobs:
           log="$RUNNER_TEMP/a-box-selftest.log"
           bash -x install.sh --self-test >"$log" 2>&1
           rc=$?
-          tail -n 350 "$log" || true
+          grep -n -C 4 -E "FAIL|failures|SELF_TEST" "$log" || true
           echo "SELFTEST_RC=$rc"
           exit "$rc"
       - name: Runtime identity compatibility regression
