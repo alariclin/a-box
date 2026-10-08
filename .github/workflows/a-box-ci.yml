@@ -15,10 +15,67 @@ jobs:
       - uses: actions/checkout@v4
       - name: Bash syntax
         run: bash -n install.sh
+      - name: Entrypoint integrity regression
+        run: |
+          set -euo pipefail
+          test "$(grep -Ec '^main\(\) \{$' install.sh)" -eq 1
+          test "$(grep -Ec '^main \"\$@\"$' install.sh)" -eq 1
+          grep -Eq '^run_self_tests\(\) \{$' install.sh
+          last_fn=$(grep -nE '^[A-Za-z_][A-Za-z0-9_]*\(\) \{$' install.sh | tail -n1 | cut -d: -f1)
+          main_call=$(grep -nE '^main \"\$@\"$' install.sh | cut -d: -f1 | head -n1)
+          test "$last_fn" -lt "$main_call"
       - name: Built-in self-test
-        run: bash install.sh --self-test
+        run: |
+          set -euo pipefail
+          output=$(bash install.sh --self-test)
+          printf '%s\n' "$output"
+          grep -Fxq 'SELF_TEST_OK' <<< "$output"
+      - name: Runtime identity compatibility regression
+        run: |
+          set -euo pipefail
+          grep -Fq 'need_cmd_pkg groupadd passwd shadow shadow-utils' install.sh
+          grep -Fq 'need_cmd_pkg useradd passwd shadow shadow-utils' install.sh
+          grep -Fq 'iptables-openrc python3 shadow)' install.sh
+          grep -Fq 'addgroup -S "$group"' install.sh
+          grep -Fq 'adduser -S -D -H -s /sbin/nologin -G "$group" "$user"' install.sh
+      - name: Backup portability regression
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          python3 - "$tmp/portable-backup.tar.gz" <<'PY_BACKUP_TEST'
+          import io, tarfile, sys
+          out=sys.argv[1]
+          required={
+              'root/etc/ddr': (True,0,0,0o700,b''),
+              'meta/manifest.version': (False,0,0,0o600,b'A-Box backup manifest v3\n'),
+              'meta/manifest.sha256': (False,0,0,0o600,b'placeholder\n'),
+              'meta/managed-paths.txt': (False,0,0,0o600,b''),
+              'meta/services.state': (False,0,0,0o600,b''),
+              'meta/firewall.backend': (False,0,0,0o600,b'iptables\n'),
+              'meta/iptables.snapshot': (False,0,0,0o600,b''),
+              'meta/ip6tables.snapshot': (False,0,0,0o600,b''),
+              'meta/cron.abox.txt': (False,0,0,0o600,b''),
+              'root/etc/sing-box': (True,0,1234,0o750,b''),
+              'root/etc/sing-box/config.json': (False,0,1234,0o640,b'{}\n'),
+              'root/etc/hysteria': (True,0,2345,0o750,b''),
+              'root/etc/hysteria/config.yaml': (False,0,2345,0o640,b'listen: :443\n'),
+              'root/etc/hysteria/acme': (True,0,2345,0o770,b''),
+              'root/etc/hysteria/acme/account.json': (False,3456,2345,0o640,b'{}\n'),
+          }
+          with tarfile.open(out,'w:gz') as tf:
+              for name in sorted(required):
+                  is_dir,uid,gid,mode,data=required[name]
+                  ti=tarfile.TarInfo(name); ti.uid=uid; ti.gid=gid; ti.mode=mode
+                  if is_dir: ti.type=tarfile.DIRTYPE; ti.size=0; tf.addfile(ti)
+                  else: ti.size=len(data); tf.addfile(ti,io.BytesIO(data))
+          PY_BACKUP_TEST
+          sed '/^main "\$@"$/d' install.sh > "$tmp/source.sh"
+          source "$tmp/source.sh"
+          validate_backup_archive "$tmp/portable-backup.tar.gz"
       - name: Release metadata regression
         run: |
+          set -euo pipefail
           grep -Eq "^ABOX_BUILD='[^']+'$" install.sh
           grep -Eq '^ABOX_BUILD_EPOCH=[0-9]+$' install.sh
           grep -Fq "ABOX_XRAY_DEFAULT_VERSION='v26.6.27'" install.sh
