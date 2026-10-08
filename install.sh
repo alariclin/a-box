@@ -1171,7 +1171,7 @@ init_system_environment() {
                 deps=(curl jq openssl bc unzip iptables tar psmisc lsof ca-certificates coreutils cronie logrotate util-linux bind-utils iproute epel-release python3)
                 ;;
             alpine)
-                deps=(bash curl jq openssl bc unzip iptables tar psmisc lsof ca-certificates iproute2 coreutils cronie logrotate util-linux bind-tools procps iptables-openrc python3)
+                deps=(bash curl jq openssl bc unzip iptables tar psmisc lsof ca-certificates iproute2 coreutils cronie logrotate util-linux bind-tools procps iptables-openrc python3 shadow)
                 ;;
         esac
         "${install_cmd[@]}" "${deps[@]}" >/dev/null 2>&1 || die '基础依赖包安装失败。'
@@ -1250,6 +1250,8 @@ ensure_commands() {
     need_cmd_pkg crontab cron cronie cronie
     need_cmd_pkg logrotate logrotate logrotate logrotate
     need_cmd_pkg python3 python3 python3 python3
+    need_cmd_pkg groupadd passwd shadow shadow-utils
+    need_cmd_pkg useradd passwd shadow shadow-utils
     if (( ${#missing_pkgs[@]} > 0 )); then
         local -a unique_pkgs=()
         mapfile -t unique_pkgs < <(printf '%s\n' "${missing_pkgs[@]}" | awk 'NF && !seen[$0]++')
@@ -4474,6 +4476,8 @@ ensure_abox_runtime_identity() {
     getent group "$group" >/dev/null 2>&1 || {
         if command -v groupadd >/dev/null 2>&1; then
             groupadd --system "$group" >/dev/null 2>&1 || getent group "$group" >/dev/null 2>&1 || return 1
+        elif [[ "${release:-}" == "alpine" ]] && command -v addgroup >/dev/null 2>&1; then
+            addgroup -S "$group" >/dev/null 2>&1 || getent group "$group" >/dev/null 2>&1 || return 1
         elif command -v addgroup >/dev/null 2>&1; then
             addgroup --system "$group" >/dev/null 2>&1 || getent group "$group" >/dev/null 2>&1 || return 1
         else
@@ -4483,6 +4487,8 @@ ensure_abox_runtime_identity() {
     if ! getent passwd "$user" >/dev/null 2>&1; then
         if command -v useradd >/dev/null 2>&1; then
             useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --gid "$group" "$user" >/dev/null 2>&1 || return 1
+        elif [[ "${release:-}" == "alpine" ]] && command -v adduser >/dev/null 2>&1; then
+            adduser -S -D -H -s /sbin/nologin -G "$group" "$user" >/dev/null 2>&1 || return 1
         elif command -v adduser >/dev/null 2>&1; then
             adduser --system --no-create-home --home /nonexistent --shell /sbin/nologin --ingroup "$group" "$user" >/dev/null 2>&1 || return 1
         else
