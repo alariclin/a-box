@@ -14600,7 +14600,6 @@ region_validate_timezone() {
     [[ "$resolved" == /usr/share/zoneinfo/* && -f "$resolved" && ! -L "$resolved" ]] || return 1
 }
 
-}
 
 
 region_validate_locale() {
