@@ -15,8 +15,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 pinned to resolved commit
       - name: Bash syntax
         run: bash -n install.sh
-      - name: Built-in self-test
+      - name: Built-in self-test (unprivileged)
         run: bash install.sh --self-test
+      - name: Built-in self-test (root-only paths)
+        run: sudo bash install.sh --self-test
       - name: Release metadata regression
         run: |
           grep -Eq "^ABOX_BUILD='[^']+'$" install.sh
@@ -36,3 +38,27 @@ jobs:
           ' data/sni-candidates.txt
           duplicates=$(awk 'NF && $0 !~ /^[[:space:]]*#/ {print tolower($0)}' data/sni-candidates.txt | sort | uniq -d | wc -l)
           test "$duplicates" -eq 0
+
+
+  alpine-busybox-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 pinned to resolved commit
+      - name: Syntax and self-test on Alpine/BusyBox
+        run: |
+          docker run --rm \
+            -v "$PWD:/src:ro" \
+            -w /src \
+            alpine:3.22 sh -ec '
+              apk add --no-cache bash coreutils python3 curl jq openssl tar gzip gawk shadow
+              export TERM=xterm
+              mkdir -p /etc/ddr
+              printf "%s\n" ci-sentinel > /etc/ddr/.ci-sentinel
+              chmod 600 /etc/ddr/.ci-sentinel
+              before="$(stat -c "%u:%g:%a:%s:%Y" /etc/ddr/.ci-sentinel)"
+              bash -n install.sh
+              bash install.sh --self-test
+              after="$(stat -c "%u:%g:%a:%s:%Y" /etc/ddr/.ci-sentinel)"
+              test "$before" = "$after"
+              rm -rf /etc/ddr
+            '
