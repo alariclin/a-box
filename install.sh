@@ -33,8 +33,8 @@ PUBLIC_IP_CACHE_TTL=600
 BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-10}
 LOCK_FALLBACK_DIR='/run/A-Box.lock.d'
 ABOX_LANG='zh'
-ABOX_BUILD='2026-10-09-sni-modular-release-v165'
-ABOX_BUILD_EPOCH=20261009165
+ABOX_BUILD='2026-10-09-audit-remediation-v166'
+ABOX_BUILD_EPOCH=20261009166
 # Cross-client compatibility pin for Shadowrocket + Mihomo/Clash Verge + sing-box
 # with VLESS/REALITY and XHTTP as of 2026-10-08.
 # Xray 26.9.8/26.9.9 introduces the newer REALITY ML-KEM ClientHello gate;
@@ -48,6 +48,7 @@ ABOX_SINGBOX_DEFAULT_VERSION='v1.14.2'
 # Candidate library sizing. 0 uses the hard ceiling instead of the historical
 # 4096 seed-only boundary; default 8192 keeps generated variants reachable.
 ABOX_SNI_DEFAULT_MAX=8192
+ABOX_SNI_MINI_DEFAULT_MAX=256
 ABOX_SNI_HARD_MAX=16384
 ABOX_SNI_CANDIDATE_URL_DEFAULT='https://raw.githubusercontent.com/alariclin/a-box/main/data/sni-candidates.txt'
 ABOX_SNI_CANDIDATE_MAX_BYTES=1048576
@@ -601,8 +602,13 @@ valid_backup_retention_count() {
     (( 10#$input <= 1000 ))
 }
 valid_hy2_bandwidth_mbps() {
-    # Keep the interactive HY2 bandwidth domain identical to the persisted .env validator.
-    valid_traffic_limit_gb "${1:-}"
+    # Mbps is a bandwidth, not a traffic quota in GB. Cap at 100 Gbps to reject
+    # accidental unit/typing errors while preserving realistic dedicated-server values.
+    local input="${1:-}" normalized
+    valid_decimal_upto "$input" 100000 || return 1
+    normalized="${input#"${input%%[!0]*}"}"
+    [[ -n "$normalized" ]] || return 1
+    (( 10#$normalized >= 1 ))
 }
 
 valid_domain() {
@@ -1190,7 +1196,15 @@ init_system_environment() {
             release='ubuntu'; install_cmd=(apt-get -y install)
         fi
     fi
-    [[ -z "$release" ]] && die '本脚本不支持当前异构系统。'
+    if [[ -z "$release" ]]; then
+        local detected_id=unknown detected_like=unknown
+        if [[ -r /etc/os-release ]]; then
+            . /etc/os-release
+            detected_id="${ID:-unknown}"
+            detected_like="${ID_LIKE:-unknown}"
+        fi
+        die "暂不支持当前操作系统 (ID=${detected_id}, ID_LIKE=${detected_like})；不会仅凭衍生关系冒险套用其他发行版的包管理逻辑。"
+    fi
     if [[ "$release" == 'centos' ]] && command -v dnf >/dev/null 2>&1; then
         install_cmd=(dnf -y install)
     fi
@@ -1379,7 +1393,7 @@ service_active_state_value() {
 
 service_manager() {
     local action=$1; shift
-    local srv
+    local srv runlevel_state
     for srv in "$@"; do
         if [[ "${INIT_SYS:-}" == 'systemd' ]]; then
             case "$action" in
@@ -1411,7 +1425,9 @@ service_manager() {
                 stop)
                     rc-service "$srv" stop >/dev/null 2>&1 || true
                     [[ "$(service_active_state_value "$srv" 2>/dev/null || printf '%s' unknown)" == 0 ]] || return 1
-                    rc-update del "$srv" default >/dev/null 2>&1 || return 1
+                    rc-update del "$srv" default >/dev/null 2>&1 || true
+                    runlevel_state=$(rc-update show default 2>/dev/null) || return 1
+                    grep -Eq "(^|[[:space:]])${srv}([[:space:]]|$)" <<< "$runlevel_state" && return 1
                     [[ "$(service_active_state_value "$srv" 2>/dev/null || printf '%s' unknown)" == 0 ]] || return 1
                     ;;
                 start)
@@ -1880,7 +1896,7 @@ prepare_hysteria_acme_dir_ownership() {
 }
 
 remove_recorded_core_family() {
-    local srv="$1" runtime_uid runtime_gid
+    local srv="$1" action="${2:-remove}" runtime_uid runtime_gid
     [[ -f "$ABOX_CORE_OWNERSHIP" && ! -L "$ABOX_CORE_OWNERSHIP" ]] || return 2
     [[ "$(stat -c %u:%g "$ABOX_CORE_OWNERSHIP" 2>/dev/null || true)" == 0:0 ]] || return 1
     [[ "$(stat -c %a "$ABOX_CORE_OWNERSHIP" 2>/dev/null || true)" =~ ^0?600$ ]] || return 1
@@ -1889,9 +1905,9 @@ remove_recorded_core_family() {
     runtime_gid=$(IFS=$'\t' read -r _u _g < <(abox_runtime_identity "$srv"); getent group "$_g" 2>/dev/null | awk -F: '{print $3}')
     [[ "$runtime_uid" =~ ^[0-9]+$ ]] || runtime_uid=0
     [[ "$runtime_gid" =~ ^[0-9]+$ ]] || runtime_gid=0
-    python3 - "$srv" "$ABOX_CORE_OWNERSHIP" "$runtime_uid" "$runtime_gid" <<'PY_CORE_REMOVE'
+    python3 - "$srv" "$ABOX_CORE_OWNERSHIP" "$runtime_uid" "$runtime_gid" "$action" <<'PY_CORE_REMOVE'
 import hashlib, os, re, stat, sys, tempfile
-srv, manifest, runtime_uid, runtime_gid=sys.argv[1:]
+srv, manifest, runtime_uid, runtime_gid, action=sys.argv[1:]
 runtime_uid=int(runtime_uid)
 runtime_gid=int(runtime_gid)
 rows=[]; keep=[]; all_rows=[]
@@ -1956,7 +1972,9 @@ for path in sorted(expected, key=os.fsencode):
         for name in names:
             child=os.path.join(path,name)
             if child not in expected: raise SystemExit(3)
-# Only after the complete tree is proven exact may deletion begin.
+# Only after the complete tree is proven exact may deletion begin. Reset preflight may request a verification-only pass.
+if action == "verify": raise SystemExit(0)
+if action != "remove": raise SystemExit(1)
 for path in sorted(files, key=lambda p:(p.count(os.sep),len(p)), reverse=True):
     try: os.unlink(path)
     except FileNotFoundError: pass
@@ -2117,7 +2135,14 @@ remove_owned_core_family() {
     case "$rc" in
         0) return 0 ;;
         2)
-            msg "${YELLOW}[!] No per-file ownership manifest exists for ${srv}; refusing destructive family deletion. Start/restart the managed service once to register exact files.${NC}"
+            core_paths=$(core_family_paths "$srv") || return 1
+            local remaining_owned_path=''
+            while IFS= read -r path; do
+                [[ -n "$path" ]] || continue
+                if [[ -e "$path" || -L "$path" ]]; then remaining_owned_path="$path"; break; fi
+            done <<< "$core_paths"
+            [[ -z "$remaining_owned_path" ]] && return 0
+            msg "${YELLOW}[!] No per-file ownership manifest exists for ${srv}; refusing destructive family deletion. Start/restart the managed service once to register exact files, or use reset-only manifest recovery after explicit confirmation.${NC}"
             return 1
             ;;
         3)
@@ -2416,7 +2441,7 @@ remove_abox_firewall_persistence() {
         command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1 || return 1
         rc-service A-Box-firewall stop >/dev/null 2>&1 || return 1
         [[ "$(service_active_state_value A-Box-firewall 2>/dev/null || printf '%s' unknown)" == 0 ]] || return 1
-        rc-update del A-Box-firewall default >/dev/null 2>&1 || return 1
+        rc-update del A-Box-firewall default >/dev/null 2>&1 || true
         rc_update=$(rc-update show default 2>/dev/null) || return 1
         grep -Eq '(^|[[:space:]])A-Box-firewall([[:space:]]|$)' <<< "$rc_update" && return 1
         rm -f -- /etc/init.d/A-Box-firewall || return 1
@@ -3842,6 +3867,10 @@ release_ports() {
     sleep 1
     local pairs pair proto p holder
     pairs=$(selected_port_pairs | awk 'NF' | sort -u)
+    if [[ -z "$pairs" ]]; then
+        msg "${YELLOW}[*] 托管服务已停止；尚未选择部署端口，端口占用将在参数向导完成后检查。${NC}"
+        return 0
+    fi
     command -v ss >/dev/null 2>&1 || die '系统缺少 ss，无法可靠检查端口占用。'
     for pair in $pairs; do
         proto=${pair%/*}; p=${pair#*/}
@@ -4774,6 +4803,7 @@ setup_active_defense() {
     missingok
     notifempty
     copytruncate
+    # With copytruncate the original inode/mode is retained; logrotate's create directive is ignored.
     compress
     create 0600 root root
 }
@@ -5631,7 +5661,7 @@ generate_self_signed_cert_atomically() {
     tmp=$(mktemp -d "$dir/.A-Box-cert.XXXXXX") || return 1
     key_tmp="$tmp/key.pem"; cert_tmp="$tmp/cert.pem"
     openssl ecparam -genkey -name prime256v1 -out "$key_tmp" >/dev/null 2>&1 || { rm -rf "$tmp"; return 1; }
-    openssl req -new -x509 -days 36500 -key "$key_tmp" -out "$cert_tmp" -subj "/CN=${cn}" >/dev/null 2>&1 || { rm -rf "$tmp"; return 1; }
+    openssl req -new -x509 -days 3650 -key "$key_tmp" -out "$cert_tmp" -subj "/CN=${cn}" >/dev/null 2>&1 || { rm -rf "$tmp"; return 1; }
     openssl x509 -in "$cert_tmp" -noout >/dev/null 2>&1 || { rm -rf "$tmp"; return 1; }
     pub1=$(openssl pkey -in "$key_tmp" -pubout -outform der 2>/dev/null | openssl dgst -sha256 2>/dev/null | awk '{print $NF}')
     pub2=$(openssl x509 -in "$cert_tmp" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform der 2>/dev/null | openssl dgst -sha256 2>/dev/null | awk '{print $NF}')
@@ -6615,8 +6645,10 @@ stop_owned() {
             3|16|32) : ;;
             *) return 1 ;;
         esac
-        rc-update del "$srv" default >/dev/null 2>&1 || return 1
-        rc-update show default 2>/dev/null | grep -Eq "(^|[[:space:]])${srv}([[:space:]]|$)" && return 1
+        rc-update del "$srv" default >/dev/null 2>&1 || true
+        local runlevel_state
+        runlevel_state=$(rc-update show default 2>/dev/null) || return 1
+        grep -Eq "(^|[[:space:]])${srv}([[:space:]]|$)" <<< "$runlevel_state" && return 1
         rc-service "$srv" status >/dev/null 2>&1; rc=$?
         case "$rc" in
             0) return 1 ;;
@@ -6705,9 +6737,16 @@ valid_backup_retention_count() {
     (( 10#$input <= 1000 ))
 }
 valid_hy2_bandwidth_mbps() {
-    # Keep the interactive HY2 bandwidth domain identical to the persisted .env validator.
-    valid_traffic_limit_gb "${1:-}"
+    # Keep generated traffic-monitor validation consistent with the interactive input.
+    local input="${1:-}" normalized
+    [[ "$input" =~ ^[0-9]{1,6}$ ]] || return 1
+    normalized="${input#"${input%%[!0]*}"}"
+    [[ -n "$normalized" ]] || return 1
+    (( 10#$normalized <= 100000 )) || return 1
+    (( 10#$normalized >= 1 ))
 }
+
+
 [[ -z "${TRAFFIC_LIMIT_GB:-}" ]] || valid_traffic_limit_gb "$TRAFFIC_LIMIT_GB" || {
     traffic_fail_closed 'persisted traffic limit is invalid' || traffic_error 'invalid persisted traffic limit could not be fail-closed enforced'
     exit 1
@@ -6743,7 +6782,18 @@ if [[ -z "$iface" ]]; then
     traffic_fail_closed 'INGRESS_IF missing; refusing to switch traffic accounting to a newly inferred interface' || traffic_error 'missing ingress interface could not be fail-closed enforced'
     exit 1
 fi
-used=$(month_bytes "$iface" "${TRAFFIC_LIMIT_MODE:-total}") || { traffic_fail_closed 'traffic accounting query failed' || traffic_error 'fail-closed traffic block could not be fully enforced'; exit 1; }
+# Retry transient vnStat startup/database hiccups; persistent failure still fails closed.
+used=''
+traffic_query_attempt=1
+while (( traffic_query_attempt <= 3 )); do
+    if used=$(month_bytes "$iface" "${TRAFFIC_LIMIT_MODE:-total}") && [[ "$used" =~ ^[0-9]+$ ]]; then
+        break
+    fi
+    used=''
+    if (( traffic_query_attempt < 3 )); then sleep "$traffic_query_attempt"; fi
+    traffic_query_attempt=$((traffic_query_attempt + 1))
+done
+[[ "$used" =~ ^[0-9]+$ ]] || { traffic_fail_closed 'traffic accounting query failed after 3 attempts' || traffic_error 'fail-closed traffic block could not be fully enforced'; exit 1; }
 limit=$(python3 - "$TRAFFIC_LIMIT_GB" <<'PY_TRAFFIC_LIMIT'
 import sys
 gb = int(sys.argv[1])
@@ -7559,6 +7609,97 @@ preflight_reset_ownership() {
     return 0
 }
 
+rebuild_core_ownership_manifest_for_reset() {
+    local srv rc need_rebuild=0 answer='' backup='' moved_original=0
+    # Reset-only recovery. Ordinary uninstall/upgrade remains manifest-driven.
+    local core_paths current_path found
+    for srv in xray sing-box hysteria; do
+        abox_owns_service "$srv" || continue
+        core_paths=$(core_family_paths "$srv") || return 1
+        found=0
+        while IFS= read -r current_path; do
+            [[ -n "$current_path" ]] || continue
+            if [[ -e "$current_path" || -L "$current_path" ]]; then found=1; break; fi
+        done <<< "$core_paths"
+        (( found == 1 )) || continue
+        remove_recorded_core_family "$srv" verify
+        rc=$?
+        case "$rc" in
+            0) ;;
+            2|3) need_rebuild=1 ;;
+            *)
+                msg "${RED}[!] Core ownership manifest cannot be safely verified (service=${srv}, rc=${rc}); possible permission, mount, or manifest-format issue. Refusing automatic rebuild.${NC}"
+                return 1
+                ;;
+        esac
+    done
+    (( need_rebuild == 1 )) || return 0
+    msg "${YELLOW}[!] Reset-only recovery: the core ownership manifest is missing or no longer matches files. Rebuild will enumerate only A-Box core_family_paths and reject mount points, symlinks, unsafe ownership/permissions, and unsupported file types.${NC}"
+    if [[ -t 0 ]]; then
+        read -r -p 'Type REBUILD-CORE-MANIFEST to rebuild ownership metadata for this reset: ' answer || answer=''
+    else
+        answer="${ABOX_RESET_REBUILD_MANIFEST:-}"
+    fi
+    [[ "$answer" == 'REBUILD-CORE-MANIFEST' ]] || {
+        msg "${YELLOW}[!] Core manifest rebuild was not explicitly authorized; reset stopped before deleting core files.${NC}"
+        return 1
+    }
+    path_parent_chain_safe "$ABOX_CORE_OWNERSHIP" || return 1
+    path_tree_has_nested_mountpoint "$ABOX_DIR" && { msg "${RED}[!] A-Box state directory contains a nested mount point; refusing manifest repair.${NC}"; return 1; }
+    if [[ -e "$ABOX_CORE_OWNERSHIP" || -L "$ABOX_CORE_OWNERSHIP" ]]; then
+        [[ -f "$ABOX_CORE_OWNERSHIP" && ! -L "$ABOX_CORE_OWNERSHIP" ]] || return 1
+        [[ "$(stat -c %u:%g "$ABOX_CORE_OWNERSHIP" 2>/dev/null || true)" == 0:0 ]] || return 1
+        [[ "$(stat -c %a "$ABOX_CORE_OWNERSHIP" 2>/dev/null || true)" =~ ^0?600$ ]] || return 1
+        [[ "$(stat -c %s "$ABOX_CORE_OWNERSHIP" 2>/dev/null || echo 99999999)" -le 4194304 ]] || return 1
+        backup=$(umask 077; mktemp "$ABOX_DIR/.managed-core-files.pre-reset.XXXXXX") || return 1
+        rm -f -- "$backup" || return 1
+        mv -- "$ABOX_CORE_OWNERSHIP" "$backup" || { rm -f -- "$backup"; return 1; }
+        moved_original=1
+        chmod 600 "$backup" && chown root:root "$backup" || {
+            mv -- "$backup" "$ABOX_CORE_OWNERSHIP" 2>/dev/null || true
+            return 1
+        }
+    fi
+    for srv in xray sing-box hysteria; do
+        abox_owns_service "$srv" || continue
+        core_paths=$(core_family_paths "$srv") || return 1
+        found=0
+        while IFS= read -r current_path; do
+            [[ -n "$current_path" ]] || continue
+            if [[ -e "$current_path" || -L "$current_path" ]]; then found=1; break; fi
+        done <<< "$core_paths"
+        (( found == 1 )) || continue
+        if ! record_core_family_ownership "$srv"; then
+            msg "${RED}[!] Could not safely rebuild manifest for ${srv}; restoring the previous manifest if present.${NC}" >&2
+            rm -f -- "$ABOX_CORE_OWNERSHIP" 2>/dev/null || true
+            if (( moved_original == 1 )); then mv -- "$backup" "$ABOX_CORE_OWNERSHIP" || msg "${RED}[!] Restore original ownership manifest manually from ${backup}${NC}" >&2; fi
+            return 1
+        fi
+    done
+    for srv in xray sing-box hysteria; do
+        abox_owns_service "$srv" || continue
+        core_paths=$(core_family_paths "$srv") || return 1
+        found=0
+        while IFS= read -r current_path; do
+            [[ -n "$current_path" ]] || continue
+            if [[ -e "$current_path" || -L "$current_path" ]]; then found=1; break; fi
+        done <<< "$core_paths"
+        (( found == 1 )) || continue
+        if ! remove_recorded_core_family "$srv" verify; then
+            msg "${RED}[!] Rebuilt manifest failed strict verification for ${srv}; restoring previous manifest when possible.${NC}" >&2
+            rm -f -- "$ABOX_CORE_OWNERSHIP" 2>/dev/null || true
+            if (( moved_original == 1 )); then mv -- "$backup" "$ABOX_CORE_OWNERSHIP" || msg "${RED}[!] Restore original ownership manifest manually from ${backup}${NC}" >&2; fi
+            return 1
+        fi
+    done
+    if (( moved_original == 1 )); then
+        msg "${YELLOW}[!] Original manifest preserved for diagnosis at ${backup}; rebuilt manifest passed strict preflight.${NC}"
+    else
+        msg "${YELLOW}[!] Missing ownership manifest rebuilt from explicitly managed core paths; strict preflight passed.${NC}"
+    fi
+    return 0
+}
+
 check_virgin_state() {
     if [[ -t 1 ]]; then
         command clear || true
@@ -7577,6 +7718,7 @@ check_virgin_state() {
     begin_deployment_transaction 'environment reset' xray sing-box hysteria || die '开启环境重置事务失败。'
     preflight_reset_ownership || die '环境重置预检失败；检测到非托管、挂载或不安全文件，已中止。'
     stop_all_managed_services || die '环境重置前无法停止全部 A-Box 托管服务。'
+    rebuild_core_ownership_manifest_for_reset || die '核心归属清单缺失/不匹配且未能安全重建；环境重置已中止。'
     clean_nat_rules || die '旧的 A-Box HY2 NAT 规则无法完整删除。'
     clean_input_rules || die '旧的 A-Box INPUT/原生防火墙规则无法完整删除。'
     save_firewall_rules || die 'A-Box 防火墙持久化失败。'
@@ -8012,6 +8154,28 @@ sni_resolve_public_ip() {
     printf '%s\n' "$chosen"
 }
 
+sni_sample_candidate_file() {
+    local input="${1:-}" output="${2:-}" limit="${3:-256}"
+    [[ -f "$input" && ! -L "$input" && -n "$output" ]] || return 1
+    valid_decimal_upto "$limit" "$ABOX_SNI_HARD_MAX" || return 1
+    local normalized="${limit#"${limit%%[!0]*}"}"
+    [[ -n "$normalized" ]] || normalized=0
+    (( 10#$normalized >= 1 )) || return 1
+    awk -v n="$normalized" '
+      { rows[NR]=$0 }
+      END {
+        if (NR == 0) exit 1
+        count=(NR < n ? NR : n)
+        if (count == NR) { for (i=1; i<=NR; i++) print rows[i]; exit }
+        if (count == 1) { print rows[int((NR+1)/2)]; exit }
+        for (i=0; i<count; i++) {
+          idx=int(i*(NR-1)/(count-1))+1
+          print rows[idx]
+        }
+      }
+    ' "$input" > "$output"
+}
+
 write_sni_candidate_library() {
     local profile="${1:-full}" out="$2" raw generated tmp append_tmp out_tmp max_count
     [[ -n "$out" ]] || die 'SNI candidate output path missing.'
@@ -8057,7 +8221,7 @@ write_sni_candidate_library() {
     [[ -s "$tmp" ]] || { rm -f "$raw" "$generated" "$tmp" "$append_tmp"; die 'SNI candidate filtering produced an empty library.'; }
 
     if [[ "$profile" == 'mini' ]]; then
-        max_count="${ABOX_SNI_MINI_MAX:-$ABOX_SNI_DEFAULT_MAX}"
+        max_count="${ABOX_SNI_MINI_MAX:-$ABOX_SNI_MINI_DEFAULT_MAX}"
     else
         max_count="${ABOX_SNI_FULL_MAX:-$ABOX_SNI_DEFAULT_MAX}"
     fi
@@ -8070,7 +8234,12 @@ write_sni_candidate_library() {
         max_count="$ABOX_SNI_HARD_MAX"
     fi
     out_tmp=$(mktemp "${out}.A-Box-new.XXXXXX") || { rm -f "$raw" "$generated" "$tmp"; die 'SNI candidate output temporary file creation failed.'; }
-    if ! awk -v n="$max_count" 'NR<=n {print}' "$tmp" > "$out_tmp"; then
+    if [[ "$profile" == 'mini' ]]; then
+        if ! sni_sample_candidate_file "$tmp" "$out_tmp" "$max_count"; then
+            rm -f "$raw" "$generated" "$tmp" "$out_tmp"
+            die 'SNI mini candidate sampling failed.'
+        fi
+    elif ! awk -v n="$max_count" 'NR<=n {print}' "$tmp" > "$out_tmp"; then
         rm -f "$raw" "$generated" "$tmp" "$out_tmp"
         die 'SNI candidate output generation failed.'
     fi
@@ -8097,7 +8266,7 @@ sni_domain_penalty() {
 }
 
 asn_lookup_ip() {
-    local ip="${1:-}" cache_dir="${2:-}" cache_file body asn country org uid gid mode
+    local ip="${1:-}" cache_dir="${2:-}" cache_file body asn country org uid gid mode response http_code lookup_limit lookup_count count_tmp
     [[ -n "$ip" && "$ip" != 'N/A' ]] || { printf 'asn=unknown\tcountry=unknown\torg=unknown'; return 0; }
     [[ -n "$cache_dir" && -d "$cache_dir" && ! -L "$cache_dir" ]] || return 1
     uid=$(stat -c %u "$cache_dir" 2>/dev/null) || return 1
@@ -8109,8 +8278,40 @@ asn_lookup_ip() {
         cat "$cache_file"
         return 0
     fi
-    body=$(curl -fsS --connect-timeout 2 -m 4 "https://ipinfo.io/${ip}/json" 2>/dev/null || true)
-    if [[ -n "$body" ]] && command -v jq >/dev/null 2>&1; then
+    if [[ -e "$cache_dir/.rate-limited" ]]; then
+        printf 'asn=unknown\tcountry=unknown\torg=unknown'
+        return 0
+    fi
+    lookup_limit="${ABOX_SNI_ASN_LOOKUP_LIMIT:-40}"
+    valid_decimal_upto "$lookup_limit" 600 || lookup_limit=40
+    lookup_limit="${lookup_limit#"${lookup_limit%%[!0]*}"}"
+    [[ -n "$lookup_limit" ]] || lookup_limit=0
+    lookup_count=0
+    if [[ -f "$cache_dir/.lookup-count" && ! -L "$cache_dir/.lookup-count" ]]; then
+        IFS= read -r lookup_count < "$cache_dir/.lookup-count" || lookup_count=0
+        [[ "$lookup_count" =~ ^[0-9]{1,4}$ ]] || lookup_count="$lookup_limit"
+    fi
+    if (( lookup_count >= lookup_limit )); then
+        printf 'asn=unknown\tcountry=unknown\torg=unknown'
+        return 0
+    fi
+    lookup_count=$((lookup_count + 1))
+    count_tmp="$cache_dir/.lookup-count.new"
+    printf '%s\n' "$lookup_count" > "$count_tmp" && chmod 600 "$count_tmp" && mv -f -- "$count_tmp" "$cache_dir/.lookup-count" || { rm -f -- "$count_tmp"; printf 'asn=unknown\tcountry=unknown\torg=unknown'; return 0; }
+    response=$(curl -sS --connect-timeout 2 --max-time 3 -w $'\n__ABOX_HTTP_STATUS__:%{http_code}' "https://ipinfo.io/${ip}/json" 2>/dev/null || true)
+    http_code="${response##*$'\n__ABOX_HTTP_STATUS__:'}"
+    if [[ "$http_code" == "$response" || ! "$http_code" =~ ^[0-9]{3}$ ]]; then
+        body=''
+    else
+        body="${response%$'\n__ABOX_HTTP_STATUS__:'*}"
+    fi
+    if [[ "$http_code" == 429 ]]; then
+        : > "$cache_dir/.rate-limited"
+        chmod 600 "$cache_dir/.rate-limited" 2>/dev/null || true
+        printf 'asn=unknown\tcountry=unknown\torg=unknown'
+        return 0
+    fi
+    if [[ "$http_code" == 200 && -n "$body" ]] && command -v jq >/dev/null 2>&1; then
         org=$(jq -r '.org // "unknown"' <<< "$body" 2>/dev/null | tr '\t\n\r' '   ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')
         country=$(jq -r '.country // "unknown"' <<< "$body" 2>/dev/null | tr '\t\n\r' '   ' | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')
         asn=$(sed -nE 's/^(AS[0-9]+).*/\1/p' <<< "$org")
@@ -8365,11 +8566,11 @@ run_builtin_sni_radar() {
     fi
     total=$(wc -l < "$candidates" | tr -d ' ')
     if [[ "$profile" == 'mini' ]]; then
-        # Mini mode uses the same candidate library as full mode. It reduces concurrency and verification depth only.
-        concurrency="${ABOX_SNI_MINI_CONCURRENCY:-8}"
-        timeout_s="${ABOX_SNI_MINI_TIMEOUT:-5}"
+        # Mini mode samples evenly across the normalized library and uses a tighter time budget.
+        concurrency="${ABOX_SNI_MINI_CONCURRENCY:-12}"
+        timeout_s="${ABOX_SNI_MINI_TIMEOUT:-3}"
         topn="${ABOX_SNI_MINI_TOPN:-60}"
-        verify_limit="${ABOX_SNI_MINI_VERIFY:-240}"
+        verify_limit="${ABOX_SNI_MINI_VERIFY:-60}"
     else
         concurrency="${ABOX_SNI_FULL_CONCURRENCY:-36}"
         timeout_s="${ABOX_SNI_FULL_TIMEOUT:-6}"
@@ -8533,6 +8734,25 @@ rollback_new_swap_activation_only() {
     [[ ! -e /swapfile && ! -L /swapfile ]]
 }
 
+strip_abox_swap_block_from_file() {
+    local source="${1:-}" destination="${2:-}"
+    [[ -f "$source" && ! -L "$source" && -n "$destination" ]] || return 1
+    awk '
+      BEGIN { inside=0; starts=0; ends=0; bad=0 }
+      $0 == "# A-Box swap BEGIN" {
+        if (inside || starts || ends) { bad=1; exit 2 }
+        inside=1; starts++; next
+      }
+      $0 == "# A-Box swap END" {
+        if (!inside || ends) { bad=1; exit 2 }
+        inside=0; ends++; next
+      }
+      inside { next }
+      { print }
+      END { if (bad || inside || starts != ends) exit 2 }
+    ' "$source" > "$destination"
+}
+
 rollback_abox_new_swap() {
     local fstab_backup="${1:-}" rollback_tmp=''
     if [[ -n "$fstab_backup" && -f "$fstab_backup" && ! -L "$fstab_backup" ]]; then
@@ -8542,12 +8762,7 @@ rollback_abox_new_swap() {
         fi
     else
         rollback_tmp=$(mktemp /etc/.fstab.A-Box-swap-rollback.XXXXXX) || return 1
-        if ! awk '
-          $0 == "# A-Box swap BEGIN" {skip=1; next}
-          $0 == "# A-Box swap END" {skip=0; next}
-          skip {next}
-          {print}
-        ' /etc/fstab > "$rollback_tmp"; then
+        if ! strip_abox_swap_block_from_file /etc/fstab "$rollback_tmp"; then
             rm -f "$rollback_tmp"
             return 1
         fi
@@ -8683,12 +8898,7 @@ remove_abox_swap() {
     tmp=$(mktemp /etc/.fstab.A-Box-remove.XXXXXX) || return 1
     backup=$(mktemp /etc/.fstab.A-Box-backup.XXXXXX) || { rm -f "$tmp"; return 1; }
     cp -a /etc/fstab "$backup" || { rm -f "$tmp" "$backup"; return 1; }
-    awk '
-      $0 == "# A-Box swap BEGIN" {skip=1; next}
-      $0 == "# A-Box swap END" {skip=0; next}
-      skip {next}
-      {print}
-    ' /etc/fstab > "$tmp" || { rm -f "$tmp" "$backup"; return 1; }
+    strip_abox_swap_block_from_file /etc/fstab "$tmp" || { rm -f "$tmp" "$backup"; return 1; }
     chmod --reference=/etc/fstab "$tmp" 2>/dev/null || chmod 644 "$tmp"
     chown --reference=/etc/fstab "$tmp" 2>/dev/null || true
     mv -f "$tmp" /etc/fstab || { rm -f "$tmp" "$backup"; return 1; }
@@ -9118,7 +9328,7 @@ _apply_managed_service_state_file() {
             if [[ "$enabled" == 1 ]]; then
                 rc-update add "$srv" default >/dev/null 2>&1 || return 1
             else
-                rc-update del "$srv" default >/dev/null 2>&1 || return 1
+                rc-update del "$srv" default >/dev/null 2>&1 || true
             fi
             if [[ "$active" == 1 ]]; then
                 rc-service "$srv" start >/dev/null 2>&1 || rc-service "$srv" restart >/dev/null 2>&1 || return 1
@@ -10033,7 +10243,7 @@ restore_cron_from_file() {
 }
 
 backup_current_config() {
-    local ts unique backup_dir work root tarball backup_failed=0 backend srv path _abox_links _old_backups
+    local ts unique backup_dir work root tarball backup_failed=0 backend srv path _abox_links _old_backups export_recovery_key="${2:-0}" recovery_key
     valid_backup_retention_count "$BACKUP_RETENTION_COUNT" || die 'BACKUP_RETENTION_COUNT 无效；必须是 0-1000 的整数。'
     ts=$(date +%Y%m%d-%H%M%S); unique=$(openssl rand -hex 3 2>/dev/null || printf '%s' "$$")
     backup_dir="${1:-$ABOX_DIR/backups}"
@@ -10118,13 +10328,21 @@ backup_current_config() {
     tar -C "$work" -czf "$tarball" root meta || { rm -rf "$work"; rm -f "$tarball"; die 'Backup tarball creation failed.'; }
     chmod 600 "$tarball"; validate_backup_archive "$tarball" || { rm -rf "$work"; rm -f "$tarball"; die 'Backup archive validation failed.'; }
     backup_checksum_write "$tarball" || { rm -rf "$work"; rm -f "$tarball" "${tarball}.sha256"; die 'Backup SHA256 creation failed.'; }
-    backup_auth_write "$tarball" || { rm -rf "$work"; rm -f "$tarball" "${tarball}.sha256" "${tarball}.hmac"; die 'Backup HMAC authentication creation failed.'; }
+    backup_auth_write "$tarball" || { rm -rf "$work"; rm -f "$tarball" "${tarball}.sha256" "${tarball}.hmac" "${tarball}.key"; die 'Backup HMAC authentication creation failed.'; }
+    if [[ "$export_recovery_key" == 1 ]]; then
+        IFS= read -r recovery_key < "$ABOX_BACKUP_KEY" || { rm -rf "$work"; rm -f "$tarball" "${tarball}.sha256" "${tarball}.hmac"; die 'Full-uninstall backup recovery key could not be read.'; }
+        [[ "$recovery_key" =~ ^[A-Fa-f0-9]{64}$ ]] || { rm -rf "$work"; rm -f "$tarball" "${tarball}.sha256" "${tarball}.hmac"; die 'Full-uninstall backup recovery key has invalid format.'; }
+        write_private_sidecar "${tarball}.key" "$recovery_key" || { rm -rf "$work"; rm -f "$tarball" "${tarball}.sha256" "${tarball}.hmac" "${tarball}.key"; die 'Full-uninstall backup could not export its recovery key; uninstall aborted to avoid an unrecoverable backup.'; }
+        msg "${YELLOW}[!] Recovery key sidecar created: ${tarball}.key. Keep it separate from the archive/off-host; anyone holding both can authenticate replacement content.${NC}"
+    fi
     local backup_dir_real abox_dir_real
     backup_dir_real=$(canonical_path "$backup_dir") || { rm -rf "$work"; die 'Backup directory canonicalization failed.'; }
     abox_dir_real=$(canonical_path "$ABOX_DIR") || { rm -rf "$work"; die 'A-Box directory canonicalization failed.'; }
     if [[ "$backup_dir_real" != "$abox_dir_real" && "$backup_dir_real" != "$abox_dir_real/"* ]]; then
-        msg "${YELLOW}[*] External backup created without exporting the authentication key beside it.${NC}"
-        msg "${YELLOW}[*] Use --export-backup-key to save the recovery key on a separate trusted medium.${NC}"
+        if [[ "$export_recovery_key" != 1 ]]; then
+            msg "${YELLOW}[*] External backup created without exporting the authentication key beside it.${NC}"
+            msg "${YELLOW}[*] Use --export-backup-key to save the recovery key on a separate trusted medium.${NC}"
+        fi
     fi
     rm -rf "$work"
     ABOX_LAST_BACKUP="$tarball"
@@ -10151,11 +10369,11 @@ PY_BACKUP_RETENTION
 }
 
 auto_backup_prompt() {
-    local reason="${1:-operation}" dest="${2:-$ABOX_DIR/backups}" answer
+    local reason="${1:-operation}" dest="${2:-$ABOX_DIR/backups}" export_recovery_key="${3:-0}" answer
     msg "${YELLOW}[!] Backup recommended before: ${reason}${NC}"
     read -r -p 'Create backup now? [Y/N]: ' answer
     if is_yes "$answer"; then
-        backup_current_config "$dest"
+        backup_current_config "$dest" "$export_recovery_key"
     else
         msg "${YELLOW}[*] Backup skipped by user.${NC}"
     fi
@@ -10653,7 +10871,7 @@ clean_uninstall_menu() {
     msg "${GREEN}0. 取消并返回${NC}"
     read -r -p '请输入执行代码 [0-2]: ' un_choice
     case "$un_choice" in
-        1) auto_backup_prompt 'full uninstall' '/root/A-Box-backups'; do_cleanup full ;;
+        1) auto_backup_prompt 'full uninstall' '/root/A-Box-backups' 1; do_cleanup full ;;
         2) auto_backup_prompt 'uninstall while keeping script entry' "$ABOX_DIR/backups"; do_cleanup keep ;;
         *) return 0 ;;
     esac
@@ -12049,7 +12267,28 @@ run_self_tests() {
             return 0
         fi
         [[ -d /etc/ddr && ! -L /etc/ddr ]] || return 1
-        find /etc/ddr -mindepth 1 -maxdepth 1 -xdev -printf '%f\0%y\0%u\0%g\0%m\0%s\0%T@\0' | sort -z | sha256sum | awk '{print $1}'
+        python3 - /etc/ddr <<'PY_SELFTEST_ABOX_SIGNATURE'
+import hashlib, os, stat, sys
+root = sys.argv[1]
+items = []
+try:
+    with os.scandir(root) as entries:
+        for entry in entries:
+            st = entry.stat(follow_symlinks=False)
+            if stat.S_ISREG(st.st_mode): kind = 'f'
+            elif stat.S_ISDIR(st.st_mode): kind = 'd'
+            elif stat.S_ISLNK(st.st_mode): kind = 'l'
+            else: kind = 'o'
+            items.append((os.fsencode(entry.name), kind, st.st_uid, st.st_gid,
+                          stat.S_IMODE(st.st_mode), st.st_size, st.st_mtime_ns))
+except OSError:
+    raise SystemExit(1)
+h = hashlib.sha256()
+for item in sorted(items, key=lambda row: row[0]):
+    h.update(b'\0'.join(str(value).encode('utf-8') if not isinstance(value, bytes) else value for value in item))
+    h.update(b'\0')
+print(h.hexdigest())
+PY_SELFTEST_ABOX_SIGNATURE
     }
     if (( EUID == 0 )); then
         if [[ -e /etc/ddr || -L /etc/ddr ]]; then real_abox_exists=1; fi
@@ -12073,10 +12312,21 @@ run_self_tests() {
     assert_ok valid_traffic_limit_gb 8589934591
     assert_bad valid_traffic_limit_gb 8589934592
     assert_bad valid_traffic_limit_gb 999999999999999999
-    assert_ok valid_hy2_bandwidth_mbps 8589934591
-    assert_bad valid_hy2_bandwidth_mbps 8589934592
+    assert_ok valid_hy2_bandwidth_mbps 1
+    assert_ok valid_hy2_bandwidth_mbps 1000
+    assert_ok valid_hy2_bandwidth_mbps 100000
+    assert_bad valid_hy2_bandwidth_mbps 0
+    assert_bad valid_hy2_bandwidth_mbps 100001
     assert_bad valid_hy2_bandwidth_mbps 1000000000000000000
+    printf '%s\n' a b c d e f g h i j > "$tmp/sni-sample-source.txt"
+    sni_sample_candidate_file "$tmp/sni-sample-source.txt" "$tmp/sni-sample-output.txt" 4 || { echo 'FAIL: deterministic SNI mini sampling'; failures=$((failures + 1)); }
+    [[ "$(paste -sd, "$tmp/sni-sample-output.txt")" == 'a,d,g,j' ]] || { echo 'FAIL: SNI mini sample spacing/content'; failures=$((failures + 1)); }
     assert_ok valid_backup_retention_count 0
+    printf '%s\n' 'UUID=root / ext4 defaults 0 1' '# A-Box swap BEGIN' '/swapfile none swap sw 0 0' '# A-Box swap END' 'UUID=data /data ext4 defaults 0 2' > "$tmp/fstab-valid.txt"
+    strip_abox_swap_block_from_file "$tmp/fstab-valid.txt" "$tmp/fstab-stripped.txt" || { echo 'FAIL: valid A-Box fstab block stripping'; failures=$((failures + 1)); }
+    grep -Fxq 'UUID=data /data ext4 defaults 0 2' "$tmp/fstab-stripped.txt" || { echo 'FAIL: fstab stripping lost data mount'; failures=$((failures + 1)); }
+    printf '%s\n' 'UUID=root / ext4 defaults 0 1' '# A-Box swap BEGIN' '/swapfile none swap sw 0 0' 'UUID=data /data ext4 defaults 0 2' > "$tmp/fstab-unclosed.txt"
+    assert_bad strip_abox_swap_block_from_file "$tmp/fstab-unclosed.txt" "$tmp/fstab-unclosed-output.txt"
     assert_ok valid_backup_retention_count 1000
     assert_bad valid_backup_retention_count -1
     assert_bad valid_backup_retention_count abc
@@ -12931,6 +13181,13 @@ PY_SELFTEST_YAML
     grep -Fq 'previous_state=$(get_desired_state)' "$0" || { echo 'FAIL: manual service transitions must snapshot desired state'; failures=$((failures + 1)); }
     grep -Fq 'local pre_state=' "$0" || { echo 'FAIL: manual service transactions must capture pre-state'; failures=$((failures + 1)); }
     grep -Fq 'restore_managed_service_state "$changed_pre" "$changed_expected"' "$0" || { echo 'FAIL: manual service rollback must use expected-state conflict guards'; failures=$((failures + 1)); }
+    grep -Fq 'write_private_sidecar "${tarball}.key" "$recovery_key"' "$0" || { echo 'FAIL: full-uninstall backup must export a recovery key sidecar'; failures=$((failures + 1)); }
+    grep -Fq "auto_backup_prompt 'full uninstall' '/root/A-Box-backups' 1" "$0" || { echo 'FAIL: full uninstall must request backup-key export'; failures=$((failures + 1)); }
+    grep -Fq 'strip_abox_swap_block_from_file /etc/fstab' "$0" || { echo 'FAIL: fstab block parsing must validate paired markers'; failures=$((failures + 1)); }
+    grep -Fq 'traffic accounting query failed after 3 attempts' "$0" || { echo 'FAIL: traffic monitor retry guard missing'; failures=$((failures + 1)); }
+    grep -Fq 'rebuild_core_ownership_manifest_for_reset' "$0" || { echo 'FAIL: reset-only core-manifest recovery missing'; failures=$((failures + 1)); }
+    grep -Fq 'ABOX_SNI_MINI_DEFAULT_MAX=256' "$0" || { echo 'FAIL: SNI mini candidate cap missing'; failures=$((failures + 1)); }
+    grep -Fq 'ABOX_SNI_ASN_LOOKUP_LIMIT' "$0" || { echo 'FAIL: bounded ASN lookup limit missing'; failures=$((failures + 1)); }
     grep -Fq 'current_state_before=$(managed_service_state_value' "$0" || { echo 'FAIL: service rollback must recheck state before mutation'; failures=$((failures + 1)); }
     grep -Fq 'start_abox_service_soft "$srv"' "$0" || { echo 'FAIL: manual start must use non-fatal service start path'; failures=$((failures + 1)); }
     grep -Fq 'local preflight_rc=$(( fail > 0 ? 1 : 0 ))' "$0" || { echo 'FAIL: preflight must preserve result before cleanup'; failures=$((failures + 1)); }
