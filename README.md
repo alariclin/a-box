@@ -8,7 +8,7 @@ One-click Linux network gateway toolkit.
   <img width="804" height="867" alt="A-Box_github" src="https://github.com/user-attachments/assets/4f51a6a1-5d1b-49db-90df-98ffae63d1ca" />
 </p>
 
-A-Box is a standalone Bash script for deploying and maintaining Linux network gateway services. The script build documented here is `2026-10-09-sni-modular-release-v165`; its configured default core versions are Xray `v26.7.28` and sing-box `v1.14.2`.
+A-Box is a standalone Bash script for deploying and maintaining Linux network gateway services. The script build documented here is `2026-10-09-audit-remediation-v166`; its configured default core versions are Xray `v26.7.28` and sing-box `v1.14.2`.
 
 It supports Xray-core, sing-box, the official Hysteria 2 server, VLESS Vision REALITY, VLESS XHTTP REALITY, Shadowsocks-2022, client configuration export, local SNI candidate testing, backup and restore, firewall management, diagnostics, traffic limits, health checks, and core software upgrades.
 
@@ -46,7 +46,7 @@ Use the official GitHub source by default. The mirror is a third-party service, 
 - **Maintenance:** controlled script OTA with displayed SHA-256 and explicit confirmation, Xray Geo data updates, and core-only upgrades that preserve node parameters.
 - **Safety controls:** deployment preflight checks, guarded service ownership/state changes, firewall handling, and rollback paths for supported operations.
 
-SNI entries are only candidates. A listed hostname is **not** a guarantee that it currently works from a particular VPS, supports the required TLS/ALPN/SAN characteristics, or is suitable for a specific REALITY deployment. Verify candidates on the target network before use. The SNI workflow fails closed when it cannot obtain a valid candidate list or fallback copy.
+SNI entries are only candidates. A listed hostname is **not** a guarantee that it currently works from a particular VPS, supports the required TLS/ALPN/SAN characteristics, or is suitable for a specific REALITY deployment. Verify candidates on the target network before use. Mini mode samples at most 256 candidates by default and deep-checks up to 60; full mode uses a broader candidate set. ASN enrichment is limited to 40 external `ipinfo.io` lookups per run by default (`ABOX_SNI_ASN_LOOKUP_LIMIT=0` disables lookups), uses a short timeout, and stops further requests after HTTP 429. These limits improve latency but do not guarantee candidate quality. The SNI workflow fails closed when it cannot obtain a valid candidate list or fallback copy.
 
 ## Main Menu
 
@@ -94,7 +94,7 @@ Run commands from the directory containing the downloaded script:
 | `sudo bash A-Box.sh --export-backup-key /secure/path/A-Box-recovery.key` | Export the recovery key to a protected path |
 | `sudo bash A-Box.sh --convert-legacy-backup OLD.tar.gz [OUTPUT_DIR]` | Convert a legacy backup to manifest v3 format |
 
-Protect exported recovery keys and backups. A `--self-test` pass does not replace a target-host preflight, live installation, or client interoperability test.
+Protect exported recovery keys and backups. Full uninstall now exports a companion `${archive}.key` sidecar for the backup it creates; store the archive and key separately, preferably off-host. If the key export fails, full uninstall aborts rather than knowingly leaving an unrecoverable archive. A `--self-test` pass does not replace a target-host preflight, live installation, or client interoperability test.
 
 ## System Requirements
 
