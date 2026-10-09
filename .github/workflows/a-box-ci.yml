@@ -12,7 +12,7 @@ jobs:
   shell-regression:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4 pinned to resolved commit
       - name: Bash syntax
         run: bash -n install.sh
       - name: Built-in self-test
@@ -21,6 +21,18 @@ jobs:
         run: |
           grep -Eq "^ABOX_BUILD='[^']+'$" install.sh
           grep -Eq '^ABOX_BUILD_EPOCH=[0-9]+$' install.sh
-          grep -Fq "ABOX_XRAY_DEFAULT_VERSION='v26.6.27'" install.sh
+          grep -Fq "ABOX_XRAY_DEFAULT_VERSION='v26.7.28'" install.sh
           grep -Fq "ABOX_XRAY_REALITY_MLKEM_MIN_VERSION='v26.9.8'" install.sh
           grep -Fq 'v2.13.0' install.sh
+          ! grep -Fq 'EOF_SNI_CANDIDATES' install.sh
+          grep -Fq 'ABOX_SNI_CANDIDATE_URL_DEFAULT=' install.sh
+          test -s data/sni-candidates.txt
+          awk '
+            NF && $0 !~ /^[[:space:]]*#/ {
+              if ($0 !~ /^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/) exit 1
+              n++
+            }
+            END { if (n < 100 || n > 12000) exit 1 }
+          ' data/sni-candidates.txt
+          duplicates=$(awk 'NF && $0 !~ /^[[:space:]]*#/ {print tolower($0)}' data/sni-candidates.txt | sort | uniq -d | wc -l)
+          test "$duplicates" -eq 0
