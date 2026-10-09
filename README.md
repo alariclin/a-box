@@ -8,7 +8,7 @@ One-click Linux network gateway toolkit.
   <img width="804" height="867" alt="A-Box_github" src="https://github.com/user-attachments/assets/4f51a6a1-5d1b-49db-90df-98ffae63d1ca" />
 </p>
 
-A-Box is a standalone Bash script for deploying and maintaining Linux network gateway services. The script build documented here is `2026-10-10-release-candidate-v170`; its configured default core versions are Xray `v26.7.28` and sing-box `v1.14.2`.
+A-Box is a standalone Bash script for deploying and maintaining Linux network gateway services. The script build documented here is `2026-10-10-release-candidate-v171`; its configured default core versions are Xray `v26.7.28` and sing-box `v1.14.2`.
 
 It supports Xray-core, sing-box, the official Hysteria 2 server, VLESS Vision REALITY, VLESS XHTTP REALITY, Shadowsocks-2022, client configuration export, local SNI candidate testing, backup and restore, firewall management, diagnostics, traffic limits, health checks, and core software upgrades.
 
@@ -41,7 +41,8 @@ Use the official GitHub source by default. The mirror is a third-party service, 
 - **Protocol deployment:** Xray VLESS Vision REALITY; Xray VLESS XHTTP REALITY; Xray Shadowsocks-2022; official Hysteria 2; corresponding sing-box Vision, Shadowsocks-2022, and Hysteria 2 options.
 - **Combined deployments:** Xray + Hysteria 2 bundle, and a sing-box Vision + Hysteria 2 + Shadowsocks-2022 bundle. The sing-box bundle intentionally does not include XHTTP.
 - **Client configuration export:** share links/URIs, QR codes, Clash/Mihomo YAML, sing-box outbound templates, and v2rayN/v2rayNG XHTTP JSON.
-- **Operations and diagnostics:** health checks, system/download benchmark, IP quality and route tests, VPS tuning, Fail2Ban/logrotate setup, traffic limits, backup and restore, redacted diagnostic bundles, and preflight checks.
+- **Operations and diagnostics:** health checks, system/download benchmark, IP quality and route tests, VPS system tools (tuning / IP preference / host DNS / timezone), Fail2Ban/logrotate setup, traffic limits with month-to-date usage banner, backup and restore, redacted diagnostic bundles, and preflight checks.
+- **Core disaster mirrors:** pinned Xray / sing-box / Hysteria assets on Release [`core-mirrors-v171`](https://github.com/alariclin/a-box/releases/tag/core-mirrors-v171); install falls back there if upstream Releases fail (see [`mirrors/README.md`](mirrors/README.md)).
 - **SNI candidate workflow:** local full and mini-host candidate tests, saved-result viewer, input validation, bounded file size/row count, duplicate removal, and fallback to a valid local cache or adjacent data file when available.
 - **Maintenance:** controlled script OTA with displayed SHA-256 and explicit confirmation, Xray Geo data updates, and core-only upgrades that preserve node parameters.
 - **Safety controls:** deployment preflight checks, guarded service ownership/state changes, firewall handling, and rollback paths for supported operations.
@@ -63,13 +64,13 @@ The repository ships a curated seed list at [`data/sni-candidates.txt`](data/sni
 | `9` | sing-box Hysteria 2 |
 | `10` | sing-box Vision + Hysteria 2 + Shadowsocks-2022 (no XHTTP) |
 | `11` | Toolbox |
-| `12` | VPS one-click optimization |
+| `12` | VPS system tools: BBR/FQ tuning (rollback), **IP preference** (IPv4 / IPv6 / dual), **host DNS** (plain / DoT via systemd-resolved where available, rollback), **timezone** (geo heuristic + custom, rollback) |
 | `13` | Display node parameters and client configurations |
 | `14` | Manual |
 | `15` | Script OTA, Xray Geo data, and core-only upgrade |
 | `16` | Full/partial uninstall |
 | `17` | Remove nodes and reset the environment |
-| `18` | Monthly traffic limit (vnStat-based; stops managed services when the quota is reached) |
+| `18` | Monthly traffic limit (vnStat-based). Opening the menu shows **usage up to now** for the current period, then quota controls |
 | `19` | SS-2022 IP/CIDR allowlist manager |
 | `20` | Switch between Chinese and English script UI |
 | `0` | Exit |

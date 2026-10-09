@@ -8,9 +8,9 @@ Linux 网络网关一键工具箱。
   <img width="804" height="867" alt="A-Box_github" src="https://github.com/user-attachments/assets/4f51a6a1-5d1b-49db-90df-98ffae63d1ca" />
 </p>
 
-A-Box 是一个独立 Bash 脚本，用于部署和维护 Linux 网络网关服务。本文档对应的脚本构建版本为 `2026-10-10-release-candidate-v170`，当前脚本配置的默认核心版本为 Xray `v26.7.28`、sing-box `v1.14.2`。
+A-Box 是一个独立 Bash 脚本，用于部署和维护 Linux 网络网关服务。本文档对应的脚本构建版本为 `2026-10-10-release-candidate-v171`，当前脚本配置的默认核心版本为 Xray `v26.7.28`、sing-box `v1.14.2`。
 
-支持 Xray-core、sing-box、官方 Hysteria 2 服务端、VLESS Vision REALITY、VLESS XHTTP REALITY、Shadowsocks-2022、客户端配置导出、本地 SNI 候选测试、备份恢复、防火墙管理、诊断、流量限制、健康检查和核心软件升级。
+支持 Xray-core、sing-box、官方 Hysteria 2 服务端、VLESS Vision REALITY、VLESS XHTTP REALITY、Shadowsocks-2022、客户端配置导出、本地 SNI 候选测试、备份恢复、防火墙管理、诊断、流量限制、健康检查和核心软件升级；上游失败时回退到仓库 Release `core-mirrors-v171` 灾备资产。
 
 > 仅限在合法、授权、合规的环境中使用。用户自行承担所有法律、运维和安全后果。
 
@@ -41,7 +41,8 @@ curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/alariclin/a-box
 - **协议部署：** Xray VLESS Vision REALITY、Xray VLESS XHTTP REALITY、Xray Shadowsocks-2022、官方 Hysteria 2，以及对应的 sing-box Vision、Shadowsocks-2022 和 Hysteria 2 选项。
 - **组合部署：** Xray + Hysteria 2 组合；sing-box Vision + Hysteria 2 + Shadowsocks-2022 组合。sing-box 组合按设计不包含 XHTTP。
 - **客户端配置导出：** 分享链接/URI、二维码、Clash/Mihomo YAML、sing-box 出站模板、v2rayN/v2rayNG XHTTP JSON。
-- **运维和诊断：** 健康检查、系统/下载测速、IP 质量和路由测试、VPS 调优、Fail2Ban/logrotate 配置、流量限制、备份恢复、脱敏诊断包和预检查。
+- **运维和诊断：** 健康检查、系统/下载测速、IP 质量和路由测试、VPS 系统工具（调优 / IP 偏好 / 本机 DNS / 时区）、Fail2Ban/logrotate、流量限制（含截至当前用量）、备份恢复、脱敏诊断包和预检查。
+- **核心灾备镜像：** 固定版本 Xray / sing-box / Hysteria 资产发布于 Release [`core-mirrors-v171`](https://github.com/alariclin/a-box/releases/tag/core-mirrors-v171)；上游失败时脚本自动回退（见 [`mirrors/README.md`](mirrors/README.md)）。
 - **SNI 候选工作流：** 本地完整和微型主机候选测试、已保存结果查看器、输入校验、文件大小/行数上限、重复项清理，以及可用时回退到有效本地缓存或同目录数据文件。
 - **维护：** 显示 SHA-256 并要求明确确认的脚本 OTA、Xray Geo 数据更新，以及不重置节点参数的核心程序单独升级。
 - **安全控制：** 部署前检查、受控服务归属/状态变更、防火墙处理，以及受支持操作的回滚路径。
@@ -63,13 +64,13 @@ curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/alariclin/a-box
 | `9` | sing-box Hysteria 2 |
 | `10` | sing-box Vision + Hysteria 2 + Shadowsocks-2022（不含 XHTTP） |
 | `11` | 综合工具箱 |
-| `12` | VPS 一键优化 |
+| `12` | VPS 系统工具：BBR/FQ 调优（可回滚）、**IP 协议偏好**（仅 IPv4 / 仅 IPv6 / 双栈）、**本机 DNS**（明文 / DoT，可回滚）、**时区**（启发式 + 自定义，可回滚） |
 | `13` | 显示节点参数和客户端配置 |
 | `14` | 脚本说明书 |
 | `15` | 脚本 OTA、Xray Geo 数据和核心单独升级 |
 | `16` | 全部/部分卸载 |
 | `17` | 删除节点并重置环境 |
-| `18` | 每月流量限制（基于 vnStat；达到限额后停止托管服务） |
+| `18` | 每月流量限制（基于 vnStat）。打开菜单先展示**截至当前**本月累计用量，再进入配额管理 |
 | `19` | SS-2022 IP/CIDR 白名单管理 |
 | `20` | 切换脚本界面的中文/English |
 | `0` | 退出 |

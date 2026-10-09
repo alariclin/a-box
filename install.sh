@@ -29,13 +29,19 @@ ABOX_BACKUP_KEY='/etc/ddr/.backup-hmac.key'
 ABOX_CORE_OWNERSHIP='/etc/ddr/.managed-core-files.tsv'
 LOCK_FILE='/run/A-Box.lock'
 LANG_FILE='/etc/ddr/.lang'
+IP_PREF_FILE='/etc/ddr/.ip-pref'
+DNS_STATE_FILE='/etc/ddr/.dns-state'
+DNS_BACKUP_DIR='/etc/ddr/.dns-backup'
+TZ_STATE_FILE='/etc/ddr/.timezone-state'
+ABOX_CORE_MIRROR_RELEASE='core-mirrors-v171'
+ABOX_CORE_MIRROR_BASE_DEFAULT='https://github.com/alariclin/a-box/releases/download/core-mirrors-v171'
 PUBLIC_IP_CACHE='/etc/ddr/.public_ip.cache'
 PUBLIC_IP_CACHE_TTL=600
 BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-10}
 LOCK_FALLBACK_DIR='/run/A-Box.lock.d'
 ABOX_LANG='zh'
-ABOX_BUILD='2026-10-10-release-candidate-v170'
-ABOX_BUILD_EPOCH=20261010170
+ABOX_BUILD='2026-10-10-release-candidate-v171'
+ABOX_BUILD_EPOCH=20261010171
 # Cross-client compatibility pin for Shadowrocket + Mihomo/Clash Verge + sing-box
 # with VLESS/REALITY and XHTTP as of 2026-10-08.
 # Xray 26.9.8/26.9.9 introduces the newer REALITY ML-KEM ClientHello gate;
@@ -1071,19 +1077,40 @@ PY_PUBLIC_IP
 }
 
 get_public_ip_fresh() {
-    local ip api
-    for api in 'https://api.ipify.org' 'https://ifconfig.me/ip' 'https://icanhazip.com'; do
-        ip=$(curl -fsS4 --connect-timeout "$PUBLIC_IP_CONNECT_TIMEOUT" -m "$PUBLIC_IP_MAX_TIME" "$api" 2>/dev/null | tr -d '[:space:]')
+    local ip api pref
+    pref=$(read_ip_pref 2>/dev/null || printf 'dual')
+    _abox_try_v4() {
+        local api ip
+        for api in 'https://api.ipify.org' 'https://ifconfig.me/ip' 'https://icanhazip.com'; do
+            ip=$(curl -fsS4 --connect-timeout "$PUBLIC_IP_CONNECT_TIMEOUT" -m "$PUBLIC_IP_MAX_TIME" "$api" 2>/dev/null | tr -d '[:space:]')
+            if valid_public_ip "$ip"; then
+                printf '%s\n' "$ip"
+                return 0
+            fi
+        done
+        return 1
+    }
+    _abox_try_v6() {
+        local ip
+        ip=$(curl -fsS6 --connect-timeout "$PUBLIC_IP_CONNECT_TIMEOUT" -m "$PUBLIC_IP_MAX_TIME" 'https://api64.ipify.org' 2>/dev/null | tr -d '[:space:]')
         if valid_public_ip "$ip"; then
             printf '%s\n' "$ip"
             return 0
         fi
-    done
-    ip=$(curl -fsS6 --connect-timeout "$PUBLIC_IP_CONNECT_TIMEOUT" -m "$PUBLIC_IP_MAX_TIME" 'https://api64.ipify.org' 2>/dev/null | tr -d '[:space:]')
-    if valid_public_ip "$ip"; then
-        printf '%s\n' "$ip"
-        return 0
-    fi
+        return 1
+    }
+    case "$pref" in
+        ipv4)
+            _abox_try_v4 && return 0
+            ;;
+        ipv6)
+            _abox_try_v6 && return 0
+            ;;
+        *)
+            _abox_try_v4 && return 0
+            _abox_try_v6 && return 0
+            ;;
+    esac
     printf 'N/A\n'
     return 1
 }
@@ -1375,13 +1402,29 @@ ensure_commands() {
 }
 
 has_ipv6() {
+    local _pref
+    _pref=$(read_ip_pref 2>/dev/null || printf 'dual')
+    [[ "$_pref" == 'ipv4' ]] && return 1
     ip -6 addr show scope global 2>/dev/null | awk '/inet6/ { found=1 } END { exit !found }' && return 0
     ip -6 route show default 2>/dev/null | awk '/^default/ { found=1 } END { exit !found }' && return 0
     return 1
 }
 
 wildcard_listen_address() {
-    local bindv6only='0'
+    local bindv6only='0' pref
+    pref=$(read_ip_pref 2>/dev/null || printf 'dual')
+    case "$pref" in
+        ipv4)
+            printf '0.0.0.0'
+            return 0
+            ;;
+        ipv6)
+            has_ipv6 || die '当前偏好为仅 IPv6，但系统没有可用的全局 IPv6 地址/默认路由。'
+            printf '::'
+            return 0
+            ;;
+    esac
+    # dual (default): prefer :: when the kernel dual-stacks IPv4-mapped traffic.
     bindv6only=$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || printf '0')
     if has_ipv6 && [[ "$bindv6only" == '0' ]]; then
         printf '::'
@@ -2460,6 +2503,7 @@ show_status_report() {
     cat <<EOF_STATUS
 A-Box status
 Build: ${ABOX_BUILD} (${ABOX_BUILD_EPOCH})
+IP preference: $(read_ip_pref 2>/dev/null || echo dual)
 Init: ${init}
 Config: CORE=${CORE:-} MODE=${MODE:-}
 Desired state: ${desired}${period:+ (traffic period ${period})}
@@ -2550,6 +2594,9 @@ write_abox_firewall_restore_script() {
 set -o pipefail
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 has_ipv6() {
+    local _pref
+    _pref=$(read_ip_pref 2>/dev/null || printf 'dual')
+    [[ "$_pref" == 'ipv4' ]] && return 1
     ip -6 addr show scope global 2>/dev/null | awk '/inet6/ { found=1 } END { exit !found }' && return 0
     ip -6 route show default 2>/dev/null | awk '/^default/ { found=1 } END { exit !found }' && return 0
     return 1
@@ -4443,7 +4490,44 @@ fetch_github_release() {
         fi
         rm -f "$tmp_file"
     done
-    die '所有通道均无法下载核心资产。请检查网络。'
+    # Disaster fallback: same-repo GitHub Release assets (core-mirrors-v171) with checksum file.
+    local mirror_base mirror_url mirror_sum expect_sum got_sum asset_leaf
+    mirror_base="${ABOX_CORE_MIRROR_BASE:-$ABOX_CORE_MIRROR_BASE_DEFAULT}"
+    case "$repo:$output_file" in
+        XTLS/Xray-core:xray_core.zip) asset_leaf="Xray-linux-${XRAY_ARCH}.zip" ;;
+        SagerNet/sing-box:singbox_core.tar.gz)
+            _sb_ver="${ABOX_SINGBOX_VERSION:-$ABOX_SINGBOX_DEFAULT_VERSION}"
+            _sb_ver="${_sb_ver#v}"
+            if [[ "${release:-}" == 'alpine' ]]; then
+                asset_leaf="sing-box-${_sb_ver}-linux-${SB_ARCH}-musl.tar.gz"
+            else
+                asset_leaf="sing-box-${_sb_ver}-linux-${SB_ARCH}-glibc.tar.gz"
+            fi
+            ;;
+        HyNetworks/hysteria:hysteria_core) asset_leaf="hysteria-linux-${HY2_ARCH}" ;;
+        *) asset_leaf='' ;;
+    esac
+    if [[ -n "$asset_leaf" && -n "$mirror_base" ]]; then
+        msg "${YELLOW}[!] 上游 Release 通道失败；尝试 A-Box 灾备镜像 ${mirror_base}/${asset_leaf}${NC}"
+        mirror_url="${mirror_base%/}/${asset_leaf}"
+        mirror_sum="${mirror_base%/}/SHA256SUMS"
+        tmp_file=$(mktemp "${dest_file}.download.XXXXXX") || die '灾备下载临时文件创建失败。'
+        if curl -fLsS --connect-timeout 10 -m 180 "$mirror_url" -o "$tmp_file"; then
+            if validate_downloaded_asset "$output_file" "$tmp_file"; then
+                expect_sum=$(curl -fsS --connect-timeout 8 -m 30 "$mirror_sum" 2>/dev/null | awk -v f="$asset_leaf" '$2==f || $2==("./" f) || $2~(f"$") {print $1; exit}')
+                got_sum=$(sha256sum "$tmp_file" | awk '{print $1}')
+                if [[ -n "$expect_sum" && "$expect_sum" =~ ^[A-Fa-f0-9]{64}$ && "${got_sum,,}" == "${expect_sum,,}" ]]; then
+                    mv -f "$tmp_file" "$dest_file" || { rm -f "$tmp_file"; die '灾备资产原子提交失败。'; }
+                    msg "${GREEN}   已从 A-Box 灾备 Release 取得核心资产（SHA256 已校验）。${NC}"
+                    return 0
+                fi
+                msg "${YELLOW}[!] 灾备 SHA256 校验失败或缺少 SHA256SUMS。${NC}"
+            fi
+        fi
+        rm -f "$tmp_file"
+    fi
+    # Last resort: keep last-good installed binary in place (caller rollback paths).
+    die '所有通道（上游 + A-Box 灾备）均无法下载核心资产。请检查网络；已安装的二进制不会被半截覆盖。'
 }
 
 fetch_geo_data() {
@@ -5232,7 +5316,7 @@ fi
 [[ "$desired" == RUNNING ]] || { rm -f "$STATE"; exit 0; }
 IPT=$(command -v iptables || echo /sbin/iptables)
 IPT6=$(command -v ip6tables || echo /sbin/ip6tables)
-has_ipv6() { ip -6 addr show scope global 2>/dev/null | awk '/inet6/ { found=1 } END { exit !found }' || ip -6 route show default 2>/dev/null | awk '/^default/ { found=1 } END { exit !found }'; }
+has_ipv6() { local _p; _p=$(read_ip_pref 2>/dev/null || printf dual); [[ "$_p" == ipv4 ]] && return 1; ip -6 addr show scope global 2>/dev/null | awk '/inet6/ { found=1 } END { exit !found }' || ip -6 route show default 2>/dev/null | awk '/^default/ { found=1 } END { exit !found }'; }
 ipv6_nat_redirect_usable() { command -v ip6tables >/dev/null 2>&1 && $IPT6 -w -t nat -L PREROUTING >/dev/null 2>&1; }
 hysteria_official_hop_firewall_ok() {
     local start="${HY2_RANGE_START:-}" end="${HY2_RANGE_END:-}" first="${HY2_MONITOR_PORT:-${HY2_RANGE_START:-}}" first_other=''
@@ -7412,11 +7496,39 @@ traffic_management_menu() {
     msg "${CYAN}======================================================================${NC}"
     msg "${BOLD}${GREEN}每月流量管控限制 / Monthly Traffic Management Limit${NC}"
     msg "${CYAN}======================================================================${NC}"
-    msg "${YELLOW}[网卡 ${INTERFACE} 当前月流量统计]${NC}"
+    msg "${BOLD}${CYAN}[截至当前 / Usage up to now]${NC}"
+    msg "${YELLOW}网卡 ${INTERFACE} · 本月累计（非秒级实时；数据来自 vnStat 当前统计周期）${NC}"
     if command -v vnstat >/dev/null 2>&1; then
+        # Prefer JSON one-shot for a clear rx/tx/total line when available.
+        if command -v jq >/dev/null 2>&1; then
+            if json=$(vnstat -i "$INTERFACE" --json m 1 2>/dev/null); then
+                python3 - "$json" <<'PY_TRAFFIC_NOW' 2>/dev/null || true
+import json,sys
+try:
+    data=json.loads(sys.argv[1])
+    iface=(data.get("interfaces") or [{}])[0]
+    traffic=((iface.get("traffic") or {}).get("month") or [{}])[0]
+    rx=int(traffic.get("rx",0)); tx=int(traffic.get("tx",0))
+    def hum(n):
+        for u in ("B","KiB","MiB","GiB","TiB"):
+            if n<1024 or u=="TiB":
+                return f"{n:.2f} {u}" if u!="B" else f"{n} B"
+            n/=1024
+        return str(n)
+    print(f"  RX={hum(rx)}  TX={hum(tx)}  TOTAL={hum(rx+tx)}")
+    y,m=traffic.get("date",{}).get("year"), traffic.get("date",{}).get("month")
+    if y and m: print(f"  Period: {y}-{int(m):02d} (month-to-date)")
+except Exception:
+    pass
+PY_TRAFFIC_NOW
+            fi
+        fi
         # Do not cap the raw output at 8 lines: vnStat headers consume several
         # lines, which previously hid every month after roughly the third row.
+        msg "${YELLOW}--- vnStat 月表 ---${NC}"
         vnstat -i "$INTERFACE" -m 2>/dev/null | awk 'NF { print; shown=1 } END { exit !shown }' || msg "${YELLOW}暂无本月统计数据，vnstat 正在收集中。${NC}"
+    else
+        msg "${YELLOW}[!] vnStat 未安装；打开流量菜单设定上限时会按需安装。${NC}"
     fi
     if [[ -n "${TRAFFIC_LIMIT_GB:-}" ]]; then
         msg "当前设定: ${GREEN}${TRAFFIC_LIMIT_GB} GB${NC} | 模式: ${TRAFFIC_LIMIT_MODE:-total}"
@@ -8007,15 +8119,446 @@ EOF_BBR
     msg "${GREEN}系统调优已应用；未强制启用 IP forwarding，也未修改核心 JSON 配置。${NC}"
 }
 
+
+valid_ip_pref() {
+    [[ "${1:-}" =~ ^(ipv4|ipv6|dual)$ ]]
+}
+
+read_ip_pref() {
+    local v='dual'
+    if [[ -r "$IP_PREF_FILE" && -f "$IP_PREF_FILE" && ! -L "$IP_PREF_FILE" ]]; then
+        [[ "$(stat -c %u:%g "$IP_PREF_FILE" 2>/dev/null || true)" == '0:0' ]] || { printf 'dual\n'; return 0; }
+        v=$(tr -d '[:space:]' < "$IP_PREF_FILE" 2>/dev/null || true)
+    fi
+    valid_ip_pref "$v" || v='dual'
+    printf '%s\n' "$v"
+}
+
+save_ip_pref() {
+    local v="${1:-}"
+    valid_ip_pref "$v" || die '非法 IP 偏好设置 / Invalid IP preference.'
+    ensure_abox_dir_owned "$ABOX_DIR" || die '无法准备 A-Box 状态目录。'
+    write_file_atomically_from_stdin "$IP_PREF_FILE" 600 <<< "$v" || die 'IP 偏好写入失败。'
+}
+
+ip_preference_menu() {
+    clear
+    local cur c
+    cur=$(read_ip_pref)
+    msg "${CYAN}======================================================================${NC}"
+    msg "${BOLD}${GREEN}IP 协议偏好 / IP protocol preference${NC}"
+    msg "${CYAN}======================================================================${NC}"
+    msg "当前 / Current: ${YELLOW}${cur}${NC}"
+    msg "${YELLOW}1. 仅 IPv4 (listen 0.0.0.0, prefer IPv4 share links)${NC}"
+    msg "${YELLOW}2. 仅 IPv6 (listen ::, prefer IPv6 share links)${NC}"
+    msg "${YELLOW}3. 双栈 dual (auto :: when available, else IPv4)${NC}"
+    msg "${GREEN}0. 返回${NC}"
+    read -r -p 'Select [0-3]: ' c
+    case "$c" in
+        1) save_ip_pref ipv4; msg "${GREEN}已保存: ipv4${NC}"; pause_return ;;
+        2)
+            has_ipv6 || { msg "${RED}[!] 系统当前无可用全局 IPv6，拒绝保存仅 IPv6。${NC}"; pause_return; return 1; }
+            save_ip_pref ipv6; msg "${GREEN}已保存: ipv6${NC}"; pause_return ;;
+        3) save_ip_pref dual; msg "${GREEN}已保存: dual${NC}"; pause_return ;;
+        *) return 0 ;;
+    esac
+    msg "${YELLOW}[*] 新监听偏好对后续部署生效；已运行节点需重新部署或重启核心以应用 listen 地址。${NC}"
+}
+
+timezone_for_country() {
+    case "${1^^}" in
+        CN) printf 'Asia/Shanghai\n' ;;
+        HK) printf 'Asia/Hong_Kong\n' ;;
+        TW) printf 'Asia/Taipei\n' ;;
+        SG) printf 'Asia/Singapore\n' ;;
+        JP) printf 'Asia/Tokyo\n' ;;
+        KR) printf 'Asia/Seoul\n' ;;
+        IN) printf 'Asia/Kolkata\n' ;;
+        ID) printf 'Asia/Jakarta\n' ;;
+        TH) printf 'Asia/Bangkok\n' ;;
+        VN) printf 'Asia/Ho_Chi_Minh\n' ;;
+        MY) printf 'Asia/Kuala_Lumpur\n' ;;
+        PH) printf 'Asia/Manila\n' ;;
+        AU) printf 'Australia/Sydney\n' ;;
+        NZ) printf 'Pacific/Auckland\n' ;;
+        US) printf 'America/New_York\n' ;;
+        CA) printf 'America/Toronto\n' ;;
+        BR) printf 'America/Sao_Paulo\n' ;;
+        MX) printf 'America/Mexico_City\n' ;;
+        GB|UK) printf 'Europe/London\n' ;;
+        IE) printf 'Europe/Dublin\n' ;;
+        FR) printf 'Europe/Paris\n' ;;
+        DE) printf 'Europe/Berlin\n' ;;
+        NL) printf 'Europe/Amsterdam\n' ;;
+        BE) printf 'Europe/Brussels\n' ;;
+        CH) printf 'Europe/Zurich\n' ;;
+        AT) printf 'Europe/Vienna\n' ;;
+        SE) printf 'Europe/Stockholm\n' ;;
+        NO) printf 'Europe/Oslo\n' ;;
+        FI) printf 'Europe/Helsinki\n' ;;
+        PL) printf 'Europe/Warsaw\n' ;;
+        CZ) printf 'Europe/Prague\n' ;;
+        ES) printf 'Europe/Madrid\n' ;;
+        IT) printf 'Europe/Rome\n' ;;
+        PT) printf 'Europe/Lisbon\n' ;;
+        RU) printf 'Europe/Moscow\n' ;;
+        TR) printf 'Europe/Istanbul\n' ;;
+        AE) printf 'Asia/Dubai\n' ;;
+        SA) printf 'Asia/Riyadh\n' ;;
+        IL) printf 'Asia/Jerusalem\n' ;;
+        ZA) printf 'Africa/Johannesburg\n' ;;
+        EG) printf 'Africa/Cairo\n' ;;
+        NG) printf 'Africa/Lagos\n' ;;
+        AR) printf 'America/Argentina/Buenos_Aires\n' ;;
+        CL) printf 'America/Santiago\n' ;;
+        *) printf '\n' ;;
+    esac
+}
+
+valid_timezone_name() {
+    local tz="${1:-}"
+    [[ "$tz" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] || return 1
+    [[ -e "/usr/share/zoneinfo/$tz" || -L "/usr/share/zoneinfo/$tz" || -e "/usr/share/zoneinfo/posix/$tz" ]]
+}
+
+current_timezone_name() {
+    local tz
+    if command -v timedatectl >/dev/null 2>&1; then
+        tz=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+        [[ -n "$tz" ]] && { printf '%s\n' "$tz"; return 0; }
+    fi
+    if [[ -L /etc/localtime ]]; then
+        tz=$(readlink /etc/localtime 2>/dev/null || true)
+        tz=${tz#*/zoneinfo/}
+        [[ -n "$tz" ]] && { printf '%s\n' "$tz"; return 0; }
+    fi
+    if [[ -r /etc/timezone ]]; then
+        tr -d '[:space:]' < /etc/timezone
+        return 0
+    fi
+    printf 'UTC\n'
+}
+
+snapshot_timezone_state() {
+    local dir="$1" cur
+    mkdir -p "$dir" || return 1
+    chmod 700 "$dir" || return 1
+    cur=$(current_timezone_name)
+    printf '%s\n' "$cur" > "$dir/timezone" || return 1
+    if [[ -e /etc/localtime ]]; then
+        cp -a /etc/localtime "$dir/localtime" 2>/dev/null || true
+    fi
+    if [[ -f /etc/timezone ]]; then
+        cp -a /etc/timezone "$dir/etc-timezone" 2>/dev/null || true
+    fi
+    return 0
+}
+
+restore_timezone_snapshot() {
+    local dir="$1" tz
+    [[ -d "$dir" ]] || return 1
+    tz=$(tr -d '[:space:]' < "$dir/timezone" 2>/dev/null || true)
+    if [[ -n "$tz" ]] && valid_timezone_name "$tz"; then
+        apply_timezone_name "$tz" || return 1
+        return 0
+    fi
+    if [[ -e "$dir/localtime" ]]; then
+        cp -a "$dir/localtime" /etc/localtime || return 1
+    fi
+    if [[ -f "$dir/etc-timezone" ]]; then
+        cp -a "$dir/etc-timezone" /etc/timezone || return 1
+    fi
+    return 0
+}
+
+apply_timezone_name() {
+    local tz="$1"
+    valid_timezone_name "$tz" || return 1
+    if command -v timedatectl >/dev/null 2>&1; then
+        timedatectl set-timezone "$tz" || return 1
+        return 0
+    fi
+    # Alpine / BusyBox path
+    if [[ -e "/usr/share/zoneinfo/$tz" ]]; then
+        ln -sf "/usr/share/zoneinfo/$tz" /etc/localtime || return 1
+        printf '%s\n' "$tz" > /etc/timezone || true
+        return 0
+    fi
+    return 1
+}
+
+detect_country_for_timezone() {
+    local ip body country
+    ip=$(get_public_ip 2>/dev/null || true)
+    [[ -n "$ip" && "$ip" != 'N/A' ]] || return 1
+    body=$(curl -fsS --connect-timeout 3 -m 6 "https://ipinfo.io/${ip}/country" 2>/dev/null | tr -d '[:space:]' || true)
+    [[ "$body" =~ ^[A-Za-z]{2}$ ]] || return 1
+    printf '%s\n' "${body^^}"
+}
+
+timezone_menu() {
+    clear
+    local cur suggested country answer custom snap c
+    cur=$(current_timezone_name)
+    msg "${CYAN}======================================================================${NC}"
+    msg "${BOLD}${GREEN}时区设置 / Timezone${NC}"
+    msg "${CYAN}======================================================================${NC}"
+    msg "当前时区 / Current: ${YELLOW}${cur}${NC}"
+    country=$(detect_country_for_timezone 2>/dev/null || true)
+    if [[ -n "$country" ]]; then
+        suggested=$(timezone_for_country "$country")
+        msg "公网 IP 国家启发式 / Geo heuristic: ${YELLOW}${country}${NC} → ${YELLOW}${suggested:-unknown}${NC}"
+    else
+        suggested=''
+        msg "${YELLOW}[!] 无法从公网 IP 推断国家；可手动输入 IANA 时区。${NC}"
+    fi
+    msg "${YELLOW}1. 应用启发式推荐时区（需确认）${NC}"
+    msg "${YELLOW}2. 自定义 IANA 时区（如 Asia/Shanghai）${NC}"
+    msg "${YELLOW}3. 回滚到上次 A-Box 时区变更前快照${NC}"
+    msg "${GREEN}0. 返回${NC}"
+    read -r -p 'Select [0-3]: ' c
+    case "$c" in
+        1)
+            [[ -n "$suggested" ]] || { msg "${RED}[!] 无可用启发式推荐。${NC}"; pause_return; return 1; }
+            msg "将设置时区为: ${YELLOW}${suggested}${NC}"
+            read -r -p '确认应用? [Y/N]: ' answer
+            is_yes "$answer" || { msg "${YELLOW}已取消。${NC}"; pause_return; return 0; }
+            snap=$(mktemp -d /etc/ddr/.tz-snap.XXXXXX) || die '时区快照目录创建失败。'
+            chmod 700 "$snap" || die '时区快照权限失败。'
+            snapshot_timezone_state "$snap" || die '时区快照失败。'
+            if apply_timezone_name "$suggested"; then
+                ensure_abox_dir_owned "$ABOX_DIR"
+                write_file_atomically_from_stdin "$TZ_STATE_FILE" 600 <<< "applied=${suggested};snapshot=${snap}" || true
+                # Keep only one rollback snapshot pointer
+                rm -rf -- "$DNS_BACKUP_DIR/../.tz-rollback" 2>/dev/null || true
+                mkdir -p /etc/ddr/.tz-rollback && rm -rf /etc/ddr/.tz-rollback/* && cp -a "$snap"/. /etc/ddr/.tz-rollback/ && rm -rf -- "$snap"
+                msg "${GREEN}时区已设置为 ${suggested}${NC}"
+            else
+                restore_timezone_snapshot "$snap" || true
+                rm -rf -- "$snap"
+                die '时区应用失败，已尝试回滚。'
+            fi
+            pause_return
+            ;;
+        2)
+            read -r -p 'IANA timezone (e.g. Asia/Shanghai): ' custom
+            valid_timezone_name "$custom" || { msg "${RED}[!] 非法或不存在的时区: $custom${NC}"; pause_return; return 1; }
+            read -r -p "确认设置为 ${custom}? [Y/N]: " answer
+            is_yes "$answer" || { pause_return; return 0; }
+            snap=$(mktemp -d /etc/ddr/.tz-snap.XXXXXX) || die '时区快照目录创建失败。'
+            chmod 700 "$snap"
+            snapshot_timezone_state "$snap" || die '时区快照失败。'
+            if apply_timezone_name "$custom"; then
+                mkdir -p /etc/ddr/.tz-rollback && rm -rf /etc/ddr/.tz-rollback/* && cp -a "$snap"/. /etc/ddr/.tz-rollback/ && rm -rf -- "$snap"
+                write_file_atomically_from_stdin "$TZ_STATE_FILE" 600 <<< "applied=${custom}" || true
+                msg "${GREEN}时区已设置为 ${custom}${NC}"
+            else
+                restore_timezone_snapshot "$snap" || true
+                rm -rf -- "$snap"
+                die '时区应用失败，已尝试回滚。'
+            fi
+            pause_return
+            ;;
+        3)
+            if [[ -d /etc/ddr/.tz-rollback ]]; then
+                restore_timezone_snapshot /etc/ddr/.tz-rollback && msg "${GREEN}已回滚时区快照。${NC}" || msg "${RED}回滚失败。${NC}"
+            else
+                msg "${YELLOW}[!] 无可用时区回滚快照。${NC}"
+            fi
+            pause_return
+            ;;
+        *) return 0 ;;
+    esac
+}
+
+dns_backend_detect() {
+    if command -v resolvectl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        printf 'resolved\n'
+    elif command -v nmcli >/dev/null 2>&1 && systemctl is-active --quiet NetworkManager 2>/dev/null; then
+        printf 'networkmanager\n'
+    else
+        printf 'resolvconf\n'
+    fi
+}
+
+snapshot_dns_state() {
+    local dir="$1"
+    mkdir -p "$dir" || return 1
+    chmod 700 "$dir" || return 1
+    dns_backend_detect > "$dir/backend" || return 1
+    [[ -f /etc/resolv.conf || -L /etc/resolv.conf ]] && cp -a /etc/resolv.conf "$dir/resolv.conf" 2>/dev/null || true
+    if [[ -d /etc/systemd/resolved.conf.d ]]; then
+        mkdir -p "$dir/resolved.conf.d"
+        cp -a /etc/systemd/resolved.conf.d/. "$dir/resolved.conf.d/" 2>/dev/null || true
+    fi
+    if [[ -f /etc/systemd/resolved.conf ]]; then
+        cp -a /etc/systemd/resolved.conf "$dir/resolved.conf" 2>/dev/null || true
+    fi
+    printf '%s\n' 'ok' > "$dir/COMPLETE" || return 1
+}
+
+restore_dns_snapshot() {
+    local dir="$1" backend
+    [[ -f "$dir/COMPLETE" ]] || return 1
+    backend=$(tr -d '[:space:]' < "$dir/backend" 2>/dev/null || true)
+    if [[ -e "$dir/resolv.conf" ]]; then
+        cp -a "$dir/resolv.conf" /etc/resolv.conf || return 1
+    fi
+    if [[ -f "$dir/resolved.conf" ]]; then
+        cp -a "$dir/resolved.conf" /etc/systemd/resolved.conf || return 1
+    fi
+    if [[ -d "$dir/resolved.conf.d" ]]; then
+        mkdir -p /etc/systemd/resolved.conf.d
+        rm -f /etc/systemd/resolved.conf.d/99-abox-dns.conf 2>/dev/null || true
+        # restore only our drop-in removal; leave other operator files
+    fi
+    rm -f /etc/systemd/resolved.conf.d/99-abox-dns.conf 2>/dev/null || true
+    if [[ "$backend" == 'resolved' ]] && command -v systemctl >/dev/null 2>&1; then
+        systemctl restart systemd-resolved >/dev/null 2>&1 || true
+    fi
+    if [[ "$backend" == 'networkmanager' ]] && command -v systemctl >/dev/null 2>&1; then
+        systemctl reload NetworkManager >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+apply_host_dns() {
+    local mode="$1" v4="$2" v6="$3" backend dropin answer
+    # mode: plain | dot
+    backend=$(dns_backend_detect)
+    msg "检测到 DNS 后端 / backend: ${YELLOW}${backend}${NC}"
+    msg "将应用 IPv4 DNS: ${YELLOW}${v4}${NC}  IPv6 DNS: ${YELLOW}${v6:-none}${NC}  模式: ${YELLOW}${mode}${NC}"
+    read -r -p '确认修改本机 DNS？可回滚。Confirm host DNS change? [Y/N]: ' answer
+    is_yes "$answer" || { msg "${YELLOW}已取消。${NC}"; return 0; }
+    # Refuse silent immutable bit games
+    if command -v lsattr >/dev/null 2>&1 && lsattr /etc/resolv.conf 2>/dev/null | grep -q 'i'; then
+        read -r -p '/etc/resolv.conf 带 immutable(i)。仍要继续并尝试 chattr -i？[Y/N]: ' answer
+        is_yes "$answer" || return 0
+        chattr -i /etc/resolv.conf 2>/dev/null || die '无法清除 immutable 属性。'
+    fi
+    rm -rf -- "$DNS_BACKUP_DIR"
+    mkdir -p "$DNS_BACKUP_DIR" || die 'DNS 备份目录创建失败。'
+    chmod 700 "$DNS_BACKUP_DIR"
+    snapshot_dns_state "$DNS_BACKUP_DIR" || die 'DNS 状态快照失败。'
+    case "$backend" in
+        resolved)
+            mkdir -p /etc/systemd/resolved.conf.d || die '无法创建 resolved.conf.d'
+            dropin=/etc/systemd/resolved.conf.d/99-abox-dns.conf
+            if [[ "$mode" == 'dot' ]]; then
+                write_file_atomically_from_stdin "$dropin" 644 <<EOF_DNS || { restore_dns_snapshot "$DNS_BACKUP_DIR"; die 'DoT drop-in 写入失败。'; }
+[Resolve]
+DNS=${v4}${v6:+ $v6}
+FallbackDNS=
+DNSOverTLS=yes
+EOF_DNS
+            else
+                write_file_atomically_from_stdin "$dropin" 644 <<EOF_DNS || { restore_dns_snapshot "$DNS_BACKUP_DIR"; die 'DNS drop-in 写入失败。'; }
+[Resolve]
+DNS=${v4}${v6:+ $v6}
+FallbackDNS=
+DNSOverTLS=no
+EOF_DNS
+            fi
+            systemctl restart systemd-resolved >/dev/null 2>&1 || { restore_dns_snapshot "$DNS_BACKUP_DIR"; die 'systemd-resolved 重启失败，已回滚。'; }
+            ;;
+        networkmanager)
+            # Apply to active device via nmcli (plaintext DNS; NM DoT varies by version)
+            local iface
+            iface=$(nmcli -t -f DEVICE,STATE d 2>/dev/null | awk -F: '$2=="connected"{print $1; exit}')
+            [[ -n "$iface" ]] || { restore_dns_snapshot "$DNS_BACKUP_DIR"; die '未找到 NetworkManager 活动接口。'; }
+            nmcli d modify "$iface" ipv4.ignore-auto-dns yes ipv4.dns "$v4" || { restore_dns_snapshot "$DNS_BACKUP_DIR"; die 'nmcli IPv4 DNS 失败。'; }
+            if [[ -n "$v6" ]]; then
+                nmcli d modify "$iface" ipv6.ignore-auto-dns yes ipv6.dns "$v6" || { restore_dns_snapshot "$DNS_BACKUP_DIR"; die 'nmcli IPv6 DNS 失败。'; }
+            fi
+            nmcli d reapply "$iface" >/dev/null 2>&1 || nmcli n off && nmcli n on || true
+            ;;
+        *)
+            # Plain resolv.conf for Alpine / generic
+            {
+                printf '# Managed by A-Box host DNS helper\n'
+                printf 'nameserver %s\n' "$v4"
+                [[ -n "$v6" ]] && printf 'nameserver %s\n' "$v6"
+                printf 'options timeout:2 attempts:3\n'
+            } > /etc/resolv.conf || { restore_dns_snapshot "$DNS_BACKUP_DIR"; die 'resolv.conf 写入失败。'; }
+            if [[ "$mode" == 'dot' ]]; then
+                msg "${YELLOW}[!] 当前后端不支持 systemd-resolved DoT；已写入明文 nameserver。请改用 stubby/unbound 或切换到 systemd-resolved。${NC}"
+            fi
+            ;;
+    esac
+    write_file_atomically_from_stdin "$DNS_STATE_FILE" 600 <<< "backend=${backend};mode=${mode};v4=${v4};v6=${v6}" || true
+    msg "${GREEN}本机 DNS 已更新。可用菜单回滚。${NC}"
+}
+
+dns_menu() {
+    clear
+    local c mode v4 v6 answer
+    msg "${CYAN}======================================================================${NC}"
+    msg "${BOLD}${GREEN}VPS 本机 DNS / Host DNS${NC}"
+    msg "${CYAN}======================================================================${NC}"
+    msg "后端: ${YELLOW}$(dns_backend_detect)${NC}"
+    if [[ -r /etc/resolv.conf ]]; then
+        msg "${YELLOW}当前 /etc/resolv.conf 摘要:${NC}"
+        grep -E '^(nameserver|search|options)' /etc/resolv.conf 2>/dev/null | head -8 || true
+    fi
+    msg "${YELLOW}1. 明文 DNS（IPv4+可选 IPv6 nameserver）${NC}"
+    msg "${YELLOW}2. 隐私 DNS DoT（systemd-resolved DNSOverTLS=yes）${NC}"
+    msg "${YELLOW}3. 使用 Cloudflare 1.1.1.1 / 2606:4700:4700::1111${NC}"
+    msg "${YELLOW}4. 使用 Quad9 9.9.9.9 / 2620:fe::fe${NC}"
+    msg "${YELLOW}5. 回滚到上次 A-Box DNS 变更前${NC}"
+    msg "${GREEN}0. 返回${NC}"
+    read -r -p 'Select [0-5]: ' c
+    case "$c" in
+        1)
+            read -r -p 'IPv4 DNS (e.g. 1.1.1.1): ' v4
+            valid_ipv4_cidr "$v4" && [[ "$v4" != */* ]] || { msg "${RED}非法 IPv4 DNS${NC}"; pause_return; return 1; }
+            read -r -p 'IPv6 DNS (可空, e.g. 2606:4700:4700::1111): ' v6
+            [[ -z "$v6" ]] || valid_ipv6_cidr "$v6" || { msg "${RED}非法 IPv6 DNS${NC}"; pause_return; return 1; }
+            [[ -z "$v6" || "$v6" != */* ]] || { msg "${RED}请填写地址而非 CIDR${NC}"; pause_return; return 1; }
+            apply_host_dns plain "$v4" "$v6"
+            pause_return
+            ;;
+        2)
+            read -r -p 'DoT resolver IPv4 (e.g. 1.1.1.1): ' v4
+            valid_ipv4_cidr "$v4" && [[ "$v4" != */* ]] || { msg "${RED}非法 IPv4${NC}"; pause_return; return 1; }
+            read -r -p 'DoT resolver IPv6 (可空): ' v6
+            [[ -z "$v6" ]] || { valid_ipv6_cidr "$v6" && [[ "$v6" != */* ]]; } || { msg "${RED}非法 IPv6${NC}"; pause_return; return 1; }
+            apply_host_dns dot "$v4" "$v6"
+            pause_return
+            ;;
+        3) apply_host_dns plain '1.1.1.1' '2606:4700:4700::1111'; pause_return ;;
+        4) apply_host_dns plain '9.9.9.9' '2620:fe::fe'; pause_return ;;
+        5)
+            if [[ -f "$DNS_BACKUP_DIR/COMPLETE" ]]; then
+                restore_dns_snapshot "$DNS_BACKUP_DIR" && msg "${GREEN}DNS 已回滚。${NC}" || msg "${RED}DNS 回滚失败。${NC}"
+            else
+                msg "${YELLOW}[!] 无 DNS 回滚快照。${NC}"
+            fi
+            pause_return
+            ;;
+        *) return 0 ;;
+    esac
+}
+
+
 tune_vps() {
     clear
-    msg "${CYAN}VPS 调优 / VPS tuning${NC}"
-    msg "${YELLOW}1. 应用可回滚调优${NC}"
+    msg "${CYAN}VPS 系统工具 / VPS system tools${NC}"
+    msg "${YELLOW}1. 应用可回滚调优 (BBR/FQ/limits)${NC}"
     msg "${YELLOW}2. 恢复调优前状态${NC}"
+    msg "${YELLOW}3. IP 协议偏好 (IPv4 / IPv6 / dual)${NC}"
+    msg "${YELLOW}4. 本机 DNS (明文 / DoT，可回滚)${NC}"
+    msg "${YELLOW}5. 时区 (启发式推荐 / 自定义，可回滚)${NC}"
     msg "${GREEN}0. 返回${NC}"
     local c
-    read -r -p 'Select [0-2]: ' c
-    case "$c" in 1) apply_vps_tune; pause_return ;; 2) restore_vps_tune; pause_return ;; *) return 0 ;; esac
+    read -r -p 'Select [0-5]: ' c
+    case "$c" in
+        1) apply_vps_tune; pause_return ;;
+        2) restore_vps_tune; pause_return ;;
+        3) ip_preference_menu ;;
+        4) dns_menu ;;
+        5) timezone_menu ;;
+        *) return 0 ;;
+    esac
 }
 
 sha256_in_allowlist() {
@@ -12749,6 +13292,23 @@ PY_SELFTEST_TAR
     grep -Fq 'support-x25519mlkem768: $clash_mlkem' "$0" || { echo 'FAIL: Clash REALITY ML-KEM flag must be version-aware'; failures=$((failures + 1)); }
     grep -Fq 'ABOX_HYSTERIA_APP_VERSION:-app/v2.13.0' "$0" || { echo 'FAIL: Hysteria v2.13.0 compatibility pin missing'; failures=$((failures + 1)); }
     grep -Fq "ABOX_XRAY_DEFAULT_VERSION='v26.7.28'" "$0" || { echo 'FAIL: Xray iOS/XHTTP compatibility pin missing'; failures=$((failures + 1)); }
+
+    grep -Fq "ABOX_BUILD='2026-10-10-release-candidate-v171'" "$0" || { echo 'FAIL: build string missing'; failures=$((failures + 1)); }
+    grep -Fq 'ABOX_BUILD_EPOCH=20261010171' "$0" || { echo 'FAIL: build epoch missing'; failures=$((failures + 1)); }
+    grep -Fq 'IP_PREF_FILE=' "$0" || { echo 'FAIL: IP preference state file missing'; failures=$((failures + 1)); }
+    grep -Fq 'ip_preference_menu()' "$0" || { echo 'FAIL: IP preference menu missing'; failures=$((failures + 1)); }
+    grep -Fq 'dns_menu()' "$0" || { echo 'FAIL: DNS menu missing'; failures=$((failures + 1)); }
+    grep -Fq 'timezone_menu()' "$0" || { echo 'FAIL: timezone menu missing'; failures=$((failures + 1)); }
+    grep -Fq 'ABOX_CORE_MIRROR_BASE_DEFAULT=' "$0" || { echo 'FAIL: core disaster mirror base missing'; failures=$((failures + 1)); }
+    grep -Fq '截至当前 / Usage up to now' "$0" || { echo 'FAIL: traffic up-to-now banner missing'; failures=$((failures + 1)); }
+    assert_ok valid_ip_pref ipv4
+    assert_ok valid_ip_pref ipv6
+    assert_ok valid_ip_pref dual
+    assert_bad valid_ip_pref both
+    assert_ok valid_timezone_name UTC
+    assert_bad valid_timezone_name '../etc/passwd'
+    [[ "$(timezone_for_country CN)" == 'Asia/Shanghai' ]] || { echo 'FAIL: CN timezone heuristic'; failures=$((failures + 1)); }
+    [[ "$(timezone_for_country US)" == 'America/New_York' ]] || { echo 'FAIL: US timezone heuristic'; failures=$((failures + 1)); }
     grep -Fq 'ABOX_SNI_DEFAULT_MAX=8192' "$0" || { echo 'FAIL: SNI default max missing'; failures=$((failures + 1)); }
     [[ "$(xray_version_compare v26.7.28 v26.3.27)" == '1' ]] || { echo 'FAIL: Xray version comparison'; failures=$((failures + 1)); }
     [[ "$(xray_version_compare v26.7.28 v26.7.28)" == '0' ]] || { echo 'FAIL: Xray compatibility pin comparison'; failures=$((failures + 1)); }
