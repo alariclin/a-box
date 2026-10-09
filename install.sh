@@ -35,13 +35,17 @@ DNS_BACKUP_DIR='/etc/ddr/.dns-backup'
 TZ_STATE_FILE='/etc/ddr/.timezone-state'
 ABOX_CORE_MIRROR_RELEASE='core-mirrors-v171'
 ABOX_CORE_MIRROR_BASE_DEFAULT='https://github.com/alariclin/a-box/releases/download/core-mirrors-v171'
+FAST_MODE_FILE='/etc/ddr/.fast-mode'
+MIRROR_PREFER_FILE='/etc/ddr/.mirror-prefer'
+EXTRA_UUID_FILE='/etc/ddr/.extra-uuids'
+SUBSCRIBE_DIR='/etc/ddr/subscribe'
 PUBLIC_IP_CACHE='/etc/ddr/.public_ip.cache'
 PUBLIC_IP_CACHE_TTL=600
 BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-10}
 LOCK_FALLBACK_DIR='/run/A-Box.lock.d'
 ABOX_LANG='zh'
-ABOX_BUILD='2026-10-10-release-candidate-v171'
-ABOX_BUILD_EPOCH=20261010171
+ABOX_BUILD='2026-10-10-release-candidate-v172'
+ABOX_BUILD_EPOCH=20261010172
 # Cross-client compatibility pin for Shadowrocket + Mihomo/Clash Verge + sing-box
 # with VLESS/REALITY and XHTTP as of 2026-10-08.
 # Xray 26.9.8/26.9.9 introduces the newer REALITY ML-KEM ClientHello gate;
@@ -2444,18 +2448,26 @@ managed_services_active() {
 }
 
 confirm_deployment_replacement() {
-    local next_core="$1" next_mode="$2" answer current="none"
+    local next_core="$1" next_mode="$2" answer current="none" active_rc=1
     [[ -n "${CORE:-}" || -n "${MODE:-}" ]] && current="${CORE:-unknown}-${MODE:-unknown}"
     if [[ "$current" == 'none' ]]; then
         managed_services_active
-        case $? in
-            1) return 0 ;;
+        active_rc=$?
+        case $active_rc in
+            1)
+                # No managed services: soft skip in fast/one-click; otherwise no prompt needed either.
+                if abox_is_fast || [[ "${ABOX_QUICK_DEPLOY:-0}" == '1' ]]; then
+                    msg "${YELLOW}[fast/one-click] fresh host; skip deploy confirm.${NC}"
+                fi
+                return 0
+                ;;
             0|2) : ;;
             *) return 1 ;;
         esac
     fi
     msg "${YELLOW}[!] A-Box will stop managed services before deploying a new stack.${NC}"
     msg "Current config: ${current} | New deployment: ${next_core}-${next_mode}"
+    # Critical when replacing existing config/services: never auto-yes in fast mode.
     read -r -p 'Continue deployment? [Y/N]: ' answer
     is_yes "$answer" || die '已取消部署 / Deployment canceled.'
 }
@@ -4442,6 +4454,21 @@ fetch_github_release() {
         fi
     fi
     msg "${YELLOW} -> 正在从 GitHub 获取指定架构/版本资产 [${repo}:${release_ref}]...${NC}"
+    probe_core_sources_banner
+
+    # U5: optional mirror-first (still SHA256 verified; never skips digest).
+    if abox_prefer_mirror; then
+        if [[ -z "$dest_file" ]]; then
+            tmp_dir=$(mktemp -d /tmp/A-Box-asset.XXXXXX) || die '核心资产临时目录创建失败。'
+            dest_file="$tmp_dir/$output_file"
+        else
+            mkdir -p "$(dirname "$dest_file")" || die '核心资产目标目录创建失败。'
+        fi
+        if fetch_abox_mirror_asset "$repo" "$output_file" "$dest_file"; then
+            return 0
+        fi
+        msg "${YELLOW}[!] mirror-first miss; falling back to upstream GitHub...${NC}"
+    fi
 
     release_json=$(github_api_get "$api_url" 2>/dev/null) || release_json=''
     [[ -n "$release_json" ]] || die 'GitHub Release API 请求失败；为保证 digest 信任根，不使用第三方镜像 API。'
@@ -5576,6 +5603,19 @@ pre_install_setup() {
     [[ -z "$INGRESS_IF" ]] && die '无法识别公网入接口。'
     GLOBAL_PUBLIC_IP=$(refresh_public_ip)
 
+    # U1 one-click / quick path: Vision-only defaults, reuse remaining setup (ports/firewall).
+    if [[ "${ABOX_QUICK_DEPLOY:-0}" == '1' && "$HAS_VISION" == 'true' && "$HAS_XHTTP" != 'true' && "$HAS_HY2" != 'true' && "$HAS_SS" != 'true' ]]; then
+        VLESS_PORT="$DEF_V_PORT"
+        VISION_SNI='www.microsoft.com'
+        VLESS_SNI="$VISION_SNI"
+        ENABLE_KEEPALIVE='false'
+        msg "${GREEN}[one-click] Vision REALITY defaults: port=${VLESS_PORT} SNI=${VISION_SNI}${NC}"
+        check_selected_ports_free
+        allowPort "$VLESS_PORT" tcp
+        save_firewall_rules || die 'A-Box 防火墙持久化失败。'
+        return 0
+    fi
+
     printf '\n%s\n' "${CYAN}======================================================================${NC}"
     if [[ "${ABOX_LANG:-zh}" == 'en' ]]; then
         msg "${BOLD}Parameter Wizard [Engine: $CORE_IN | Mode: $MODE_IN]${NC}"
@@ -5715,12 +5755,17 @@ pre_install_setup() {
         fi
     fi
 
-    if [[ "${ABOX_LANG:-zh}" == 'en' ]]; then
-        read -r -p "   ${L_GLOBAL} Enable TCP KeepAlive 45s to prevent NAT idle disconnect? [Y/N]: " INPUT_KA || die '交互输入已结束 / Interactive input closed.'
+    if abox_is_fast; then
+        ENABLE_KEEPALIVE='false'
+        msg "${YELLOW}[fast] TCP KeepAlive default off.${NC}"
     else
-        read -r -p "   ${L_GLOBAL} 是否开启 TCP KeepAlive (45s) 防治 NAT 空闲断连? [Y/N]: " INPUT_KA || die '交互输入已结束 / Interactive input closed.'
+        if [[ "${ABOX_LANG:-zh}" == 'en' ]]; then
+            read -r -p "   ${L_GLOBAL} Enable TCP KeepAlive 45s to prevent NAT idle disconnect? [Y/N]: " INPUT_KA || die '交互输入已结束 / Interactive input closed.'
+        else
+            read -r -p "   ${L_GLOBAL} 是否开启 TCP KeepAlive (45s) 防治 NAT 空闲断连? [Y/N]: " INPUT_KA || die '交互输入已结束 / Interactive input closed.'
+        fi
+        is_yes "$INPUT_KA" && ENABLE_KEEPALIVE='true' || ENABLE_KEEPALIVE='false'
     fi
-    is_yes "$INPUT_KA" && ENABLE_KEEPALIVE='true' || ENABLE_KEEPALIVE='false'
     printf '%s\n\n' "${CYAN}======================================================================${NC}"
 
     check_selected_ports_free
@@ -8120,6 +8165,333 @@ EOF_BBR
 }
 
 
+
+# --- v172 UX helpers (U1–U5) ---
+abox_is_fast() {
+    [[ "${ABOX_FAST:-}" =~ ^(1|true|yes|YES|True)$ ]] && return 0
+    [[ -r "$FAST_MODE_FILE" && -f "$FAST_MODE_FILE" && ! -L "$FAST_MODE_FILE" ]] || return 1
+    [[ "$(tr -d '[:space:]' < "$FAST_MODE_FILE" 2>/dev/null || true)" == '1' ]]
+}
+
+read_fast_mode_label() {
+    if abox_is_fast; then printf 'fast\n'; else printf 'strict\n'; fi
+}
+
+save_fast_mode() {
+    local v="${1:-0}"
+    [[ "$v" =~ ^(0|1)$ ]] || die '非法快速模式开关。'
+    ensure_abox_dir_owned "$ABOX_DIR" || die '无法准备 A-Box 状态目录。'
+    write_file_atomically_from_stdin "$FAST_MODE_FILE" 600 <<< "$v" || die '快速模式写入失败。'
+}
+
+abox_prefer_mirror() {
+    [[ "${ABOX_CORE_MIRROR_PREFER:-}" =~ ^(1|true|yes)$ ]] && return 0
+    [[ -r "$MIRROR_PREFER_FILE" && -f "$MIRROR_PREFER_FILE" && ! -L "$MIRROR_PREFER_FILE" ]] || return 1
+    [[ "$(tr -d '[:space:]' < "$MIRROR_PREFER_FILE" 2>/dev/null || true)" == '1' ]]
+}
+
+save_mirror_prefer() {
+    local v="${1:-0}"
+    [[ "$v" =~ ^(0|1)$ ]] || die '非法镜像优先开关。'
+    ensure_abox_dir_owned "$ABOX_DIR" || die '无法准备 A-Box 状态目录。'
+    write_file_atomically_from_stdin "$MIRROR_PREFER_FILE" 600 <<< "$v" || die '镜像优先写入失败。'
+}
+
+confirm_soft() {
+    # Non-critical confirm: auto-yes in fast mode. Never use for uninstall/digest/destructive wipe.
+    local prompt="$1" answer
+    if abox_is_fast; then
+        msg "${YELLOW}[fast] ${prompt} → Y${NC}"
+        return 0
+    fi
+    read -r -p "$prompt" answer || return 1
+    is_yes "$answer"
+}
+
+show_core_pin_docs() {
+    clear
+    msg "${CYAN}======================================================================${NC}"
+    msg "${BOLD}${GREEN}核心兼容钉扎说明 / Core compatibility pins${NC}"
+    msg "${CYAN}======================================================================${NC}"
+    msg "Xray default: ${YELLOW}${ABOX_XRAY_DEFAULT_VERSION}${NC} (Shadowrocket/Mihomo/XHTTP; avoids 26.9.x ML-KEM ClientHello gate)"
+    msg "sing-box default: ${YELLOW}${ABOX_SINGBOX_DEFAULT_VERSION}${NC}"
+    msg "Hysteria default: ${YELLOW}${ABOX_HYSTERIA_APP_VERSION:-app/v2.13.0}${NC}"
+    msg "Override: ABOX_XRAY_VERSION / ABOX_SINGBOX_VERSION / ABOX_HYSTERIA_APP_VERSION"
+    msg "Disaster mirror Release: ${YELLOW}${ABOX_CORE_MIRROR_RELEASE}${NC}"
+    msg "Download order: upstream GitHub → A-Box core-mirrors → custom ABOX_CORE_MIRROR_BASE"
+    msg "Prefer mirror file: ${MIRROR_PREFER_FILE} (or ABOX_CORE_MIRROR_PREFER=1)"
+    msg "Mode: ${YELLOW}$(read_fast_mode_label)${NC} (ABOX_FAST=1 or ${FAST_MODE_FILE})"
+    pause_return
+}
+
+probe_core_sources_banner() {
+    local pref='upstream-first'
+    abox_prefer_mirror && pref='mirror-first'
+    msg "${CYAN}[download sources] order=${pref}: 1) upstream GitHub Release  2) A-Box ${ABOX_CORE_MIRROR_RELEASE}  3) custom ABOX_CORE_MIRROR_BASE=${ABOX_CORE_MIRROR_BASE:-<unset>}${NC}"
+}
+
+fetch_abox_mirror_asset() {
+    # Try disaster mirror for current repo:output_file; verify SHA256SUMS. Used by prefer-mirror and fallback.
+    local repo=$1 output_file=$2 dest_file=$3
+    local mirror_base mirror_url mirror_sum expect_sum got_sum asset_leaf tmp_file _sb_ver
+    mirror_base="${ABOX_CORE_MIRROR_BASE:-$ABOX_CORE_MIRROR_BASE_DEFAULT}"
+    [[ -n "$mirror_base" ]] || return 1
+    case "$repo:$output_file" in
+        XTLS/Xray-core:xray_core.zip) asset_leaf="Xray-linux-${XRAY_ARCH}.zip" ;;
+        SagerNet/sing-box:singbox_core.tar.gz)
+            _sb_ver="${ABOX_SINGBOX_VERSION:-$ABOX_SINGBOX_DEFAULT_VERSION}"; _sb_ver="${_sb_ver#v}"
+            if [[ "${release:-}" == 'alpine' ]]; then
+                asset_leaf="sing-box-${_sb_ver}-linux-${SB_ARCH}-musl.tar.gz"
+            else
+                asset_leaf="sing-box-${_sb_ver}-linux-${SB_ARCH}-glibc.tar.gz"
+            fi
+            ;;
+        HyNetworks/hysteria:hysteria_core) asset_leaf="hysteria-linux-${HY2_ARCH}" ;;
+        *) return 1 ;;
+    esac
+    mirror_url="${mirror_base%/}/${asset_leaf}"
+    mirror_sum="${mirror_base%/}/SHA256SUMS"
+    msg "${YELLOW} -> A-Box mirror try: ${mirror_url}${NC}"
+    tmp_file=$(mktemp "${dest_file}.download.XXXXXX") || return 1
+    if ! curl -fLsS --connect-timeout 10 -m 180 "$mirror_url" -o "$tmp_file"; then
+        rm -f "$tmp_file"; return 1
+    fi
+    if ! validate_downloaded_asset "$output_file" "$tmp_file"; then
+        rm -f "$tmp_file"; return 1
+    fi
+    expect_sum=$(curl -fsS --connect-timeout 8 -m 30 "$mirror_sum" 2>/dev/null | awk -v f="$asset_leaf" '$2==f || $2==("./" f) || $2~(f"$") {print $1; exit}')
+    got_sum=$(sha256sum "$tmp_file" | awk '{print $1}')
+    if [[ -z "$expect_sum" || ! "$expect_sum" =~ ^[A-Fa-f0-9]{64}$ || "${got_sum,,}" != "${expect_sum,,}" ]]; then
+        msg "${YELLOW}[!] mirror SHA256 mismatch or missing SHA256SUMS${NC}"
+        rm -f "$tmp_file"; return 1
+    fi
+    mv -f "$tmp_file" "$dest_file" || { rm -f "$tmp_file"; return 1; }
+    msg "${GREEN}   mirror asset OK (SHA256 verified).${NC}"
+    return 0
+}
+
+one_click_reality_deploy() {
+    local eng='1' answer
+    clear
+    msg "${CYAN}======================================================================${NC}"
+    msg "${BOLD}${GREEN}一键 Reality / One-click Vision REALITY${NC}"
+    msg "${CYAN}======================================================================${NC}"
+    msg "Defaults: port ${YELLOW}443${NC}, SNI ${YELLOW}www.microsoft.com${NC}, KeepAlive off"
+    msg "Reuses existing deploy stack; menu 1/6 still available for full wizard."
+    if [[ "${ABOX_LANG:-zh}" == 'en' ]]; then
+        msg "${YELLOW}1.${NC} Xray Vision REALITY (recommended)"
+        msg "${YELLOW}2.${NC} sing-box Vision REALITY"
+        msg "${GREEN}0.${NC} Cancel"
+        read -r -p 'Select [0-2]: ' eng || return 0
+    else
+        msg "${YELLOW}1.${NC} Xray Vision REALITY（推荐）"
+        msg "${YELLOW}2.${NC} sing-box Vision REALITY"
+        msg "${GREEN}0.${NC} 取消"
+        read -r -p '请选择 [0-2]: ' eng || return 0
+    fi
+    case "$eng" in
+        1|2) ;;
+        *) return 0 ;;
+    esac
+    if ! confirm_soft 'Deploy one-click Vision REALITY now? [Y/N]: '; then
+        msg "${YELLOW}Canceled.${NC}"; pause_return; return 0
+    fi
+    export ABOX_QUICK_DEPLOY=1
+    case "$eng" in
+        1) deploy_xray VISION ;;
+        2) deploy_singbox VISION ;;
+    esac
+    unset ABOX_QUICK_DEPLOY
+}
+
+ux_mode_menu() {
+    clear
+    local c
+    msg "${CYAN}======================================================================${NC}"
+    msg "${BOLD}${GREEN}体验模式与下载源 / UX mode & download source${NC}"
+    msg "Current mode: ${YELLOW}$(read_fast_mode_label)${NC}"
+    msg "Prefer mirror: ${YELLOW}$(abox_prefer_mirror && echo on || echo off)${NC}"
+    msg "${YELLOW}1. Strict mode (default; all soft confirms)${NC}"
+    msg "${YELLOW}2. Fast mode (skip non-critical confirms; NEVER skip digest / uninstall)${NC}"
+    msg "${YELLOW}3. Prefer A-Box core-mirrors first${NC}"
+    msg "${YELLOW}4. Prefer upstream GitHub first (default)${NC}"
+    msg "${YELLOW}5. Show pin / download order docs${NC}"
+    msg "${GREEN}0. Back${NC}"
+    read -r -p 'Select [0-5]: ' c
+    case "$c" in
+        1) save_fast_mode 0; msg "${GREEN}Strict mode saved.${NC}"; pause_return ;;
+        2) save_fast_mode 1; msg "${GREEN}Fast mode saved (ABOX_FAST=1 also works).${NC}"; pause_return ;;
+        3) save_mirror_prefer 1; msg "${GREEN}Mirror-first saved.${NC}"; pause_return ;;
+        4) save_mirror_prefer 0; msg "${GREEN}Upstream-first saved.${NC}"; pause_return ;;
+        5) show_core_pin_docs ;;
+        *) return 0 ;;
+    esac
+}
+
+list_extra_uuids() {
+    [[ -r "$EXTRA_UUID_FILE" && -f "$EXTRA_UUID_FILE" && ! -L "$EXTRA_UUID_FILE" ]] || return 0
+    grep -E '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$' "$EXTRA_UUID_FILE" 2>/dev/null || true
+}
+
+sync_uuids_into_xray_config() {
+    local cfg='/usr/local/etc/xray/config.json' tmp primary extras_json
+    [[ -f "$cfg" && ! -L "$cfg" ]] || return 1
+    primary="${UUID:-}"
+    [[ -n "$primary" ]] || return 1
+    extras_json=$(list_extra_uuids | jq -R . | jq -s -c 'map(select(length>0))')
+    [[ -n "$extras_json" ]] || extras_json='[]'
+    tmp=$(mktemp /tmp/A-Box-uuid.XXXXXX) || return 1
+    if ! jq --arg p "$primary" --argjson extras "$extras_json" '
+        .inbounds |= map(
+          if .protocol=="vless" then
+            (.settings.clients[0].flow // "") as $flow |
+            .settings.clients = (
+              [({id:$p} + (if $flow != "" then {flow:$flow} else {} end))]
+              + ($extras | map({id:.} + (if $flow != "" then {flow:$flow} else {} end)))
+            )
+          else . end
+        )
+      ' "$cfg" > "$tmp"; then
+        rm -f "$tmp"; return 1
+    fi
+    jq empty "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
+    if [[ -x /usr/local/bin/xray ]]; then
+        XRAY_LOCATION_ASSET=/usr/local/share/xray /usr/local/bin/xray run -test -config "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
+    fi
+    install_file_atomically "$tmp" "$cfg" 600 || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+    return 0
+}
+
+export_lightweight_subscription() {
+    local CALLER=${1:-manual} F_IP VISION_SNI_E PUBLIC_KEY_E SHORT_ID_E uri_file b64_file clash_file u url
+    ensure_abox_dir_owned "$ABOX_DIR" || die 'subscribe dir prepare failed'
+    mkdir -p "$SUBSCRIBE_DIR" || die 'subscribe dir create failed'
+    chmod 700 "$SUBSCRIBE_DIR" || true
+    [[ -f "$ABOX_ENV" ]] || { msg "${RED}No deployment env.${NC}"; pause_return; return 1; }
+    load_abox_env "$ABOX_ENV" || die 'env invalid'
+    F_IP="${LINK_IP:-}"
+    [[ "$F_IP" =~ : ]] && F_IP="[$F_IP]"
+    VISION_SNI=${VISION_SNI:-${VLESS_SNI:-}}
+    VISION_SNI_E=$(urlencode "$VISION_SNI")
+    PUBLIC_KEY_E=$(urlencode "$PUBLIC_KEY")
+    SHORT_ID_E=$(urlencode "$SHORT_ID")
+    uri_file="$SUBSCRIBE_DIR/uri-list.txt"
+    b64_file="$SUBSCRIBE_DIR/subscription.base64"
+    : > "$uri_file"
+    if [[ "$MODE" == *'VISION'* || "$MODE" == *'ALL'* || "$MODE" == 'VLESS_SS' ]]; then
+        url="vless://$UUID@$F_IP:$VLESS_PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$VISION_SNI_E&fp=chrome&pbk=$PUBLIC_KEY_E&sid=$SHORT_ID_E&type=tcp#A-Box-primary"
+        printf '%s\n' "$url" >> "$uri_file"
+        while IFS= read -r u; do
+            [[ -n "$u" ]] || continue
+            url="vless://$u@$F_IP:$VLESS_PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$VISION_SNI_E&fp=chrome&pbk=$PUBLIC_KEY_E&sid=$SHORT_ID_E&type=tcp#A-Box-$u"
+            printf '%s\n' "$url" >> "$uri_file"
+        done < <(list_extra_uuids)
+    fi
+    if command -v base64 >/dev/null 2>&1; then
+        base64 -w0 < "$uri_file" > "$b64_file" 2>/dev/null || base64 < "$uri_file" | tr -d '\n' > "$b64_file"
+    fi
+    clash_file=$(write_clash_yaml 2>/dev/null || true)
+    msg "${GREEN}URI list: ${uri_file}${NC}"
+    [[ -f "$b64_file" ]] && msg "${GREEN}Base64 subscription: ${b64_file}${NC}"
+    [[ -n "${clash_file:-}" ]] && msg "${GREEN}Clash YAML: ${clash_file}${NC}"
+    if [[ "$CALLER" != 'quiet' ]]; then
+        msg "${YELLOW}Host these files via HTTPS for remote import; this is not a full panel.${NC}"
+        pause_return
+    fi
+}
+
+multi_uuid_menu() {
+    clear
+    local c nu answer
+    msg "${CYAN}======================================================================${NC}"
+    msg "${BOLD}${GREEN}轻量多 UUID / 订阅导出 (U4)${NC}"
+    msg "Primary UUID: ${YELLOW}${UUID:-load env first}${NC}"
+    msg "Extra UUIDs:"
+    list_extra_uuids | sed 's/^/  /' || msg '  (none)'
+    msg "${YELLOW}1. Add extra UUID (patch Xray clients if Vision present)${NC}"
+    msg "${YELLOW}2. Export URI list + base64 + Clash path${NC}"
+    msg "${YELLOW}3. Clear extra UUIDs file (does not rewrite server until next sync/export add)${NC}"
+    msg "${GREEN}0. Back${NC}"
+    [[ -f "$ABOX_ENV" ]] && load_abox_env "$ABOX_ENV" 2>/dev/null || true
+    read -r -p 'Select [0-3]: ' c
+    case "$c" in
+        1)
+            nu=$(generate_robust_uuid)
+            ensure_abox_dir_owned "$ABOX_DIR"
+            touch "$EXTRA_UUID_FILE"
+            chmod 600 "$EXTRA_UUID_FILE"
+            printf '%s\n' "$nu" >> "$EXTRA_UUID_FILE"
+            msg "${GREEN}Added: $nu${NC}"
+            if [[ "${CORE:-}" == 'xray' ]] && [[ -f /usr/local/etc/xray/config.json ]]; then
+                if sync_uuids_into_xray_config; then
+                    service_manager restart xray 2>/dev/null || service_manager start xray 2>/dev/null || true
+                    msg "${GREEN}Xray clients updated.${NC}"
+                else
+                    msg "${YELLOW}[!] Could not patch Xray config; URI export still lists the UUID for manual merge.${NC}"
+                fi
+            fi
+            export_lightweight_subscription quiet
+            pause_return
+            ;;
+        2) export_lightweight_subscription manual ;;
+        3)
+            read -r -p 'Clear extra UUID file? [Y/N]: ' answer
+            is_yes "$answer" || { pause_return; return 0; }
+            rm -f -- "$EXTRA_UUID_FILE"
+            msg "${GREEN}Cleared.${NC}"; pause_return
+            ;;
+        *) return 0 ;;
+    esac
+}
+
+try_latest_cores_danger() {
+    local answer targets=() t latest json
+    clear
+    msg "${RED}${BOLD}DANGER: 试用上游 latest 核心 / Try upstream latest${NC}"
+    msg "Default pins remain ${ABOX_XRAY_DEFAULT_VERSION} / ${ABOX_SINGBOX_DEFAULT_VERSION}."
+    msg "This path may break Shadowrocket/Mihomo (e.g. Xray ML-KEM). Failure triggers automatic rollback."
+    read -r -p 'Type YES to continue: ' answer
+    [[ "$answer" == 'YES' ]] || { msg "${YELLOW}Canceled.${NC}"; pause_return; return 0; }
+    init_system_environment
+    load_optional_abox_env_or_die
+    if abox_owns_service xray && [[ -x /usr/local/bin/xray ]]; then targets+=(xray); fi
+    if abox_owns_service sing-box && [[ -x /usr/local/bin/sing-box ]]; then targets+=(singbox); fi
+    if abox_owns_service hysteria && [[ -x /usr/local/bin/hysteria ]]; then targets+=(hysteria); fi
+    (( ${#targets[@]} > 0 )) || { msg "${YELLOW}No owned cores.${NC}"; pause_return; return 0; }
+    begin_core_upgrade_transaction "${targets[@]}"
+    for t in "${targets[@]}"; do
+        case "$t" in
+            xray)
+                json=$(github_api_get 'https://api.github.com/repos/XTLS/Xray-core/releases/latest' 2>/dev/null) || json=''
+                latest=$(jq -r '.tag_name // empty' <<< "$json")
+                [[ -n "$latest" ]] || die '无法解析 Xray latest tag。'
+                msg "${YELLOW}Trying Xray ${latest}${NC}"
+                ABOX_XRAY_VERSION="$latest" upgrade_xray_core_only
+                ;;
+            singbox)
+                json=$(github_api_get 'https://api.github.com/repos/SagerNet/sing-box/releases/latest' 2>/dev/null) || json=''
+                latest=$(jq -r '.tag_name // empty' <<< "$json")
+                [[ -n "$latest" ]] || die '无法解析 sing-box latest tag。'
+                msg "${YELLOW}Trying sing-box ${latest}${NC}"
+                ABOX_SINGBOX_VERSION="$latest" upgrade_singbox_core_only
+                ;;
+            hysteria)
+                # Hysteria uses app/vX tags; keep pin channel unless API gives tag
+                json=$(github_api_get 'https://api.github.com/repos/HyNetworks/hysteria/releases/latest' 2>/dev/null) || json=''
+                latest=$(jq -r '.tag_name // empty' <<< "$json")
+                [[ -n "$latest" ]] || die '无法解析 Hysteria latest tag。'
+                msg "${YELLOW}Trying Hysteria ${latest}${NC}"
+                ABOX_HYSTERIA_APP_VERSION="$latest" upgrade_hysteria_core_only
+                ;;
+        esac
+    done
+    commit_core_upgrade_transaction
+    msg "${GREEN}Latest-core attempt finished (transaction committed). Re-test clients.${NC}"
+    pause_return
+}
+
+
 valid_ip_pref() {
     [[ "${1:-}" =~ ^(ipv4|ipv6|dual)$ ]]
 }
@@ -8548,15 +8920,17 @@ tune_vps() {
     msg "${YELLOW}3. IP 协议偏好 (IPv4 / IPv6 / dual)${NC}"
     msg "${YELLOW}4. 本机 DNS (明文 / DoT，可回滚)${NC}"
     msg "${YELLOW}5. 时区 (启发式推荐 / 自定义，可回滚)${NC}"
+    msg "${YELLOW}6. 体验模式 / 下载源 (fast·strict·mirror) [U2/U5]${NC}"
     msg "${GREEN}0. 返回${NC}"
     local c
-    read -r -p 'Select [0-5]: ' c
+    read -r -p 'Select [0-6]: ' c
     case "$c" in
         1) apply_vps_tune; pause_return ;;
         2) restore_vps_tune; pause_return ;;
         3) ip_preference_menu ;;
         4) dns_menu ;;
         5) timezone_menu ;;
+        6) ux_mode_menu ;;
         *) return 0 ;;
     esac
 }
@@ -11514,6 +11888,7 @@ vps_benchmark_menu() {
         msg "${YELLOW}8. Export redacted diagnostic bundle${NC}"
         msg "${YELLOW}9. Full dry-run preflight check${NC}"
         msg "${YELLOW}10. SNI preference records${NC}"
+        msg "${YELLOW}11. Multi-UUID / lightweight subscription export [U4]${NC}"
         msg "${GREEN}0. Back${NC}"
     else
         msg "${YELLOW}1. 本机配置和下载测速${NC}"
@@ -11526,10 +11901,11 @@ vps_benchmark_menu() {
         msg "${YELLOW}8. 导出脱敏诊断包${NC}"
         msg "${YELLOW}9. 完整 Dry-run 预检查${NC}"
         msg "${YELLOW}10. SNI 优选记录${NC}"
+        msg "${YELLOW}11. 轻量多 UUID / 订阅导出 [U4]${NC}"
         msg "${GREEN}0. 返回主菜单${NC}"
     fi
     local bench_choice
-    read -r -p 'Select [0-10]: ' bench_choice
+    read -r -p 'Select [0-11]: ' bench_choice
     case "$bench_choice" in
         1)
             confirm_yes_no "$(tprintf confirm_remote 'System benchmark and download speed')" && run_remote_bash_script 'System benchmark and download speed' 'https://bench.sh'
@@ -11547,6 +11923,7 @@ vps_benchmark_menu() {
         8) export_diagnostic_bundle ;;
         9) preflight_check ;;
         10) show_sni_preference_records ;;
+        11) multi_uuid_menu ;;
         *) return 0 ;;
     esac
 }
@@ -12090,7 +12467,8 @@ EOF_USAGE
 【运维类】
 11 综合工具箱
    本机配置/下载测速；IP纯净度/流媒体解锁/回程测试；内置全量SNI优选库；内置微型主机SNI优选库；SNI 优选记录查看；Cloudflare WARP接管；2G Swap划拨；配置备份/恢复；脱敏诊断包导出；完整 Dry-run 预检查。
-12 VPS 一键优化
+12 VPS 系统工具 (含 fast/mirror)
+21 一键 Reality
    BBR/FQ、文件句柄、KeepAlive、健康探针、logrotate/fail2ban防御。
 13 全部节点参数显示
    输出 URI、二维码、Clash/Mihomo YAML、sing-box出站、v2rayN/v2rayNG XHTTP JSON。
@@ -12643,21 +13021,27 @@ ota_and_geo_menu() {
         msg "${YELLOW}1. Upgrade A-Box script${NC}"
         msg "${YELLOW}2. Update Xray Loyalsoldier Geo resources now${NC}"
         msg "${YELLOW}3. Upgrade current installed proxy cores only; preserve node parameters${NC}"
+        msg "${YELLOW}4. Show compatibility pin docs [U3]${NC}"
+        msg "${YELLOW}5. DANGER: try upstream latest cores (auto-rollback) [U3]${NC}"
         msg "${GREEN}0. Back${NC}"
-        read -r -p 'Select [0-3]: ' ota_choice
+        read -r -p 'Select [0-5]: ' ota_choice
     else
         msg "${BOLD}${GREEN}脚本 OTA、Xray Geo 与核心无损升级${NC}"
         msg "${CYAN}======================================================================${NC}"
         msg "${YELLOW}1. 升级 A-Box 核心脚本${NC}"
         msg "${YELLOW}2. 立即拉取并更新 Xray Loyalsoldier Geo 资源${NC}"
         msg "${YELLOW}3. 仅升级当前已安装协议核心，不重置节点参数${NC}"
+        msg "${YELLOW}4. 查看兼容钉扎说明 [U3]${NC}"
+        msg "${YELLOW}5. 危险：试用上游 latest 核心（失败自动回滚）[U3]${NC}"
         msg "${GREEN}0. 返回主菜单${NC}"
-        read -r -p '请选择 [0-3]: ' ota_choice
+        read -r -p '请选择 [0-5]: ' ota_choice
     fi
     case "$ota_choice" in
         1) update_script ;;
         2) force_update_geo ;;
         3) upgrade_current_cores_only ;;
+        4) show_core_pin_docs ;;
+        5) try_latest_cores_danger ;;
         *) return 0 ;;
     esac
 }
@@ -13293,14 +13677,21 @@ PY_SELFTEST_TAR
     grep -Fq 'ABOX_HYSTERIA_APP_VERSION:-app/v2.13.0' "$0" || { echo 'FAIL: Hysteria v2.13.0 compatibility pin missing'; failures=$((failures + 1)); }
     grep -Fq "ABOX_XRAY_DEFAULT_VERSION='v26.7.28'" "$0" || { echo 'FAIL: Xray iOS/XHTTP compatibility pin missing'; failures=$((failures + 1)); }
 
-    grep -Fq "ABOX_BUILD='2026-10-10-release-candidate-v171'" "$0" || { echo 'FAIL: build string missing'; failures=$((failures + 1)); }
-    grep -Fq 'ABOX_BUILD_EPOCH=20261010171' "$0" || { echo 'FAIL: build epoch missing'; failures=$((failures + 1)); }
+    grep -Fq "ABOX_BUILD='2026-10-10-release-candidate-v172'" "$0" || { echo 'FAIL: build string missing'; failures=$((failures + 1)); }
+    grep -Fq 'ABOX_BUILD_EPOCH=20261010172' "$0" || { echo 'FAIL: build epoch missing'; failures=$((failures + 1)); }
     grep -Fq 'IP_PREF_FILE=' "$0" || { echo 'FAIL: IP preference state file missing'; failures=$((failures + 1)); }
     grep -Fq 'ip_preference_menu()' "$0" || { echo 'FAIL: IP preference menu missing'; failures=$((failures + 1)); }
     grep -Fq 'dns_menu()' "$0" || { echo 'FAIL: DNS menu missing'; failures=$((failures + 1)); }
     grep -Fq 'timezone_menu()' "$0" || { echo 'FAIL: timezone menu missing'; failures=$((failures + 1)); }
     grep -Fq 'ABOX_CORE_MIRROR_BASE_DEFAULT=' "$0" || { echo 'FAIL: core disaster mirror base missing'; failures=$((failures + 1)); }
     grep -Fq '截至当前 / Usage up to now' "$0" || { echo 'FAIL: traffic up-to-now banner missing'; failures=$((failures + 1)); }
+    grep -Fq 'one_click_reality_deploy()' "$0" || { echo 'FAIL: one-click Reality missing'; failures=$((failures + 1)); }
+    grep -Fq 'abox_is_fast()' "$0" || { echo 'FAIL: fast mode helper missing'; failures=$((failures + 1)); }
+    grep -Fq 'try_latest_cores_danger()' "$0" || { echo 'FAIL: try-latest cores missing'; failures=$((failures + 1)); }
+    grep -Fq 'export_lightweight_subscription()' "$0" || { echo 'FAIL: lightweight subscription missing'; failures=$((failures + 1)); }
+    grep -Fq 'probe_core_sources_banner()' "$0" || { echo 'FAIL: download source probe missing'; failures=$((failures + 1)); }
+    grep -Fq 'fetch_abox_mirror_asset()' "$0" || { echo 'FAIL: mirror asset helper missing'; failures=$((failures + 1)); }
+
     assert_ok valid_ip_pref ipv4
     assert_ok valid_ip_pref ipv6
     assert_ok valid_ip_pref dual
@@ -14336,7 +14727,8 @@ main_loop() {
         msg "${BOLD}${YELLOW}==================================A-Box===============================${NC}"
         msg "${BLUE}======================================================================${NC}"
         if [[ "${ABOX_LANG:-zh}" == 'en' ]]; then
-            msg "Gateway: ${YELLOW}$GLOBAL_PUBLIC_IP${NC} | Core: $STATUS_STR $CUR_MODE"
+            msg "Gateway: ${YELLOW}$GLOBAL_PUBLIC_IP${NC} | Core: $STATUS_STR $CUR_MODE | Mode: ${YELLOW}$(read_fast_mode_label)${NC}"
+            msg "${GREEN}21.${NC} ${BOLD}One-click Vision REALITY${NC} (minimal prompts)  ${YELLOW}[r]${NC}=same"
             msg "${BLUE}----------------------------------------------------------------------${NC}"
             msg "${YELLOW}[ Xray-core Deployment ]${NC}              ${YELLOW}[ Sing-box Deployment ]${NC}"
             msg "${GREEN}1.${NC} VLESS-Vision-Reality               ${GREEN}6.${NC} VLESS-Vision-Reality"
@@ -14355,6 +14747,7 @@ main_loop() {
             msg "${GREEN}18.${NC} Monthly Traffic Limit"
             msg "${GREEN}19.${NC} SS-2022 Whitelist Manager"
             msg "${GREEN}20.${NC} Language"
+            msg "${GREEN}21.${NC} One-click Vision REALITY"
             msg "${GREEN} 0.${NC} Exit"
             msg "${BLUE}======================================================================${NC}"
             _menu_lock_released=0
@@ -14367,7 +14760,8 @@ main_loop() {
             fi
             unset _menu_lock_released
         else
-            msg "网关/Gateway: ${YELLOW}$GLOBAL_PUBLIC_IP${NC} | 核心/Core: $STATUS_STR $CUR_MODE"
+            msg "网关/Gateway: ${YELLOW}$GLOBAL_PUBLIC_IP${NC} | 核心/Core: $STATUS_STR $CUR_MODE | 模式: ${YELLOW}$(read_fast_mode_label)${NC}"
+            msg "${GREEN}21.${NC} ${BOLD}一键 Reality${NC}（Vision 默认 SNI，最少提问）  ${YELLOW}[r]${NC}=同"
             msg "${BLUE}----------------------------------------------------------------------${NC}"
             msg "${YELLOW}[ Xray-core 部署 ]${NC}                    ${YELLOW}[ Sing-box 部署 ]${NC}"
             msg "${GREEN}1.${NC} VLESS-Vision-Reality               ${GREEN}6.${NC} VLESS-Vision-Reality"
@@ -14386,6 +14780,7 @@ main_loop() {
             msg "${GREEN}18.${NC} 每月流量管控限制"
             msg "${GREEN}19.${NC} SS-2022 白名单 IP 管理"
             msg "${GREEN}20.${NC} 语言设置 / Language"
+            msg "${GREEN}21.${NC} 一键 Reality"
             msg "${GREEN} 0.${NC} 退出脚本"
             msg "${BLUE}======================================================================${NC}"
             _menu_lock_released=0
@@ -14419,6 +14814,7 @@ main_loop() {
             18) traffic_management_menu ;;
             19) manage_ss_whitelist ;;
             20) language_menu ;;
+            21|r|R) one_click_reality_deploy ;;
             0) clear; exit 0 ;;
             *) sleep 1 ;;
         esac

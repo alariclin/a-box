@@ -8,7 +8,7 @@ Linux 网络网关一键工具箱。
   <img width="804" height="867" alt="A-Box_github" src="https://github.com/user-attachments/assets/4f51a6a1-5d1b-49db-90df-98ffae63d1ca" />
 </p>
 
-A-Box 是一个独立 Bash 脚本，用于部署和维护 Linux 网络网关服务。本文档对应的脚本构建版本为 `2026-10-10-release-candidate-v171`，当前脚本配置的默认核心版本为 Xray `v26.7.28`、sing-box `v1.14.2`。
+A-Box 是一个独立 Bash 脚本，用于部署和维护 Linux 网络网关服务。本文档对应的脚本构建版本为 `2026-10-10-release-candidate-v172`，当前脚本配置的默认核心版本为 Xray `v26.7.28`、sing-box `v1.14.2`。
 
 支持 Xray-core、sing-box、官方 Hysteria 2 服务端、VLESS Vision REALITY、VLESS XHTTP REALITY、Shadowsocks-2022、客户端配置导出、本地 SNI 候选测试、备份恢复、防火墙管理、诊断、流量限制、健康检查和核心软件升级；上游失败时回退到仓库 Release `core-mirrors-v171` 灾备资产。
 
@@ -45,6 +45,7 @@ curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/alariclin/a-box
 - **核心灾备镜像：** 固定版本 Xray / sing-box / Hysteria 资产发布于 Release [`core-mirrors-v171`](https://github.com/alariclin/a-box/releases/tag/core-mirrors-v171)；上游失败时脚本自动回退（见 [`mirrors/README.md`](mirrors/README.md)）。
 - **SNI 候选工作流：** 本地完整和微型主机候选测试、已保存结果查看器、输入校验、文件大小/行数上限、重复项清理，以及可用时回退到有效本地缓存或同目录数据文件。
 - **维护：** 显示 SHA-256 并要求明确确认的脚本 OTA、Xray Geo 数据更新，以及不重置节点参数的核心程序单独升级。
+- **体验增强 (v172)：** 一键 Reality；快速/严格模式（`ABOX_FAST`）；钉扎说明与试用 latest（失败回滚）；轻量多 UUID/订阅导出；下载源探测（上游→灾备→自定义）。
 - **安全控制：** 部署前检查、受控服务归属/状态变更、防火墙处理，以及受支持操作的回滚路径。
 
 仓库内置候选种子文件见 [`data/sni-candidates.txt`](data/sni-candidates.txt)。SNI 列表仅是候选项。域名出现在列表中，**不代表它从特定 VPS 当前可用，也不保证符合目标 REALITY 部署所需的 TLS/ALPN/SAN 条件**。使用前必须在目标网络实际验证。无法取得有效列表或有效备用副本时，SNI 工作流会拒绝继续，而不是使用未经验证的数据。
@@ -73,6 +74,7 @@ curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/alariclin/a-box
 | `18` | 每月流量限制（基于 vnStat）。打开菜单先展示**截至当前**本月累计用量，再进入配额管理 |
 | `19` | SS-2022 IP/CIDR 白名单管理 |
 | `20` | 切换脚本界面的中文/English |
+| `21` | **一键 Reality**（Vision 默认 SNI，最少提问；`r` 同） |
 | `0` | 退出 |
 
 ### 工具箱

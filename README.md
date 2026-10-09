@@ -8,7 +8,7 @@ One-click Linux network gateway toolkit.
   <img width="804" height="867" alt="A-Box_github" src="https://github.com/user-attachments/assets/4f51a6a1-5d1b-49db-90df-98ffae63d1ca" />
 </p>
 
-A-Box is a standalone Bash script for deploying and maintaining Linux network gateway services. The script build documented here is `2026-10-10-release-candidate-v171`; its configured default core versions are Xray `v26.7.28` and sing-box `v1.14.2`.
+A-Box is a standalone Bash script for deploying and maintaining Linux network gateway services. The script build documented here is `2026-10-10-release-candidate-v172`; its configured default core versions are Xray `v26.7.28` and sing-box `v1.14.2`.
 
 It supports Xray-core, sing-box, the official Hysteria 2 server, VLESS Vision REALITY, VLESS XHTTP REALITY, Shadowsocks-2022, client configuration export, local SNI candidate testing, backup and restore, firewall management, diagnostics, traffic limits, health checks, and core software upgrades.
 
@@ -42,6 +42,7 @@ Use the official GitHub source by default. The mirror is a third-party service, 
 - **Combined deployments:** Xray + Hysteria 2 bundle, and a sing-box Vision + Hysteria 2 + Shadowsocks-2022 bundle. The sing-box bundle intentionally does not include XHTTP.
 - **Client configuration export:** share links/URIs, QR codes, Clash/Mihomo YAML, sing-box outbound templates, and v2rayN/v2rayNG XHTTP JSON.
 - **Operations and diagnostics:** health checks, system/download benchmark, IP quality and route tests, VPS system tools (tuning / IP preference / host DNS / timezone), Fail2Ban/logrotate setup, traffic limits with month-to-date usage banner, backup and restore, redacted diagnostic bundles, and preflight checks.
+- **v172 UX:** one-click Reality; fast/strict mode (`ABOX_FAST`); pin docs + try-latest with rollback; lightweight multi-UUID/subscription export; download source probe (upstream → mirrors → custom).
 - **Core disaster mirrors:** pinned Xray / sing-box / Hysteria assets on Release [`core-mirrors-v171`](https://github.com/alariclin/a-box/releases/tag/core-mirrors-v171); install falls back there if upstream Releases fail (see [`mirrors/README.md`](mirrors/README.md)).
 - **SNI candidate workflow:** local full and mini-host candidate tests, saved-result viewer, input validation, bounded file size/row count, duplicate removal, and fallback to a valid local cache or adjacent data file when available.
 - **Maintenance:** controlled script OTA with displayed SHA-256 and explicit confirmation, Xray Geo data updates, and core-only upgrades that preserve node parameters.
