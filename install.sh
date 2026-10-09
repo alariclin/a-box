@@ -14,7 +14,7 @@ export LANG=${LANG:-en_US.UTF-8}
 RED=$'\033[0;31m'
 GREEN=$'\033[0;32m'
 YELLOW=$'\033[0;33m'
-BLUE=$'\033[0;36m'
+BLUE=$'\033[0;34m'
 CYAN=$'\033[0;36m'
 NC=$'\033[0m'
 BOLD=$'\033[1m'
@@ -33,11 +33,22 @@ PUBLIC_IP_CACHE_TTL=600
 BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-10}
 LOCK_FALLBACK_DIR='/run/A-Box.lock.d'
 ABOX_LANG='zh'
-ABOX_BUILD='2026-10-08-audit-fix-v141'
-ABOX_BUILD_EPOCH=20261008141
-# Current Xray compatibility pin for iOS Shadowrocket + XHTTP/REALITY as of 2026-10-05.
-# This pin is a prerelease upstream build; newer prereleases remain opt-in via ABOX_XRAY_VERSION.
-ABOX_XRAY_DEFAULT_VERSION='v26.6.27'
+ABOX_BUILD='2026-10-09-audit-fix-v163'
+ABOX_BUILD_EPOCH=20261009163
+# Cross-client compatibility pin for Shadowrocket + Mihomo/Clash Verge + sing-box
+# with VLESS/REALITY and XHTTP as of 2026-10-08.
+# Xray 26.9.8/26.9.9 introduces the newer REALITY ML-KEM ClientHello gate;
+# public interoperability reports show breakage with common non-PQ clients.
+# Keep 26.7.28 as the compatibility baseline; explicit ABOX_XRAY_VERSION overrides
+# remain available for operators who intentionally test a newer build.
+ABOX_XRAY_DEFAULT_VERSION='v26.7.28'
+# Current sing-box stable release. XHTTP is intentionally Xray-only in A-Box because
+# the official sing-box V2Ray transport list does not expose an XHTTP transport.
+ABOX_SINGBOX_DEFAULT_VERSION='v1.14.2'
+# Candidate library sizing. 0 uses the hard ceiling instead of the historical
+# 4096 seed-only boundary; default 8192 keeps generated variants reachable.
+ABOX_SNI_DEFAULT_MAX=8192
+ABOX_SNI_HARD_MAX=16384
 ABOX_XRAY_REALITY_MLKEM_MIN_VERSION='v26.9.8'
 ABOX_RUNTIME_XRAY_USER='abox-xray'
 ABOX_RUNTIME_XRAY_GROUP='abox-xray'
@@ -339,6 +350,10 @@ tr_msg() {
         en:bad_sni) echo 'Invalid SNI format: %s' ;;
         zh:apple_non443_warn) echo '检测到非 443 端口使用 Apple/iCloud 类 SNI：%s。Xray-core 对 apple/icloud target 与非443端口有风险警告，此组合可能提高 IP 封禁概率。' ;;
         en:apple_non443_warn) echo 'Apple/iCloud-like SNI on non-443 port detected: %s. Xray-core warns about apple/icloud targets and non-443 listening ports; this combination may increase IP blocking risk.' ;;
+        zh:reality_non443_warn) echo '[!] REALITY/XHTTP 使用非 443 监听端口 (%s)。Xray 上游将其作为独立风险条件提示；请确认该端口符合你的网络环境。' ;;
+        en:reality_non443_warn) echo '[!] REALITY/XHTTP is using a non-443 listen port (%s). Xray treats this as a separate risk condition; confirm that the port is suitable for your network environment.' ;;
+        zh:apple_sni_warn) echo '[!] Apple/iCloud 类 target (%s) 被 Xray 上游作为独立风险条件提示；建议改用经过实测的非 Apple/iCloud 目标。' ;;
+        en:apple_sni_warn) echo '[!] Apple/iCloud-like target (%s) is flagged by Xray as a separate risk condition; a tested non-Apple/iCloud target is recommended.' ;;
         zh:continue_or_reset) echo '继续使用此 SNI？输入 y 继续，其他任意键重新输入 %s: ' ;;
         en:continue_or_reset) echo 'Continue with this SNI? Type y to continue, anything else to re-enter %s: ' ;;
         zh:port_prompt) echo '   %s 请输入监听端口 (回车默认: %s): ' ;;
@@ -531,6 +546,7 @@ valid_hy2_uri_ports() {
     local input="${1:-}" part
     [[ "$input" =~ ^[0-9]+(-[0-9]+)?(,[0-9]+(-[0-9]+)?)*$ ]] || return 1
     local IFS=,
+    local -a _parts=()
     read -r -a _parts <<< "$input"
     ((${#_parts[@]} > 0)) || return 1
     for part in "${_parts[@]}"; do
@@ -623,11 +639,11 @@ prompt_reality_sni() {
         fi
         warned=0
         if [[ "$port" != '443' ]]; then
-            printf '%s\n' "${YELLOW}[!] REALITY/XHTTP 使用非 443 监听端口 (${port})。Xray 上游将其作为独立风险条件提示；请确认该端口符合你的网络环境。${NC}" >&2
+            printf '%s\n' "${YELLOW}$(tprintf reality_non443_warn "$port")${NC}" >&2
             warned=1
         fi
         if is_apple_like_sni "$input"; then
-            printf '%s\n' "${YELLOW}[!] Apple/iCloud 类 target (${input}) 被 Xray 上游作为独立风险条件提示；建议改用经过实测的非 Apple/iCloud 目标。${NC}" >&2
+            printf '%s\n' "${YELLOW}$(tprintf apple_sni_warn "$input")${NC}" >&2
             warned=1
         fi
         if [[ "$warned" == 1 ]]; then
@@ -942,6 +958,17 @@ PY_ABOX_ENV
     fi
 }
 
+
+load_optional_abox_env_or_die() {
+    # A missing .env is valid during first-time setup. An existing but invalid,
+    # unsafe, or unreadable .env must never be treated as an empty installation.
+    if [[ -e "$ABOX_ENV" || -L "$ABOX_ENV" ]]; then
+        load_abox_env "$ABOX_ENV" 2>/dev/null || die '现有 A-Box .env 校验失败或权限不安全；已中止操作。'
+    else
+        clear_abox_env_vars
+    fi
+}
+
 rand_alnum() {
     local len="$1" out='' chunk attempt target max_attempts
     valid_positive_int "$len" && (( 10#$len <= 4096 )) || die '随机字符串长度非法。'
@@ -999,8 +1026,33 @@ try:
     addr = ipaddress.ip_address(sys.argv[1])
 except ValueError:
     raise SystemExit(1)
-# A public-node address must be globally routable.
-raise SystemExit(0 if addr.is_global else 1)
+if (addr.is_multicast or addr.is_reserved or addr.is_loopback or
+    addr.is_link_local or addr.is_unspecified or addr.is_private):
+    raise SystemExit(1)
+if addr.version == 6 and addr.ipv4_mapped is not None:
+    raise SystemExit(1)
+if addr.version == 4:
+    blocked = (
+        ipaddress.ip_network('0.0.0.0/8'),
+        ipaddress.ip_network('192.0.0.0/24'),
+        ipaddress.ip_network('192.88.99.0/24'),
+        ipaddress.ip_network('198.18.0.0/15'),
+        ipaddress.ip_network('198.51.100.0/24'),
+        ipaddress.ip_network('203.0.113.0/24'),
+        ipaddress.ip_network('240.0.0.0/4'),
+    )
+else:
+    blocked = (
+        ipaddress.ip_network('2001:db8::/32'),
+        ipaddress.ip_network('2001:2::/48'),
+        ipaddress.ip_network('2001:20::/28'),
+        ipaddress.ip_network('64:ff9b::/96'),
+    )
+if any(addr in network for network in blocked):
+    raise SystemExit(1)
+if not addr.is_global:
+    raise SystemExit(1)
+raise SystemExit(0)
 PY_PUBLIC_IP
 }
 
@@ -1086,7 +1138,7 @@ get_active_interface() {
     local iface
     iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
     [[ -z "$iface" ]] && iface=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-    [[ -z "$iface" ]] && iface=$(ip -o route show to default 2>/dev/null | awk '{print $5; exit}')
+    [[ -z "$iface" ]] && iface=$(ip -o route show to default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
     [[ -z "$iface" ]] && iface=$(ip -6 -o route show to default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
     [[ -z "$iface" ]] && iface=$(ip -o link show up 2>/dev/null | awk -F': ' '$2 !~ /^(lo|vir|wl)/ {sub(/@.*/,"",$2); print $2; exit}')
     printf '%s\n' "$iface"
@@ -1242,8 +1294,8 @@ ensure_commands() {
     need_cmd_pkg crontab cron cronie cronie
     need_cmd_pkg logrotate logrotate logrotate logrotate
     need_cmd_pkg python3 python3 python3 python3
-    need_cmd_pkg groupadd passwd shadow shadow-utils
-    need_cmd_pkg useradd passwd shadow shadow-utils
+    need_cmd_pkg groupadd passwd shadow-utils shadow
+    need_cmd_pkg useradd passwd shadow-utils shadow
     if (( ${#missing_pkgs[@]} > 0 )); then
         local -a unique_pkgs=()
         mapfile -t unique_pkgs < <(printf '%s\n' "${missing_pkgs[@]}" | awk 'NF && !seen[$0]++')
@@ -1561,7 +1613,7 @@ def add_path(path):
         raise SystemExit(1)
     acme = srv == 'hysteria' and (path == '/etc/hysteria/acme' or path.startswith('/etc/hysteria/acme/'))
     uid_ok = st.st_uid in ({0, runtime_uid} if acme else {0})
-    gid_ok = st.st_gid in ({0, runtime_gid} if acme else {0})
+    gid_ok = st.st_gid in ({0, runtime_gid})
     group_write_ok = acme and path == '/etc/hysteria/acme' and st.st_uid == 0 and st.st_gid == runtime_gid and stat.S_ISDIR(st.st_mode)
     if not uid_ok or not gid_ok or stat.S_ISLNK(st.st_mode) or (st.st_mode & 0o002) or ((st.st_mode & 0o020) and not group_write_ok):
         raise SystemExit(1)
@@ -1626,7 +1678,7 @@ def safe_stat(path):
         return None
     acme = srv == 'hysteria' and (path == target or path.startswith(target + '/'))
     uid_ok = st.st_uid in ({0, runtime_uid} if acme else {0})
-    gid_ok = st.st_gid in ({0, runtime_gid} if acme else {0})
+    gid_ok = st.st_gid in ({0, runtime_gid})
     legacy_root_dir_ok = acme and path == target and st.st_uid == 0 and st.st_gid == 0 and stat.S_ISDIR(st.st_mode) and (st.st_mode & 0o077) == 0
     group_write_ok = acme and path == target and st.st_uid == 0 and st.st_gid == runtime_gid and stat.S_ISDIR(st.st_mode)
     if not uid_ok or not gid_ok or stat.S_ISLNK(st.st_mode) or (st.st_mode & 0o002) or ((st.st_mode & 0o020) and not group_write_ok) or (acme and path == target and not (group_write_ok or legacy_root_dir_ok)):
@@ -1758,7 +1810,7 @@ def check(path):
     except FileNotFoundError: raise SystemExit(1)
     acme = path == target or path.startswith(target + '/')
     uid_ok = st.st_uid in ({0, runtime_uid} if acme else {0})
-    gid_ok = st.st_gid in ({0, runtime_gid} if acme else {0})
+    gid_ok = st.st_gid in ({0, runtime_gid})
     legacy_root_dir_ok = acme and path == target and st.st_uid == 0 and st.st_gid == 0 and stat.S_ISDIR(st.st_mode) and (st.st_mode & 0o077) == 0
     group_write_ok = acme and path == target and st.st_uid == 0 and st.st_gid == runtime_gid and stat.S_ISDIR(st.st_mode)
     if not uid_ok or not gid_ok or stat.S_ISLNK(st.st_mode) or (st.st_mode & 0o002) or ((st.st_mode & 0o020) and not group_write_ok) or (acme and path == target and not (group_write_ok or legacy_root_dir_ok)):
@@ -1881,7 +1933,7 @@ for path in sorted(expected, key=os.fsencode):
         raise SystemExit(3)
     acme = srv == 'hysteria' and (path == '/etc/hysteria/acme' or path.startswith('/etc/hysteria/acme/'))
     uid_ok = st.st_uid in ({0} if not acme else {0, runtime_uid})
-    gid_ok = st.st_gid in ({0, runtime_gid} if acme else {0})
+    gid_ok = st.st_gid in ({0, runtime_gid})
     group_write_ok = acme and path == '/etc/hysteria/acme' and st.st_uid == 0 and st.st_gid == runtime_gid and stat.S_ISDIR(st.st_mode)
     if not uid_ok or not gid_ok or stat.S_ISLNK(st.st_mode) or (st.st_mode & 0o002) or ((st.st_mode & 0o020) and not group_write_ok):
         raise SystemExit(3)
@@ -1971,10 +2023,10 @@ auxiliary_content_is_abox_managed() {
             grep -Fxq '# Managed by A-Box' "$file" 2>/dev/null && grep -Fq 'TRAFFIC_LIMIT_GB' "$file" 2>/dev/null && grep -Fq 'month_bytes()' "$file" 2>/dev/null
             ;;
         /etc/ddr/geo_update.sh)
-            grep -Fxq '# Managed by A-Box' "$file" 2>/dev/null && grep -Fq 'Geo' "$file" 2>/dev/null && grep -Fq 'refresh_dynamic_core_subtree_ownership' "$file" 2>/dev/null
+            grep -Fxq '# Managed by A-Box' "$file" 2>/dev/null && grep -Fq 'Geo' "$file" 2>/dev/null && (grep -Fq 'update_geo_ownership' "$file" 2>/dev/null || grep -Fq 'refresh_dynamic_core_subtree_ownership' "$file" 2>/dev/null)
             ;;
         /etc/ddr/socket_probe.sh)
-            grep -Fxq '# Managed by A-Box' "$file" 2>/dev/null && grep -Fq 'SOCKET_PROBE' "$file" 2>/dev/null
+            grep -Fxq '# Managed by A-Box' "$file" 2>/dev/null && grep -Fq '/run/A-Box-socket-probe.lock' "$file" 2>/dev/null && grep -Fq 'socket_owned_by_pid' "$file" 2>/dev/null
             ;;
         *) return 1 ;;
     esac
@@ -2331,52 +2383,46 @@ firewall_snapshot_is_abox_managed() {
 }
 
 remove_abox_firewall_persistence() {
-    local failed=0 fw_file
+    local fw_file enabled_state rc_update
     # Complete ownership preflight before any destructive service/file operation.
-    # A foreign persistence file must abort cleanup without removing the A-Box unit.
     for fw_file in "$ABOX_DIR/firewall_restore.sh" "$ABOX_DIR/iptables.v4" "$ABOX_DIR/iptables.v6"; do
         [[ -e "$fw_file" || -L "$fw_file" ]] || continue
         case "$fw_file" in
-            "$ABOX_DIR/firewall_restore.sh")
-                auxiliary_content_is_abox_managed "$fw_file" /etc/ddr/firewall_restore.sh || return 1
-                ;;
-            *)
-                firewall_snapshot_is_abox_managed "$fw_file" || return 1
-                ;;
+            "$ABOX_DIR/firewall_restore.sh") auxiliary_content_is_abox_managed "$fw_file" /etc/ddr/firewall_restore.sh || return 1 ;;
+            *) firewall_snapshot_is_abox_managed "$fw_file" || return 1 ;;
         esac
     done
-    if [[ -f /etc/systemd/system/A-Box-firewall.service ]] && grep -Fxq '# Managed by A-Box' /etc/systemd/system/A-Box-firewall.service 2>/dev/null; then
-        if systemd_available; then
-            systemctl disable --now A-Box-firewall.service >/dev/null 2>&1 || true
-            if [[ "$(service_active_state_value A-Box-firewall.service 2>/dev/null || printf '%s' unknown)" != 0 ]]; then
-                failed=1
-            fi
-        else
-            failed=1
-        fi
-        rm -f /etc/systemd/system/A-Box-firewall.service || failed=1
-        [[ ! -e /etc/systemd/system/A-Box-firewall.service && ! -L /etc/systemd/system/A-Box-firewall.service ]] || failed=1
-        if systemd_available; then
-            systemctl daemon-reload >/dev/null 2>&1 || failed=1
-        fi
+
+    if [[ -e /etc/systemd/system/A-Box-firewall.service || -L /etc/systemd/system/A-Box-firewall.service ]]; then
+        [[ -f /etc/systemd/system/A-Box-firewall.service && ! -L /etc/systemd/system/A-Box-firewall.service ]] || return 1
+        grep -Fxq '# Managed by A-Box' /etc/systemd/system/A-Box-firewall.service 2>/dev/null || return 1
+        systemd_available || return 1
+        systemctl disable --now A-Box-firewall.service >/dev/null 2>&1 || return 1
+        [[ "$(service_active_state_value A-Box-firewall.service 2>/dev/null || printf '%s' unknown)" == 0 ]] || return 1
+        enabled_state=$(systemctl show -p UnitFileState --value A-Box-firewall.service 2>/dev/null) || return 1
+        [[ "$enabled_state" == disabled ]] || return 1
+        rm -f -- /etc/systemd/system/A-Box-firewall.service || return 1
+        [[ ! -e /etc/systemd/system/A-Box-firewall.service && ! -L /etc/systemd/system/A-Box-firewall.service ]] || return 1
+        systemctl daemon-reload >/dev/null 2>&1 || return 1
     fi
-    if [[ -f /etc/init.d/A-Box-firewall ]] && grep -Fxq '# Managed by A-Box' /etc/init.d/A-Box-firewall 2>/dev/null; then
-        if command -v rc-service >/dev/null 2>&1; then
-            rc-service A-Box-firewall stop >/dev/null 2>&1 || true
-            if [[ "$(service_active_state_value A-Box-firewall 2>/dev/null || printf '%s' unknown)" != 0 ]]; then
-                failed=1
-            else
-                rc-update del A-Box-firewall default >/dev/null 2>&1 || failed=1
-            fi
-        else
-            failed=1
-        fi
-        rm -f /etc/init.d/A-Box-firewall || failed=1
-        [[ ! -e /etc/init.d/A-Box-firewall && ! -L /etc/init.d/A-Box-firewall ]] || failed=1
+
+    if [[ -e /etc/init.d/A-Box-firewall || -L /etc/init.d/A-Box-firewall ]]; then
+        [[ -f /etc/init.d/A-Box-firewall && ! -L /etc/init.d/A-Box-firewall ]] || return 1
+        grep -Fxq '# Managed by A-Box' /etc/init.d/A-Box-firewall 2>/dev/null || return 1
+        command -v rc-service >/dev/null 2>&1 && command -v rc-update >/dev/null 2>&1 || return 1
+        rc-service A-Box-firewall stop >/dev/null 2>&1 || return 1
+        [[ "$(service_active_state_value A-Box-firewall 2>/dev/null || printf '%s' unknown)" == 0 ]] || return 1
+        rc-update del A-Box-firewall default >/dev/null 2>&1 || return 1
+        rc_update=$(rc-update show default 2>/dev/null) || return 1
+        grep -Eq '(^|[[:space:]])A-Box-firewall([[:space:]]|$)' <<< "$rc_update" && return 1
+        rm -f -- /etc/init.d/A-Box-firewall || return 1
+        [[ ! -e /etc/init.d/A-Box-firewall && ! -L /etc/init.d/A-Box-firewall ]] || return 1
     fi
-    rm -f "$ABOX_DIR/firewall_restore.sh" "$ABOX_DIR/iptables.v4" "$ABOX_DIR/iptables.v6" || failed=1
-    [[ ! -e "$ABOX_DIR/firewall_restore.sh" && ! -e "$ABOX_DIR/iptables.v4" && ! -e "$ABOX_DIR/iptables.v6" ]] || failed=1
-    (( failed == 0 ))
+
+    # Recovery script and snapshots remain present until all owning services are
+    # confirmed inactive and disabled. A failure above leaves them intact.
+    rm -f -- "$ABOX_DIR/firewall_restore.sh" "$ABOX_DIR/iptables.v4" "$ABOX_DIR/iptables.v6" || return 1
+    [[ ! -e "$ABOX_DIR/firewall_restore.sh" && ! -e "$ABOX_DIR/iptables.v4" && ! -e "$ABOX_DIR/iptables.v6" ]]
 }
 
 write_abox_firewall_restore_script() {
@@ -2397,11 +2443,19 @@ write_abox_firewall_restore_script() {
 # Managed by A-Box
 set -o pipefail
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+has_ipv6() {
+    ip -6 addr show scope global 2>/dev/null | awk '/inet6/ { found=1 } END { exit !found }' && return 0
+    ip -6 route show default 2>/dev/null | awk '/^default/ { found=1 } END { exit !found }' && return 0
+    return 1
+}
 clean_chain() {
     local cmd="$1" table="$2" chain="$3" output rule
     local owned_re='--comment "?A-Box-(HY2-HOP|[0-9]+(:[0-9]+)?-(tcp|udp)(-(WL6?|DROP6?))?)"?([[:space:]]|$)'
     local -a argv=()
-    command -v "$cmd" >/dev/null 2>&1 || return 0
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        [[ "${cmd##*/}" == ip6tables && ! has_ipv6 ]] && return 0
+        return 1
+    fi
     while :; do
         output=$("$cmd" -w -t "$table" -S "$chain" 2>/dev/null) || return 1
         rule=$(awk -v re="$owned_re" '$0 ~ re { sub(/^-A /,"-D "); print; exit }' <<< "$output")
@@ -2414,6 +2468,7 @@ clean_chain() {
 restore_one() {
     local file="$1" cmd="$2"
     [[ -s "$file" ]] || return 0
+    if [[ "${cmd##*/}" == ip6tables-restore ]] && ! has_ipv6; then return 0; fi
     command -v "$cmd" >/dev/null 2>&1 || return 1
     grep -q '^\*' "$file" || return 0
     "$cmd" -w --noflush < "$file" >/dev/null 2>&1 || "$cmd" --noflush < "$file" >/dev/null 2>&1
@@ -2448,7 +2503,10 @@ reorder_one() {
 
     command -v "$cmd" >/dev/null 2>&1 || return 0
     command -v "$save_cmd" >/dev/null 2>&1 || return 1
-    "$cmd" -w -S INPUT >/dev/null 2>&1 || return 0
+    if ! "$cmd" -w -S INPUT >/dev/null 2>&1; then
+        if [[ "${cmd##*/}" == ip6tables && ! has_ipv6 ]]; then return 0; fi
+        return 1
+    fi
     if iptables_rule_check "$cmd" INPUT -p "$proto" --dport "$port" -m comment --comment "$drop_comment" -j DROP; then check_rc=0; else check_rc=$?; fi
     case "$check_rc" in 0) ;; 1) return 0 ;; *) return 1 ;; esac
 
@@ -2472,15 +2530,22 @@ reorder_one() {
     flock -n "$lock_fd" || { eval "exec ${lock_fd}>&-"; return 1; }
     firewall_unlock() { eval "exec ${lock_fd}>&-" 2>/dev/null || true; lock_fd=''; }
 
+    normalize_managed_rule_line() {
+        local line="$1"
+        line=${line//\"/}
+        line=$(printf '%s\n' "$line" | sed -E 's/^(-A[[:space:]]+INPUT[[:space:]]+-p[[:space:]]+(tcp|udp))[[:space:]]+-m[[:space:]]+\2([[:space:]]|$)/\1\3/')
+        printf '%s\n' "$line"
+    }
     capture_firewall_views() {
-        local item
+        local item normalized
         current_rules_output=$("$cmd" -w -S INPUT 2>/dev/null) || return 1
         current_target_lines=()
         current_foreign_lines=()
         while IFS= read -r item; do
             [[ "$item" =~ ^-A[[:space:]]+INPUT[[:space:]] ]] || continue
             if [[ "$item" =~ $wl_re || "$item" =~ $drop_re ]]; then
-                current_target_lines+=("$item")
+                normalized=$(normalize_managed_rule_line "$item") || return 1
+                current_target_lines+=("$normalized")
             else
                 current_foreign_lines+=("$item")
             fi
@@ -2572,7 +2637,7 @@ reorder_one() {
         mutated=1
         expected_target_lines=("$expected_line" "${expected_target_lines[@]}")
     done
-    local expected_drop_line="-A INPUT -p ${proto} --dport ${port} -m comment --comment \"${drop_comment}\" -j DROP"
+    local expected_drop_line="-A INPUT -p ${proto} --dport ${port} -m comment --comment ${drop_comment} -j DROP"
     firewall_state_matches_expected || { if ! firewall_rollback >/dev/null 2>&1; then printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; fi; firewall_unlock; return 1; }
     if ! "$cmd" -w -I INPUT "$((n + 1))" -p "$proto" --dport "$port" -m comment --comment "$drop_comment" -j DROP >/dev/null 2>&1; then
         if ! firewall_rollback >/dev/null 2>&1; then printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; fi
@@ -2641,12 +2706,21 @@ reorder_policy() {
 }
 clean_chain iptables filter INPUT || exit 1
 clean_chain iptables nat PREROUTING || exit 1
-clean_chain ip6tables filter INPUT || exit 1
-clean_chain ip6tables nat PREROUTING || exit 1
 restore_one /etc/ddr/iptables.v4 iptables-restore || exit 1
-restore_one /etc/ddr/iptables.v6 ip6tables-restore || exit 1
 reorder_policy iptables WL DROP || exit 1
-reorder_policy ip6tables WL6 DROP6 || exit 1
+if has_ipv6; then
+    command -v ip6tables >/dev/null 2>&1 || exit 1
+    ip6tables -w -S INPUT >/dev/null 2>&1 || exit 1
+    clean_chain ip6tables filter INPUT || exit 1
+    clean_chain ip6tables nat PREROUTING || exit 1
+    restore_one /etc/ddr/iptables.v6 ip6tables-restore || exit 1
+    reorder_policy ip6tables WL6 DROP6 || exit 1
+elif command -v ip6tables >/dev/null 2>&1 && ip6tables -w -S INPUT >/dev/null 2>&1; then
+    clean_chain ip6tables filter INPUT || exit 1
+    clean_chain ip6tables nat PREROUTING || exit 1
+    restore_one /etc/ddr/iptables.v6 ip6tables-restore || exit 1
+    reorder_policy ip6tables WL6 DROP6 || exit 1
+fi
 EOF_ABOX_FW_RESTORE
     [[ $? -eq 0 ]] || { rm -f "$tmp"; return 1; }
     chmod 700 "$tmp" || { rm -f "$tmp"; return 1; }
@@ -2842,10 +2916,24 @@ save_firewall_rules() {
     extract_abox_iptables_rules "${tmp4}.all" all > "$tmp4" || { rm -f "$tmp4" "$tmp6" "${tmp4}.all" "$backup4" "$backup6"; return 1; }
     rm -f "${tmp4}.all"
     if command -v ip6tables-save >/dev/null 2>&1; then
-        ip6tables-save > "${tmp6}.all" 2>/dev/null || { rm -f "$tmp4" "$tmp6" "${tmp6}.all" "$backup4" "$backup6"; return 1; }
-        extract_abox_iptables_rules "${tmp6}.all" all > "$tmp6" || { rm -f "$tmp4" "$tmp6" "${tmp6}.all" "$backup4" "$backup6"; return 1; }
-        rm -f "${tmp6}.all"
+        if ip6tables-save > "${tmp6}.all" 2>/dev/null; then
+            extract_abox_iptables_rules "${tmp6}.all" all > "$tmp6" || { rm -f "$tmp4" "$tmp6" "${tmp6}.all" "$backup4" "$backup6"; return 1; }
+            rm -f "${tmp6}.all"
+        elif ! has_ipv6; then
+            # A present userspace binary does not prove that the kernel IPv6
+            # firewall backend is enabled. Ignore only a failed v6 query when
+            # no global IPv6 address/default route is available.
+            rm -f "${tmp6}.all"
+            : > "$tmp6"
+        else
+            rm -f "$tmp4" "$tmp6" "${tmp6}.all" "$backup4" "$backup6"
+            return 1
+        fi
     else
+        if has_ipv6; then
+            rm -f -- "$tmp4" "$tmp6" "$backup4" "$backup6"
+            return 1
+        fi
         : > "$tmp6"
     fi
     chmod 600 "$tmp4" "$tmp6" || { rm -f "$tmp4" "$tmp6" "$backup4" "$backup6"; return 1; }
@@ -3015,14 +3103,16 @@ ufw_owned_rule_exists() {
 }
 
 ufw_delete_owned_rules() {
-    local spec proto="$2" numbers number
+    local spec proto="$2" numbers
     spec=$(normalize_port_spec "$1") || return 1
+    [[ "$proto" == tcp || "$proto" == udp ]] || return 1
     numbers=$(ufw_global_rule_numbers "$spec" "$proto" 1) || return 1
     [[ -n "$numbers" ]] || return 0
-    while IFS= read -r number; do
-        [[ "$number" =~ ^[0-9]+$ ]] || return 1
-        ufw --force delete "$number" >/dev/null 2>&1 || return 1
-    done < <(printf '%s\n' "$numbers" | sort -rn)
+    # Delete by the full rule specification rather than mutable display indices.
+    # UFW can match the original comment and removes the generic v4/v6 rule pair
+    # as one logical rule; a concurrent insertion cannot redirect deletion to a
+    # different numbered rule.
+    ufw --force delete allow proto "$proto" from any to any port "$spec" comment "A-Box-${spec}-${proto}" >/dev/null 2>&1 || return 1
     ! ufw_owned_rule_exists "$spec" "$proto"
 }
 
@@ -3399,7 +3489,10 @@ reorder_ss_whitelist_rules_one() {
 
     command -v "$cmd" >/dev/null 2>&1 || return 0
     command -v "$save_cmd" >/dev/null 2>&1 || return 1
-    "$cmd" -w -S INPUT >/dev/null 2>&1 || return 0
+    if ! "$cmd" -w -S INPUT >/dev/null 2>&1; then
+        if [[ "${cmd##*/}" == ip6tables && ! has_ipv6 ]]; then return 0; fi
+        return 1
+    fi
     if iptables_rule_check "$cmd" INPUT -p "$proto" --dport "$port" -m comment --comment "$drop_comment" -j DROP; then check_rc=0; else check_rc=$?; fi
     case "$check_rc" in 0) ;; 1) return 0 ;; *) return 1 ;; esac
 
@@ -3423,15 +3516,22 @@ reorder_ss_whitelist_rules_one() {
     flock -n "$lock_fd" || { eval "exec ${lock_fd}>&-"; return 1; }
     firewall_unlock() { eval "exec ${lock_fd}>&-" 2>/dev/null || true; lock_fd=''; }
 
+    normalize_managed_rule_line() {
+        local line="$1"
+        line=${line//\"/}
+        line=$(printf '%s\n' "$line" | sed -E 's/^(-A[[:space:]]+INPUT[[:space:]]+-p[[:space:]]+(tcp|udp))[[:space:]]+-m[[:space:]]+\2([[:space:]]|$)/\1\3/')
+        printf '%s\n' "$line"
+    }
     capture_firewall_views() {
-        local item
+        local item normalized
         current_rules_output=$("$cmd" -w -S INPUT 2>/dev/null) || return 1
         current_target_lines=()
         current_foreign_lines=()
         while IFS= read -r item; do
             [[ "$item" =~ ^-A[[:space:]]+INPUT[[:space:]] ]] || continue
             if [[ "$item" =~ $wl_re || "$item" =~ $drop_re ]]; then
-                current_target_lines+=("$item")
+                normalized=$(normalize_managed_rule_line "$item") || return 1
+                current_target_lines+=("$normalized")
             else
                 current_foreign_lines+=("$item")
             fi
@@ -3523,7 +3623,7 @@ reorder_ss_whitelist_rules_one() {
         mutated=1
         expected_target_lines=("$expected_line" "${expected_target_lines[@]}")
     done
-    local expected_drop_line="-A INPUT -p ${proto} --dport ${port} -m comment --comment \"${drop_comment}\" -j DROP"
+    local expected_drop_line="-A INPUT -p ${proto} --dport ${port} -m comment --comment ${drop_comment} -j DROP"
     firewall_state_matches_expected || { if ! firewall_rollback >/dev/null 2>&1; then printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; fi; firewall_unlock; return 1; }
     if ! "$cmd" -w -I INPUT "$((n + 1))" -p "$proto" --dport "$port" -m comment --comment "$drop_comment" -j DROP >/dev/null 2>&1; then
         if ! firewall_rollback >/dev/null 2>&1; then printf '%s\n' "A-Box firewall rollback incomplete; recovery snapshot: $recovery_snapshot" >&2; fi
@@ -3600,15 +3700,21 @@ clean_nat_rules() {
         read -r -a argv <<< "$rule"
         $IPT -w -t nat "${argv[@]}" >/dev/null 2>&1 || { failed=1; break; }
     done
-    if command -v ip6tables >/dev/null 2>&1 && $IPT6 -w -t nat -S PREROUTING >/dev/null 2>&1; then
-        while :; do
-            output=$($IPT6 -w -t nat -S PREROUTING 2>/dev/null) || { failed=1; break; }
-            rule=$(awk -v re="$owned_re" '$0 ~ re { sub(/^-A /,"-D "); print; exit }' <<< "$output")
-            [[ -n "$rule" ]] || break
-            rule=${rule//\"/}
-            read -r -a argv <<< "$rule"
-            $IPT6 -w -t nat "${argv[@]}" >/dev/null 2>&1 || { failed=1; break; }
-        done
+    if command -v ip6tables >/dev/null 2>&1; then
+        if $IPT6 -w -t nat -S PREROUTING >/dev/null 2>&1; then
+            while :; do
+                output=$($IPT6 -w -t nat -S PREROUTING 2>/dev/null) || { failed=1; break; }
+                rule=$(awk -v re="$owned_re" '$0 ~ re { sub(/^-A /,"-D "); print; exit }' <<< "$output")
+                [[ -n "$rule" ]] || break
+                rule=${rule//\"/}
+                read -r -a argv <<< "$rule"
+                $IPT6 -w -t nat "${argv[@]}" >/dev/null 2>&1 || { failed=1; break; }
+            done
+        elif has_ipv6; then
+            failed=1
+        fi
+    elif has_ipv6; then
+        failed=1
     fi
     (( failed == 0 ))
 }
@@ -3626,15 +3732,21 @@ clean_input_rules() {
         read -r -a argv <<< "$rule"
         $IPT -w "${argv[@]}" >/dev/null 2>&1 || { failed=1; break; }
     done
-    if command -v ip6tables >/dev/null 2>&1 && $IPT6 -w -S INPUT >/dev/null 2>&1; then
-        while :; do
-            output=$($IPT6 -w -S INPUT 2>/dev/null) || { failed=1; break; }
-            rule=$(awk -v re="$owned_re" '$0 ~ re { sub(/^-A /,"-D "); print; exit }' <<< "$output")
-            [[ -n "$rule" ]] || break
-            rule=${rule//\"/}
-            read -r -a argv <<< "$rule"
-            $IPT6 -w "${argv[@]}" >/dev/null 2>&1 || { failed=1; break; }
-        done
+    if command -v ip6tables >/dev/null 2>&1; then
+        if $IPT6 -w -S INPUT >/dev/null 2>&1; then
+            while :; do
+                output=$($IPT6 -w -S INPUT 2>/dev/null) || { failed=1; break; }
+                rule=$(awk -v re="$owned_re" '$0 ~ re { sub(/^-A /,"-D "); print; exit }' <<< "$output")
+                [[ -n "$rule" ]] || break
+                rule=${rule//\"/}
+                read -r -a argv <<< "$rule"
+                $IPT6 -w "${argv[@]}" >/dev/null 2>&1 || { failed=1; break; }
+            done
+        elif has_ipv6; then
+            failed=1
+        fi
+    elif has_ipv6; then
+        failed=1
     fi
     (( failed == 0 ))
 }
@@ -4013,17 +4125,36 @@ verify_github_asset_digest() {
 }
 
 valid_github_download_url() {
-    local repo="$1" url="$2" expected_ref="${3:-}"
+    local repo="$1" url="$2" expected_ref="${3:-}" expected_asset="${4:-}"
     local repo_lower="${repo,,}" url_lower="${url,,}"
     [[ "$repo_lower" =~ ^[a-z0-9_.-]+/[a-z0-9_.-]+$ ]] || return 1
+    [[ "$url" != *$'\r'* && "$url" != *$'\n'* && "$url" != *$'\t'* ]] || return 1
     if [[ -n "$expected_ref" ]]; then
-        # The release tag is an exact trust-binding value. Keep the tag path
-        # case-sensitive instead of lower-casing it, so a metadata URL for a
-        # different Git ref cannot pass merely by differing in letter case.
         [[ "$expected_ref" =~ ^[A-Za-z0-9._/-]+$ ]] || return 1
+        if [[ -n "$expected_asset" ]]; then
+            python3 - "$url" "$repo" "$expected_ref" "$expected_asset" <<'PY_GITHUB_URL'
+from urllib.parse import urlsplit
+import sys
+url, repo, ref, asset = sys.argv[1:]
+try:
+    u = urlsplit(url)
+except ValueError:
+    raise SystemExit(1)
+if u.scheme != 'https' or u.hostname != 'github.com' or u.username or u.password or u.query or u.fragment:
+    raise SystemExit(1)
+if u.path != f'/{repo}/releases/download/{ref}/{asset}':
+    raise SystemExit(1)
+raise SystemExit(0)
+PY_GITHUB_URL
+            return $?
+        fi
         [[ "$url" == "https://github.com/${repo}/releases/download/${expected_ref}/"* ]] || return 1
+        local tail="${url#https://github.com/${repo}/releases/download/${expected_ref}/}"
+        [[ -n "$tail" && "$tail" != */* && "$tail" != *'?'* && "$tail" != *'#'* && "$tail" != *'..'* && "$tail" != *'\\'* ]] || return 1
     else
         [[ "$url_lower" == "https://github.com/${repo_lower}/releases/download/"* ]] || return 1
+        local tail="${url#https://github.com/${repo_lower}/releases/download/}"
+        [[ -n "$tail" && "$tail" != *'?'* && "$tail" != *'#'* && "$tail" != *'..'* && "$tail" != *'\\'* ]] || return 1
     fi
 }
 
@@ -4035,37 +4166,40 @@ singbox_asset_regex() {
     fi
 }
 
+decimal_component_compare() {
+    local a="${1:-}" b="${2:-}" LC_ALL=C
+    [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] || return 2
+    a="${a#"${a%%[!0]*}"}"; b="${b#"${b%%[!0]*}"}"
+    [[ -n "$a" ]] || a='0'
+    [[ -n "$b" ]] || b='0'
+    if (( ${#a} < ${#b} )); then printf '%s\n' -1; return 0; fi
+    if (( ${#a} > ${#b} )); then printf '%s\n' 1; return 0; fi
+    if [[ "$a" == "$b" ]]; then printf '%s\n' 0; elif [[ "$a" < "$b" ]]; then printf '%s\n' -1; else printf '%s\n' 1; fi
+}
+
 xray_version_at_least() {
-    local version="${1:-}" min_major="${2:-0}" min_minor="${3:-0}" min_patch="${4:-0}" major minor patch
+    local version="${1:-}" min_major="${2:-0}" min_minor="${3:-0}" min_patch="${4:-0}" major minor patch cmp
     version="${version#v}"
-    if [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-        major="${BASH_REMATCH[1]}"
-        minor="${BASH_REMATCH[2]}"
-        patch="${BASH_REMATCH[3]}"
-    else
-        return 2
-    fi
-    if (( 10#$major > 10#$min_major )); then return 0; fi
-    if (( 10#$major < 10#$min_major )); then return 1; fi
-    if (( 10#$minor > 10#$min_minor )); then return 0; fi
-    if (( 10#$minor < 10#$min_minor )); then return 1; fi
-    (( 10#$patch >= 10#$min_patch ))
+    [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 2
+    major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"; patch="${BASH_REMATCH[3]}"
+    cmp=$(decimal_component_compare "$major" "$min_major") || return 2
+    (( cmp > 0 )) && return 0; (( cmp < 0 )) && return 1
+    cmp=$(decimal_component_compare "$minor" "$min_minor") || return 2
+    (( cmp > 0 )) && return 0; (( cmp < 0 )) && return 1
+    cmp=$(decimal_component_compare "$patch" "$min_patch") || return 2
+    (( cmp >= 0 ))
 }
 
 xray_version_compare() {
-    local a="${1:-}" b="${2:-}" am aj ap bm bj bp
+    local a="${1:-}" b="${2:-}" am aj ap bm bj bp cmp
     a="${a#v}"; b="${b#v}"
     [[ "$a" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 2
     am="${BASH_REMATCH[1]}"; aj="${BASH_REMATCH[2]}"; ap="${BASH_REMATCH[3]}"
     [[ "$b" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 2
     bm="${BASH_REMATCH[1]}"; bj="${BASH_REMATCH[2]}"; bp="${BASH_REMATCH[3]}"
-    if (( 10#$am < 10#$bm )); then printf '%s\n' -1; return 0; fi
-    if (( 10#$am > 10#$bm )); then printf '%s\n' 1; return 0; fi
-    if (( 10#$aj < 10#$bj )); then printf '%s\n' -1; return 0; fi
-    if (( 10#$aj > 10#$bj )); then printf '%s\n' 1; return 0; fi
-    if (( 10#$ap < 10#$bp )); then printf '%s\n' -1; return 0; fi
-    if (( 10#$ap > 10#$bp )); then printf '%s\n' 1; return 0; fi
-    printf '%s\n' 0
+    cmp=$(decimal_component_compare "$am" "$bm") || return 2; (( cmp != 0 )) && { printf '%s\n' "$cmp"; return 0; }
+    cmp=$(decimal_component_compare "$aj" "$bj") || return 2; (( cmp != 0 )) && { printf '%s\n' "$cmp"; return 0; }
+    decimal_component_compare "$ap" "$bp"
 }
 
 xray_latest_stable_version() {
@@ -4097,19 +4231,19 @@ singbox_asset_json_from_release() {
     preferred="$(singbox_asset_regex)"
     # Fail closed on libc selection. A generic linux-ARCH asset is not accepted
     # because it can silently select the wrong libc family and fail after install.
-    asset_json=$(jq -c --arg re "$preferred" 'first(.assets[]? | select(.name | test($re)) | {url:.browser_download_url,digest:(.digest // "")}) // empty' <<< "$release_json")
+    asset_json=$(jq -c --arg re "$preferred" 'first(.assets[]? | select(.name | test($re)) | {name:.name,url:.browser_download_url,digest:(.digest // "")}) // empty' <<< "$release_json")
     [[ -n "$asset_json" && "$asset_json" != 'null' ]] || return 1
     printf '%s\n' "$asset_json"
 }
 
 fetch_github_release() {
-    local repo=$1 output_file=$2 dest_file="${3:-}" api_url asset_re release_json asset_json download_url digest mirror tmp_file tmp_dir release_ref
+    local repo=$1 output_file=$2 dest_file="${3:-}" api_url asset_re release_json asset_json asset_name download_url digest mirror tmp_file tmp_dir release_ref
     case "$repo:$output_file" in
         # Keep new installs on the current iOS/XHTTP compatibility pin.
         # The pin is intentionally not the latest prerelease; explicit overrides remain supported
         # but are treated as compatibility-sensitive.
         XTLS/Xray-core:xray_core.zip) release_ref="${ABOX_XRAY_VERSION:-$ABOX_XRAY_DEFAULT_VERSION}" ;;
-        SagerNet/sing-box:singbox_core.tar.gz) release_ref="${ABOX_SINGBOX_VERSION:-v1.14.2}" ;;
+        SagerNet/sing-box:singbox_core.tar.gz) release_ref="${ABOX_SINGBOX_VERSION:-$ABOX_SINGBOX_DEFAULT_VERSION}" ;;
         HyNetworks/hysteria:hysteria_core) release_ref="${ABOX_HYSTERIA_APP_VERSION:-app/v2.13.0}" ;;
         *) release_ref='' ;;
     esac
@@ -4137,12 +4271,14 @@ fetch_github_release() {
     if [[ "$repo:$output_file" == 'SagerNet/sing-box:singbox_core.tar.gz' ]]; then
         asset_json=$(singbox_asset_json_from_release "$release_json") || die '未能解析 sing-box 核心资产下载地址。'
     else
-        asset_json=$(jq -c --arg re "$asset_re" 'first(.assets[]? | select(.name | test($re)) | {url:.browser_download_url,digest:(.digest // "")}) // empty' <<< "$release_json")
+        asset_json=$(jq -c --arg re "$asset_re" 'first(.assets[]? | select(.name | test($re)) | {name:.name,url:.browser_download_url,digest:(.digest // "")}) // empty' <<< "$release_json")
         [[ -n "$asset_json" && "$asset_json" != 'null' ]] || die '未能解析核心资产下载地址。'
     fi
+    asset_name=$(jq -r '.name // ""' <<< "$asset_json")
     download_url=$(jq -r '.url' <<< "$asset_json")
     digest=$(jq -r '.digest // ""' <<< "$asset_json")
-    valid_github_download_url "$repo" "$download_url" "$release_ref" || die 'GitHub Release 下载地址仓库或版本标签不匹配。'
+    [[ -n "$asset_name" ]] || die 'GitHub Release asset name missing.'
+    valid_github_download_url "$repo" "$download_url" "$release_ref" "$asset_name" || die 'GitHub Release 下载地址仓库或版本标签不匹配。'
     [[ "$digest" == sha256:* ]] || die 'GitHub Release asset 缺少官方 SHA256 digest，拒绝安装。'
     [[ "${digest#sha256:}" =~ ^[A-Fa-f0-9]{64}$ ]] || die 'GitHub Release digest 格式异常。'
 
@@ -4180,7 +4316,7 @@ fetch_github_release() {
 }
 
 fetch_geo_data() {
-    local file_name official_url out tmp_out size repo asset release_json asset_json download_url digest out_created=0
+    local file_name official_url out tmp_out size repo asset release_json asset_json asset_name download_url digest release_ref out_created=0
     file_name="${1:-}"
     official_url="${2:-}"
     out="${3:-}"
@@ -4200,11 +4336,14 @@ fetch_geo_data() {
         asset="${BASH_REMATCH[2]}"
         release_json=$(github_api_get "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null) || release_json=''
         [[ -n "$release_json" ]] || { rm -f -- "$tmp_out"; die "Geo Release API 请求失败: ${repo}"; }
-        asset_json=$(jq -c --arg name "$asset" 'first(.assets[]? | select(.name == $name) | {url:.browser_download_url,digest:(.digest // "")}) // empty' <<< "$release_json")
+        asset_json=$(jq -c --arg name "$asset" 'first(.assets[]? | select(.name == $name) | {name:.name,url:.browser_download_url,digest:(.digest // "")}) // empty' <<< "$release_json")
         [[ -n "$asset_json" && "$asset_json" != 'null' ]] || { rm -f -- "$tmp_out"; die "Geo Release asset 未找到: ${asset}"; }
+        asset_name=$(jq -r '.name // ""' <<< "$asset_json")
+        release_ref=$(jq -r '.tag_name // ""' <<< "$release_json")
         download_url=$(jq -r '.url' <<< "$asset_json")
         digest=$(jq -r '.digest // ""' <<< "$asset_json")
-        valid_github_download_url "$repo" "$download_url" || { rm -f -- "$tmp_out"; die 'Geo GitHub Release 下载地址域名/仓库不匹配。'; }
+        [[ -n "$asset_name" && -n "$release_ref" ]] || { rm -f -- "$tmp_out"; die 'Geo Release metadata missing asset name or tag.'; }
+        valid_github_download_url "$repo" "$download_url" "$release_ref" "$asset_name" || { rm -f -- "$tmp_out"; die 'Geo GitHub Release 下载地址域名/仓库不匹配。'; }
         curl -fLs --connect-timeout 10 -m 90 "$download_url" -o "$tmp_out" || { rm -f -- "$tmp_out"; die "Geo 数据文件 ${file_name} 下载失败。"; }
         if ! verify_github_asset_digest "$tmp_out" "$digest"; then
             rm -f -- "$tmp_out"; (( out_created == 1 )) && rm -f -- "$out"
@@ -4930,7 +5069,12 @@ printf '%s %s\n' "$count" "$last" > "$STATE"
 (( now - last >= 600 )) || exit 0
 if restart_owned "$failed_srv"; then printf '0 %s\n' "$now" > "$STATE"; else printf '%s %s\n' "$count" "$now" > "$STATE"; fi
 EOF_PROBE
-    if [[ "${INIT_SYS:-}" == systemd ]]; then sed -i "s|^INIT_SYS_EXPECTED=.*|INIT_SYS_EXPECTED='systemd'|" "$ABOX_DIR/socket_probe.sh"; else sed -i "s|^INIT_SYS_EXPECTED=.*|INIT_SYS_EXPECTED='openrc'|" "$ABOX_DIR/socket_probe.sh"; fi
+    if [[ "${INIT_SYS:-}" == systemd ]]; then
+        sed -i "s|^INIT_SYS_EXPECTED=.*|INIT_SYS_EXPECTED='systemd'|" "$ABOX_DIR/socket_probe.sh" || die '健康探针运行环境标记写入失败。'
+    else
+        sed -i "s|^INIT_SYS_EXPECTED=.*|INIT_SYS_EXPECTED='openrc'|" "$ABOX_DIR/socket_probe.sh" || die '健康探针运行环境标记写入失败。'
+    fi
+    grep -Fxq "INIT_SYS_EXPECTED='${INIT_SYS}'" "$ABOX_DIR/socket_probe.sh" || die '健康探针运行环境标记后置校验失败。' 
     chmod 700 "$ABOX_DIR/socket_probe.sh" || die '健康探针权限设置失败。'
     install_abox_cron_block PROBE '* * * * * /usr/bin/flock -n /run/A-Box-probe-cron.lock /bin/bash /etc/ddr/socket_probe.sh >/dev/null 2>&1'
 }
@@ -5018,7 +5162,7 @@ fetch_one() {
     local asset="$1" out="$2" api release_json asset_json url digest expected actual size
     api="https://api.github.com/repos/${GEO_REPO}/releases/latest"
     release_json=$(curl -fLsS --connect-timeout 10 -m 60 -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2026-03-10' "$api") || return 1
-    asset_json=$(jq -c --arg name "$asset" 'first(.assets[]? | select(.name == $name) | {url:.browser_download_url,digest:(.digest // "")}) // empty' <<< "$release_json")
+    asset_json=$(jq -c --arg name "$asset" 'first(.assets[]? | select(.name == $name) | {name:.name,url:.browser_download_url,digest:(.digest // "")}) // empty' <<< "$release_json")
     [[ -n "$asset_json" && "$asset_json" != null ]] || return 1
     url=$(jq -r '.url' <<< "$asset_json")
     digest=$(jq -r '.digest // ""' <<< "$asset_json")
@@ -5073,7 +5217,12 @@ if ! update_geo_ownership; then
     exit 1
 fi
 EOF_GEO
-    if [[ "${INIT_SYS:-}" == systemd ]]; then sed -i "s|^INIT_SYS_EXPECTED=.*|INIT_SYS_EXPECTED='systemd'|" "$ABOX_DIR/geo_update.sh"; else sed -i "s|^INIT_SYS_EXPECTED=.*|INIT_SYS_EXPECTED='openrc'|" "$ABOX_DIR/geo_update.sh"; fi
+    if [[ "${INIT_SYS:-}" == systemd ]]; then
+        sed -i "s|^INIT_SYS_EXPECTED=.*|INIT_SYS_EXPECTED='systemd'|" "$ABOX_DIR/geo_update.sh" || die 'Geo 更新脚本运行环境标记写入失败。'
+    else
+        sed -i "s|^INIT_SYS_EXPECTED=.*|INIT_SYS_EXPECTED='openrc'|" "$ABOX_DIR/geo_update.sh" || die 'Geo 更新脚本运行环境标记写入失败。'
+    fi
+    grep -Fxq "INIT_SYS_EXPECTED='${INIT_SYS}'" "$ABOX_DIR/geo_update.sh" || die 'Geo 更新脚本运行环境标记后置校验失败。' 
     chmod 700 "$ABOX_DIR/geo_update.sh" || die 'Geo 更新脚本权限设置失败。'
     install_abox_cron_block GEO '0 3 * * 1 /usr/bin/flock -n /run/A-Box-geo-cron.lock /bin/bash /etc/ddr/geo_update.sh >/dev/null 2>&1'
 }
@@ -5341,7 +5490,7 @@ json_sockopt_xray() {
 }
 
 build_xray_config() {
-    local mode="$1" sockopt_json inbounds_json out tmp_out listen_addr
+    local mode="$1" sockopt_json inbounds_json out="${2:-/usr/local/etc/xray/config.json}" tmp_out listen_addr
     listen_addr=$(wildcard_listen_address)
     sockopt_json=$(json_sockopt_xray)
     inbounds_json=$(jq -n \
@@ -5380,7 +5529,6 @@ build_xray_config() {
         | if ($mode|contains("XHTTP")) or ($mode|contains("ALL")) then . + [xhttp] else . end
         | if ($mode|contains("SS")) or ($mode|contains("ALL")) or $mode == "VLESS_SS" then . + [ss] else . end
     ') || die 'Xray inbounds JSON 构造失败。'
-    out="${XRAY_CONFIG_PATH:-/usr/local/etc/xray/config.json}"
     local out_dir
     out_dir=$(dirname -- "$out")
     [[ ! -L "$out_dir" && ! -L "$out" ]] || die 'Xray 配置路径存在符号链接，拒绝写入。'
@@ -5403,7 +5551,7 @@ build_xray_config() {
 }
 
 build_singbox_config() {
-    local mode="$1" inbounds_json ka_obj cert_cn='localhost' out tmp_out listen_addr
+    local mode="$1" inbounds_json ka_obj cert_cn='localhost' out="${2:-/etc/sing-box/config.json}" tmp_out listen_addr
     listen_addr=$(wildcard_listen_address)
     [[ -n "${HY2_DOMAIN:-}" ]] && cert_cn="$HY2_DOMAIN"
     if [[ "${ENABLE_KEEPALIVE:-}" == true ]]; then ka_obj='{"tcp_keep_alive":"45s","tcp_keep_alive_interval":"45s"}'; else ka_obj='{}'; fi
@@ -5434,7 +5582,6 @@ build_singbox_config() {
         | if ($mode|contains("VISION")) or ($mode|contains("ALL")) or $mode == "VLESS_SS" then . + [vision] else . end
         | if ($mode|contains("HY2")) or ($mode|contains("ALL")) then . + [hy2] else . end
         | if ($mode|contains("SS")) or ($mode|contains("ALL")) or $mode == "VLESS_SS" then . + [ss] else . end') || die 'Sing-box inbounds JSON 构造失败。'
-    out="${SINGBOX_CONFIG_PATH:-/etc/sing-box/config.json}"
     local out_dir
     out_dir=$(dirname -- "$out")
     [[ ! -L "$out_dir" && ! -L "$out" ]] || die 'Sing-box 配置路径存在符号链接，拒绝写入。'
@@ -5549,7 +5696,7 @@ deploy_official_hy2() {
     if [[ "$IS_SILENT" != 'SILENT' ]]; then
         clear; msg "${BOLD}${GREEN}部署官方 Hysteria 2${NC}"
         init_system_environment
-        load_abox_env "$ABOX_ENV" 2>/dev/null || true
+        load_optional_abox_env_or_die
         light_preflight_check
         assert_no_foreign_core_conflicts hysteria
         confirm_deployment_replacement hysteria HY2
@@ -5807,9 +5954,51 @@ cleanup_ephemeral_deployment_transaction_dir() {
 
 deployment_transaction_rollback() {
     [[ "${ABOX_DEPLOY_TX_ACTIVE:-0}" == 1 ]] || return 0
-    local targets="${ABOX_DEPLOY_TX_TARGETS:-}" reason="${ABOX_DEPLOY_TX_REASON:-deployment}" backup="${ABOX_DEPLOY_TX_BACKUP:-}" tx_tmp="${ABOX_DEPLOY_TX_TMP:-}" tx_backup_dir="${ABOX_DEPLOY_TX_BACKUP_DIR:-$ABOX_DIR/backups}" tx_key_file="${ABOX_DEPLOY_TX_KEY_FILE:-}" tx_ephemeral_dir="${ABOX_DEPLOY_TX_EPHEMERAL_DIR:-}" srv
+    local targets="${ABOX_DEPLOY_TX_TARGETS:-}" reason="${ABOX_DEPLOY_TX_REASON:-deployment}" backup="${ABOX_DEPLOY_TX_BACKUP:-}" tx_tmp="${ABOX_DEPLOY_TX_TMP:-}" tx_backup_dir="${ABOX_DEPLOY_TX_BACKUP_DIR:-$ABOX_DIR/backups}" tx_key_file="${ABOX_DEPLOY_TX_KEY_FILE:-}" tx_ephemeral_dir="${ABOX_DEPLOY_TX_EPHEMERAL_DIR:-}" srv cleanup_failed=0
     [[ -n "${1:-}" ]] && reason="${reason}; $1"
+    # Disable recursive EXIT rollback, but keep the snapshot/context fields until
+    # rollback truly completes so an incomplete recovery remains diagnosable.
     ABOX_DEPLOY_TX_ACTIVE=0
+    ABOX_DIE_HOOK=''
+    msg "${YELLOW}[!] ${reason} failed; restoring the exact pre-operation snapshot.${NC}"
+
+    if ! stop_all_managed_services >/dev/null 2>&1; then
+        msg "${RED}[!] Rollback aborted before destructive cleanup: one or more managed services could not be confirmed stopped. Pre-operation backup retained: ${backup:-missing}${NC}" >&2
+        return 1
+    fi
+    clean_nat_rules >/dev/null 2>&1 || cleanup_failed=1
+    clean_input_rules >/dev/null 2>&1 || cleanup_failed=1
+    remove_native_firewall_rules >/dev/null 2>&1 || cleanup_failed=1
+    if (( cleanup_failed != 0 )); then
+        msg "${RED}[!] Rollback aborted before removing core files: firewall cleanup could not be verified. Recovery backup retained: ${backup:-missing}${NC}" >&2
+        return 1
+    fi
+
+    for srv in $targets; do
+        if ! remove_core_family_force "$srv"; then
+            msg "${RED}[!] Rollback aborted: unable to remove the staged/current ${srv} core family. No backup restore was attempted; recovery backup retained: ${backup:-missing}${NC}" >&2
+            return 1
+        fi
+    done
+
+    if [[ -n "$tx_key_file" ]]; then
+        if ! restore_latest_backup_silent "$tx_backup_dir" "$backup" "$tx_key_file"; then
+            msg "${RED}[!] Automatic rollback could not restore the exact pre-operation backup: ${backup:-missing}. Recovery context retained.${NC}" >&2
+            return 1
+        fi
+    else
+        if ! restore_latest_backup_silent "$tx_backup_dir" "$backup"; then
+            msg "${RED}[!] Automatic rollback could not restore the exact pre-operation backup: ${backup:-missing}. Recovery context retained.${NC}" >&2
+            return 1
+        fi
+    fi
+
+    if [[ -n "$tx_tmp" ]]; then
+        rm -rf -- "$tx_tmp" || { msg "${RED}[!] Prior state restored, but transaction staging cleanup failed: $tx_tmp${NC}" >&2; return 1; }
+    fi
+    if [[ -n "$tx_ephemeral_dir" && "$tx_ephemeral_dir" == /run/A-Box-uninstall-tx.* && "$tx_ephemeral_dir" != /run/ ]]; then
+        rm -rf -- "$tx_ephemeral_dir" 2>/dev/null || { msg "${RED}[!] Prior state restored, but ephemeral transaction cleanup failed: $tx_ephemeral_dir${NC}" >&2; return 1; }
+    fi
     ABOX_DEPLOY_TX_TARGETS=''
     ABOX_DEPLOY_TX_REASON=''
     ABOX_DEPLOY_TX_BACKUP=''
@@ -5817,24 +6006,7 @@ deployment_transaction_rollback() {
     ABOX_DEPLOY_TX_BACKUP_DIR=''
     ABOX_DEPLOY_TX_KEY_FILE=''
     ABOX_DEPLOY_TX_EPHEMERAL_DIR=''
-    ABOX_DIE_HOOK=''
-    msg "${YELLOW}[!] ${reason} failed; restoring the exact pre-operation snapshot.${NC}"
-    stop_all_managed_services >/dev/null 2>&1 || true
-    clean_nat_rules >/dev/null 2>&1 || true
-    clean_input_rules >/dev/null 2>&1 || true
-    remove_native_firewall_rules >/dev/null 2>&1 || true
-    local remove_failed=0
-    for srv in $targets; do remove_core_family_force "$srv" || remove_failed=1; done
-    (( remove_failed == 0 )) || msg "${RED}[!] Rollback could not completely remove one or more managed core files before restore.${NC}"
-    if [[ -n "$tx_key_file" ]]; then
-        restore_latest_backup_silent "$tx_backup_dir" "$backup" "$tx_key_file" || msg "${RED}[!] Automatic rollback could not restore the exact pre-operation backup: ${backup:-missing}${NC}"
-    else
-        restore_latest_backup_silent "$tx_backup_dir" "$backup" || msg "${RED}[!] Automatic rollback could not restore the exact pre-operation backup: ${backup:-missing}${NC}"
-    fi
-    [[ -n "$tx_tmp" ]] && rm -rf -- "$tx_tmp"
-    if [[ -n "$tx_ephemeral_dir" && "$tx_ephemeral_dir" == /run/A-Box-uninstall-tx.* && "$tx_ephemeral_dir" != /run/ ]]; then
-        rm -rf -- "$tx_ephemeral_dir" 2>/dev/null || true
-    fi
+    return 0
 }
 
 begin_deployment_transaction() {
@@ -5904,7 +6076,7 @@ deploy_xray() {
     local MODE_IN=$1 KEYPAIR
     clear; msg "${BOLD}${GREEN}部署 Xray-core [$MODE_IN]${NC}"
     init_system_environment
-    load_abox_env "$ABOX_ENV" 2>/dev/null || true
+    load_optional_abox_env_or_die
     light_preflight_check
     if [[ "$MODE_IN" == *'ALL'* ]]; then assert_no_foreign_core_conflicts xray hysteria; else assert_no_foreign_core_conflicts xray; fi
     confirm_deployment_replacement xray "$MODE_IN"
@@ -6020,7 +6192,7 @@ deploy_singbox() {
     local MODE_IN=$1 KEYPAIR SB_PATH cert_cn='localhost' SB_PRE_START='' SB_POST_STOP='' SB_RC_PRE='' SB_RC_POST='' SB_CAPS='CAP_NET_BIND_SERVICE'
     clear; msg "${BOLD}${GREEN}部署 Sing-box 核心 [$MODE_IN]${NC}"
     init_system_environment
-    load_abox_env "$ABOX_ENV" 2>/dev/null || true
+    load_optional_abox_env_or_die
     light_preflight_check
     assert_no_foreign_core_conflicts sing-box
     confirm_deployment_replacement singbox "$MODE_IN"
@@ -6165,16 +6337,22 @@ EOF_SVC
 }
 
 get_month_total_bytes() {
-    local iface="$1" mode="${2:-total}" json rx tx line
+    local iface="$1" mode="${2:-total}" json rx tx line month_count
     if command -v jq >/dev/null 2>&1 && json=$(vnstat -i "$iface" --json m 1 2>/dev/null); then
+        month_count=$(jq -r '(.interfaces[0].traffic.month // .interfaces[0].traffic.months // []) | length' <<< "$json" 2>/dev/null || printf 'x')
+        if [[ "$month_count" == '0' ]]; then
+            case "$mode" in rx|tx|total) printf '0
+'; return 0 ;; *) return 1 ;; esac
+        fi
         rx=$(jq -r '([.interfaces[0].traffic.month[]?, .interfaces[0].traffic.months[]?] | last | .rx) // empty' <<< "$json" 2>/dev/null)
         tx=$(jq -r '([.interfaces[0].traffic.month[]?, .interfaces[0].traffic.months[]?] | last | .tx) // empty' <<< "$json" 2>/dev/null)
         if [[ "$rx" =~ ^[0-9]+$ && "$tx" =~ ^[0-9]+$ ]]; then
             case "$mode" in
-                rx) printf '%s\n' "$rx" ;;
-                tx) printf '%s\n' "$tx" ;;
-                total)
-                    python3 - "$rx" "$tx" <<'PY_VNSTAT_TOTAL_MAIN'
+                rx) printf '%s
+' "$rx" ;;
+                tx) printf '%s
+' "$tx" ;;
+                total) python3 - "$rx" "$tx" <<'PY_VNSTAT_TOTAL_MAIN'
 import sys
 print(int(sys.argv[1]) + int(sys.argv[2]))
 PY_VNSTAT_TOTAL_MAIN
@@ -6322,16 +6500,23 @@ read_block_period() {
     printf '%s\n' "$period"
 }
 month_bytes() {
-    local i="$1" mode="${2:-total}" json rx tx line
+    local i="$1" mode="${2:-total}" json rx tx line month_count
     if command -v jq >/dev/null 2>&1 && json=$(vnstat -i "$i" --json m 1 2>/dev/null); then
+        # A newly initialized vnStat database may have an interface entry but no
+        # monthly sample yet. Treat an empty monthly series as 0 for quota purposes.
+        # A failed interface/database query still falls through and remains fail-closed.
+        month_count=$(jq -r '(.interfaces[0].traffic.month // .interfaces[0].traffic.months // []) | length' <<< "$json" 2>/dev/null || printf 'x')
+        if [[ "$month_count" == '0' ]]; then
+            case "$mode" in rx|tx|total) printf '0
+'; return 0 ;; *) return 1 ;; esac
+        fi
         rx=$(jq -r '([.interfaces[0].traffic.month[]?, .interfaces[0].traffic.months[]?] | last | .rx) // empty' <<< "$json" 2>/dev/null)
         tx=$(jq -r '([.interfaces[0].traffic.month[]?, .interfaces[0].traffic.months[]?] | last | .tx) // empty' <<< "$json" 2>/dev/null)
         if [[ "$rx" =~ ^[0-9]+$ && "$tx" =~ ^[0-9]+$ ]]; then
             case "$mode" in
                 rx) echo "$rx" ;;
                 tx) echo "$tx" ;;
-                total)
-                    python3 - "$rx" "$tx" <<'PY_VNSTAT_TOTAL_MONITOR'
+                total) python3 - "$rx" "$tx" <<'PY_VNSTAT_TOTAL_MONITOR'
 import sys
 print(int(sys.argv[1]) + int(sys.argv[2]))
 PY_VNSTAT_TOTAL_MONITOR
@@ -6345,20 +6530,95 @@ PY_VNSTAT_TOTAL_MONITOR
     case "$mode" in rx) awk -F';' '{print $9}' <<< "$line";; tx) awk -F';' '{print $10}' <<< "$line";; total) awk -F';' '{print $11}' <<< "$line";; *) return 1;; esac
 }
 is_systemd() { [[ "$INIT_SYS_EXPECTED" == systemd ]]; }
-owned() { local srv="$1" u; if is_systemd; then u="/etc/systemd/system/${srv}.service"; else u="/etc/init.d/${srv}"; fi; [[ -f "$u" && ! -L "$u" ]] && grep -Fxq '# Managed by A-Box' "$u"; }
+managed_unit_path() {
+    case "$1" in
+        xray|sing-box|hysteria)
+            if is_systemd; then printf '/etc/systemd/system/%s.service\n' "$1"; else printf '/etc/init.d/%s\n' "$1"; fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+owned() {
+    local srv="$1" u
+    u=$(managed_unit_path "$srv") || return 1
+    [[ -f "$u" && ! -L "$u" ]] && grep -Fxq '# Managed by A-Box' "$u"
+}
+force_stop_owned_openrc() {
+    local srv="$1" pidfile exe pid owner proc_exe
+    case "$srv" in
+        xray) pidfile=/run/xray.pid; exe=/usr/local/bin/xray ;;
+        sing-box) pidfile=/run/sing-box.pid; exe=/usr/local/bin/sing-box ;;
+        hysteria) pidfile=/run/hysteria.pid; exe=/usr/local/bin/hysteria ;;
+        *) return 1 ;;
+    esac
+    [[ -f "$pidfile" && ! -L "$pidfile" ]] || return 1
+    [[ "$(stat -c %h "$pidfile" 2>/dev/null)" == 1 ]] || return 1
+    owner=$(stat -c %u "$pidfile" 2>/dev/null) || return 1
+    [[ "$owner" == 0 ]] || return 1
+    pid=$(cat -- "$pidfile" 2>/dev/null) || return 1
+    [[ "$pid" =~ ^[1-9][0-9]{0,9}$ ]] && (( 10#$pid > 1 )) || return 1
+    proc_exe=$(readlink "/proc/${pid}/exe" 2>/dev/null) || return 1
+    [[ "$proc_exe" == "$exe" ]] || return 1
+    command -v start-stop-daemon >/dev/null 2>&1 || return 1
+    # OpenRC's own process helper verifies both the pidfile and executable
+    # before signaling. Never fall back to an unqualified kill by PID.
+    start-stop-daemon --stop --pidfile "$pidfile" --exec "$exe" --retry TERM/5/KILL/1 >/dev/null 2>&1 || return 1
+}
+
 stop_owned() {
-    local srv="$1"
-    owned "$srv" || return 0
+    local srv="$1" u rc enabled_state
+    u=$(managed_unit_path "$srv") || return 1
+    if ! owned "$srv"; then
+        # An existing but unmarked unit is outside A-Box ownership and cannot be
+        # changed. If the unit file is absent, still query the service manager:
+        # a previously loaded unit may remain active after its file was removed.
+        [[ ! -e "$u" && ! -L "$u" ]] || return 1
+        if is_systemd; then
+            local load_state
+            load_state=$(systemctl show -p ActiveState --value "$srv" 2>/dev/null) || return 1
+            case "$load_state" in inactive|failed|dead|not-found) return 0 ;; *) return 1 ;; esac
+        else
+            rc-service "$srv" status >/dev/null 2>&1; rc=$?
+            case "$rc" in 3|16|32) return 0 ;; *) return 1 ;; esac
+        fi
+    fi
     if is_systemd; then
-        systemctl stop "$srv" >/dev/null 2>&1 || return 1
+        systemctl stop "$srv" >/dev/null 2>&1 || true
+        if systemctl is-active --quiet "$srv"; then
+            # Restart=always can race a failed stop. Disable first, then kill the
+            # unit cgroup and re-check actual activity before reporting success.
+            systemctl disable "$srv" >/dev/null 2>&1 || return 1
+            systemctl kill --kill-who=all --signal=SIGKILL "$srv" >/dev/null 2>&1 || true
+            systemctl stop "$srv" >/dev/null 2>&1 || true
+        fi
         systemctl is-active --quiet "$srv" && return 1
         systemctl disable "$srv" >/dev/null 2>&1 || return 1
-        systemctl is-enabled "$srv" >/dev/null 2>&1 && return 1
+        enabled_state=$(systemctl show -p UnitFileState --value "$srv" 2>/dev/null) || return 1
+        [[ "$enabled_state" == disabled ]] || return 1
+        return 0
     else
-        rc-service "$srv" stop >/dev/null 2>&1 || return 1
-        rc-service "$srv" status >/dev/null 2>&1 && return 1
+        rc-service "$srv" stop >/dev/null 2>&1 || true
+        rc-service "$srv" status >/dev/null 2>&1; rc=$?
+        if (( rc == 0 )); then
+            # If OpenRC's stop action failed and the service remains active,
+            # try its pidfile-aware TERM/KILL escalation only after validating
+            # that the pidfile belongs to root and the PID maps to this core.
+            force_stop_owned_openrc "$srv" || return 1
+            rc-service "$srv" status >/dev/null 2>&1; rc=$?
+        fi
+        case "$rc" in
+            0) return 1 ;;
+            3|16|32) : ;;
+            *) return 1 ;;
+        esac
         rc-update del "$srv" default >/dev/null 2>&1 || return 1
-        rc-service "$srv" status >/dev/null 2>&1 && return 1
+        rc-update show default 2>/dev/null | grep -Eq "(^|[[:space:]])${srv}([[:space:]]|$)" && return 1
+        rc-service "$srv" status >/dev/null 2>&1; rc=$?
+        case "$rc" in
+            0) return 1 ;;
+            3|16|32) : ;;
+            *) return 1 ;;
+        esac
     fi
 }
 start_owned() {
@@ -6503,7 +6763,12 @@ elif [[ "$desired" == TRAFFIC_BLOCKED ]]; then
     for_expected_services stop_owned || { traffic_error 'traffic-blocked state could not be fully enforced'; exit 1; }
 fi
 EOF_TRAFFIC
-    if [[ "${INIT_SYS:-}" == systemd ]]; then sed -i "s|^INIT_SYS_EXPECTED=.*|INIT_SYS_EXPECTED='systemd'|" "$ABOX_DIR/traffic_monitor.sh"; else sed -i "s|^INIT_SYS_EXPECTED=.*|INIT_SYS_EXPECTED='openrc'|" "$ABOX_DIR/traffic_monitor.sh"; fi
+    if [[ "${INIT_SYS:-}" == systemd ]]; then
+        sed -i "s|^INIT_SYS_EXPECTED=.*|INIT_SYS_EXPECTED='systemd'|" "$ABOX_DIR/traffic_monitor.sh" || die '流量监控脚本运行环境标记写入失败。'
+    else
+        sed -i "s|^INIT_SYS_EXPECTED=.*|INIT_SYS_EXPECTED='openrc'|" "$ABOX_DIR/traffic_monitor.sh" || die '流量监控脚本运行环境标记写入失败。'
+    fi
+    grep -Fxq "INIT_SYS_EXPECTED='${INIT_SYS}'" "$ABOX_DIR/traffic_monitor.sh" || die '流量监控脚本运行环境标记后置校验失败。' 
     chmod 700 "$ABOX_DIR/traffic_monitor.sh" || die '流量监控脚本权限设置失败。'
     [[ -z "${ABOX_TRAFFIC_TX_DIR:-}" ]] || capture_traffic_quota_expected_state "$ABOX_TRAFFIC_TX_DIR" || die '流量限制监控脚本事务快照失败。'
     install_abox_cron_block TRAFFIC '* * * * * /bin/bash /etc/ddr/traffic_monitor.sh >/dev/null 2>&1'
@@ -6605,7 +6870,7 @@ restore_vnstat_runtime_state() {
 }
 
 traffic_restore_cron_block() {
-    local pre_file="$1" expected_block="$2" current tmp stripped
+    local pre_file="$1" expected_block="$2" current tmp stripped rc=0
     current=$(umask 077; mktemp /tmp/A-Box-traffic-cron-current.XXXXXX) || return 1
     tmp=$(umask 077; mktemp /tmp/A-Box-traffic-cron-restore.XXXXXX) || { rm -f -- "$current"; return 1; }
     if ! read_crontab_to_file "$current"; then rm -f -- "$current" "$tmp"; return 1; fi
@@ -6620,8 +6885,13 @@ traffic_restore_cron_block() {
     fi
     cat "$stripped" > "$tmp" || { rm -f -- "$current" "$tmp" "$stripped"; return 1; }
     if [[ -s "$pre_file" ]]; then cat "$pre_file" >> "$tmp" || { rm -f -- "$current" "$tmp" "$stripped"; return 1; }; fi
-    crontab "$tmp" >/dev/null 2>&1 || { rm -f -- "$current" "$tmp" "$stripped"; return 1; }
+    if commit_crontab_if_unchanged "$current" "$tmp"; then
+        rc=0
+    else
+        rc=$?
+    fi
     rm -f -- "$current" "$tmp" "$stripped"
+    return "$rc"
 }
 
 capture_traffic_quota_expected_state() {
@@ -6748,7 +7018,7 @@ traffic_quota_transaction_rollback() {
     if [[ -s "$tx_dir/pre.block" ]]; then IFS= read -r current_state < "$tx_dir/pre.block" && write_private_line "$ABOX_TRAFFIC_BLOCK_STATE" "$current_state" || rc=1; else rm -f -- "$ABOX_TRAFFIC_BLOCK_STATE" 2>/dev/null || true; fi
 
     if [[ -f "$tx_dir/pre.cron.traffic" ]]; then
-        if ! traffic_restore_cron_block "$tx_dir/pre.cron.traffic" "$expected_block"; then cron_rc=$?; rc=1; fi
+        if traffic_restore_cron_block "$tx_dir/pre.cron.traffic" "$expected_block"; then :; else cron_rc=$?; rc=1; fi
         if (( cron_rc == 2 )); then printf '%s\n' "A-Box traffic rollback conflict: crontab TRAFFIC block changed externally; recovery state preserved at $tx_dir" >&2; fi
     fi
 
@@ -6803,10 +7073,44 @@ finalize_traffic_quota_transaction() {
 }
 
 
+start_services_for_traffic_unblock() {
+    local pre_state="$1" changed_pre="$2" changed_expected="$3"
+    local services srv before after active enabled op_rc final_state
+    services=$(expected_managed_services) || return 1
+    while IFS= read -r srv; do
+        [[ -n "$srv" ]] || continue
+        abox_owns_service "$srv" || return 1
+        before=$(managed_service_state_value "$srv" 2>/dev/null) || return 1
+        [[ "$before" == "$srv|1|1" ]] && continue
+        IFS='|' read -r _ active enabled <<< "$before"
+        append_managed_service_state_entry "$pre_state" "$changed_pre" "$srv" || return 1
+        if [[ "$active" == 1 ]]; then
+            if enable_abox_service_soft "$srv"; then op_rc=0; else op_rc=$?; fi
+        else
+            if start_abox_service_soft "$srv"; then op_rc=0; else op_rc=$?; fi
+        fi
+        after=$(managed_service_state_value "$srv" 2>/dev/null || true)
+        if [[ -n "$after" ]]; then
+            printf '%s\n' "$after" >> "$changed_expected" || return 1
+        else
+            # Keep the expected post-state explicit; rollback will refuse to
+            # mutate if the actual state cannot later be proven to match it.
+            printf '%s\n' "$srv|1|1" >> "$changed_expected" || return 1
+        fi
+        (( op_rc == 0 )) || return 1
+        [[ "$after" == "$srv|1|1" ]] || return 1
+    done <<< "$services"
+    while IFS= read -r srv; do
+        [[ -n "$srv" ]] || continue
+        final_state=$(managed_service_state_value "$srv" 2>/dev/null) || return 1
+        [[ "$final_state" == "$srv|1|1" ]] || return 1
+    done <<< "$services"
+}
+
 traffic_management_menu() {
     clear
     local INTERFACE limit_gb mode_choice
-    load_abox_env "$ABOX_ENV" 2>/dev/null || true
+    load_optional_abox_env_or_die
     INTERFACE="${INGRESS_IF:-$(get_active_interface)}"
     msg "${CYAN}======================================================================${NC}"
     msg "${BOLD}${GREEN}每月流量管控限制 / Monthly Traffic Management Limit${NC}"
@@ -6832,30 +7136,64 @@ traffic_management_menu() {
             read -r -p '计量模式 total/rx/tx (回车默认 total): ' mode_choice
             mode_choice=${mode_choice:-total}
             [[ "$mode_choice" =~ ^(total|rx|tx)$ ]] || { msg "${RED}[!] 计量模式无效。${NC}"; pause_return; return; }
-            local traffic_tx_dir="" old_die_hook="" traffic_tx_active=0
+            local traffic_tx_dir="" old_die_hook="" traffic_previous_state='' traffic_service_pre='' traffic_service_changed_pre='' traffic_service_changed_expected='' traffic_op_rc=0 traffic_target_state=''
+            traffic_previous_state=$(get_desired_state) || die '无法可靠读取当前服务期望状态；未修改流量限制。'
             traffic_tx_dir=$(mktemp -d /run/A-Box-traffic-tx.XXXXXX) || die '无法创建流量状态事务目录。'
             chmod 700 "$traffic_tx_dir" || { rm -rf -- "$traffic_tx_dir"; die '流量状态事务目录权限设置失败。'; }
             prepare_traffic_quota_transaction "$traffic_tx_dir" || { rm -rf -- "$traffic_tx_dir"; die '无法保存流量限制事务前态。'; }
+            if [[ "$traffic_previous_state" == TRAFFIC_BLOCKED ]]; then
+                traffic_service_pre="$traffic_tx_dir/pre-services.state"
+                traffic_service_changed_pre="$traffic_tx_dir/changed-services-pre.state"
+                traffic_service_changed_expected="$traffic_tx_dir/changed-services-expected.state"
+                capture_managed_service_state "$traffic_service_pre" || { rm -rf -- "$traffic_tx_dir"; die '无法保存解除流量封锁前的服务状态。'; }
+                : > "$traffic_service_changed_pre"; : > "$traffic_service_changed_expected"
+            fi
             if [[ ${ABOX_DIE_HOOK+x} ]]; then old_die_hook="$ABOX_DIE_HOOK"; fi
             ABOX_TRAFFIC_TX_DIR="$traffic_tx_dir"
             ABOX_DIE_HOOK=traffic_quota_menu_die_rollback
             traffic_quota_menu_die_rollback() {
-                local rollback_rc=0
-                traffic_quota_transaction_rollback "$traffic_tx_dir" || rollback_rc=$?
+                local rollback_rc=0 reason="${1:-traffic quota change failed}"
+                if [[ -n "$traffic_service_changed_pre" && -s "$traffic_service_changed_pre" ]]; then
+                    if [[ -s "$traffic_service_changed_expected" ]]; then
+                        restore_managed_service_state "$traffic_service_changed_pre" "$traffic_service_changed_expected" || rollback_rc=1
+                    else
+                        rollback_rc=1
+                    fi
+                fi
+                traffic_quota_transaction_rollback "$traffic_tx_dir" || rollback_rc=1
                 if (( rollback_rc != 0 )); then
                     printf '%s\n' "A-Box traffic quota rollback incomplete/conflicted; recovery state preserved at $traffic_tx_dir" >&2
                 else
-                    rm -rf -- "$traffic_tx_dir" || true
+                    rm -rf -- "$traffic_tx_dir" || rollback_rc=1
+                fi
+                if (( rollback_rc != 0 )); then
+                    printf '%s\n' "A-Box traffic quota/service rollback incomplete; inspect recovery state at $traffic_tx_dir" >&2
                 fi
                 if [[ -n "$old_die_hook" && "$old_die_hook" != traffic_quota_menu_die_rollback ]] && declare -F "$old_die_hook" >/dev/null 2>&1; then
-                    "$old_die_hook" "$1" || true
+                    "$old_die_hook" "$reason" || true
                 fi
+                return "$rollback_rc"
             }
-            traffic_tx_active=1
             setup_traffic_monitor
-            update_traffic_state_atomically "$limit_gb" "$mode_choice" || die '流量限制状态原子提交失败。'
-            clear_traffic_block_period || die '旧流量封禁周期清理失败。'
-            set_desired_state RUNNING || die '服务期望状态写入失败。'
+            if update_traffic_state_atomically "$limit_gb" "$mode_choice"; then traffic_op_rc=0; else traffic_op_rc=$?; fi
+            capture_traffic_quota_expected_state "$traffic_tx_dir" || die '流量限制更新后无法核验状态；事务已中止。'
+            (( traffic_op_rc == 0 )) || die '流量限制状态原子提交失败。'
+            if clear_traffic_block_period; then traffic_op_rc=0; else traffic_op_rc=$?; fi
+            capture_traffic_quota_expected_state "$traffic_tx_dir" || die '清除旧封锁周期后无法核验状态；事务已中止。'
+            (( traffic_op_rc == 0 )) || die '旧流量封锁周期清理失败。'
+            case "$traffic_previous_state" in
+                TRAFFIC_BLOCKED)
+                    start_services_for_traffic_unblock "$traffic_service_pre" "$traffic_service_changed_pre" "$traffic_service_changed_expected" || die '新流量上限已写入，但托管服务无法恢复运行；事务已中止。'
+                    traffic_target_state=RUNNING
+                    ;;
+                RUNNING|MANUAL_STOPPED|MAINTENANCE)
+                    traffic_target_state="$traffic_previous_state"
+                    ;;
+                *) die "未知服务期望状态 ${traffic_previous_state}；拒绝提交流量限制。" ;;
+            esac
+            if set_desired_state "$traffic_target_state"; then traffic_op_rc=0; else traffic_op_rc=$?; fi
+            capture_traffic_quota_expected_state "$traffic_tx_dir" || die '期望状态提交后无法核验事务；已中止。'
+            (( traffic_op_rc == 0 )) || die '服务期望状态写入失败。'
             finalize_traffic_quota_transaction "$traffic_tx_dir" || die '流量限制事务提交后校验失败。'
             unset ABOX_DIE_HOOK
             if [[ -n "$old_die_hook" ]]; then ABOX_DIE_HOOK="$old_die_hook"; fi
@@ -6865,24 +7203,99 @@ traffic_management_menu() {
             pause_return
             ;;
         2)
-            previous_state=$(get_desired_state 2>/dev/null || printf RUNNING)
-            update_traffic_state_atomically '' '' || die '解除流量限制时状态原子提交失败。'
-            disable_traffic_monitor || die '解除流量限制失败：A-Box cron 或监控脚本未能完整移除。'
-            set_desired_state RUNNING || die '服务期望状态写入失败。'
-            load_abox_env "$ABOX_ENV" 2>/dev/null || true
-            if [[ "$previous_state" == TRAFFIC_BLOCKED ]]; then
-                case "${CORE:-}" in
-                    xray) abox_owns_service xray && service_manager start xray ;;
-                    singbox) abox_owns_service sing-box && service_manager start sing-box ;;
-                    hysteria) abox_owns_service hysteria && service_manager start hysteria ;;
-                esac
-                [[ "${CORE:-}" == 'xray' && "${MODE:-}" == *'ALL'* ]] && abox_owns_service hysteria && service_manager start hysteria
-            fi
+            previous_state=$(get_desired_state) || die '无法可靠读取当前服务期望状态；未解除流量限制。'
+            local unblock_tx_dir='' unblock_old_die_hook='' unblock_state_pre='' unblock_changed_pre='' unblock_changed_expected='' unblock_op_rc=0 target_state=''
+            unblock_tx_dir=$(mktemp -d /run/A-Box-traffic-unblock.XXXXXX) || die '无法创建流量解除事务目录。'
+            chmod 700 "$unblock_tx_dir" || { rm -rf -- "$unblock_tx_dir"; die '流量解除事务目录权限设置失败。'; }
+            prepare_traffic_quota_transaction "$unblock_tx_dir" || { rm -rf -- "$unblock_tx_dir"; die '无法保存流量解除事务前态。'; }
+            unblock_state_pre="$unblock_tx_dir/pre-services.state"
+            unblock_changed_pre="$unblock_tx_dir/changed-services-pre.state"
+            unblock_changed_expected="$unblock_tx_dir/changed-services-expected.state"
+            capture_managed_service_state "$unblock_state_pre" || { rm -rf -- "$unblock_tx_dir"; die '无法保存流量解除前的服务状态。'; }
+            : > "$unblock_changed_pre"; : > "$unblock_changed_expected"
+            if [[ ${ABOX_DIE_HOOK+x} ]]; then unblock_old_die_hook="$ABOX_DIE_HOOK"; fi
+            ABOX_TRAFFIC_TX_DIR="$unblock_tx_dir"
+            ABOX_DIE_HOOK=traffic_unblock_menu_die_rollback
+            traffic_unblock_menu_die_rollback() {
+                local rollback_rc=0 reason="${1:-traffic unblock failed}"
+                if [[ -s "$unblock_changed_pre" ]]; then
+                    if [[ -s "$unblock_changed_expected" ]]; then
+                        restore_managed_service_state "$unblock_changed_pre" "$unblock_changed_expected" || rollback_rc=1
+                    else
+                        rollback_rc=1
+                    fi
+                fi
+                traffic_quota_transaction_rollback "$unblock_tx_dir" || rollback_rc=1
+                if (( rollback_rc == 0 )); then
+                    rm -rf -- "$unblock_tx_dir" || rollback_rc=1
+                fi
+                if (( rollback_rc != 0 )); then
+                    printf '%s\n' "A-Box traffic-unblock rollback incomplete; recovery state preserved at $unblock_tx_dir" >&2
+                fi
+                if [[ -n "$unblock_old_die_hook" && "$unblock_old_die_hook" != traffic_unblock_menu_die_rollback ]] && declare -F "$unblock_old_die_hook" >/dev/null 2>&1; then
+                    "$unblock_old_die_hook" "$reason" || true
+                fi
+                return "$rollback_rc"
+            }
+
+            if update_traffic_state_atomically '' ''; then unblock_op_rc=0; else unblock_op_rc=$?; fi
+            capture_traffic_quota_expected_state "$unblock_tx_dir" || die '流量解除时无法验证新状态；事务已中止。'
+            (( unblock_op_rc == 0 )) || die '解除流量限制时状态原子提交失败。'
+            if remove_abox_cron_block TRAFFIC; then unblock_op_rc=0; else unblock_op_rc=$?; fi
+            capture_traffic_quota_expected_state "$unblock_tx_dir" || die '移除流量监控任务后状态核验失败；事务已中止。'
+            (( unblock_op_rc == 0 )) || die '移除流量监控任务失败；未提交解除操作。'
+            if remove_owned_runtime_helper "$ABOX_DIR/traffic_monitor.sh"; then unblock_op_rc=0; else unblock_op_rc=$?; fi
+            capture_traffic_quota_expected_state "$unblock_tx_dir" || die '移除流量监控脚本后状态核验失败；事务已中止。'
+            (( unblock_op_rc == 0 )) || die '移除流量监控脚本失败；未提交解除操作。'
+            if clear_traffic_block_period; then unblock_op_rc=0; else unblock_op_rc=$?; fi
+            capture_traffic_quota_expected_state "$unblock_tx_dir" || die '清除流量封锁周期后状态核验失败；事务已中止。'
+            (( unblock_op_rc == 0 )) || die '清除流量封锁周期失败；未提交解除操作。'
+            load_abox_env "$ABOX_ENV" || die '流量配置重读失败；未提交解除操作。'
+            case "$previous_state" in
+                TRAFFIC_BLOCKED)
+                    start_services_for_traffic_unblock "$unblock_state_pre" "$unblock_changed_pre" "$unblock_changed_expected" || die '流量封锁解除后有托管服务未能启动/启用并通过状态核验。'
+                    target_state=RUNNING
+                    ;;
+                RUNNING|MANUAL_STOPPED|MAINTENANCE)
+                    target_state="$previous_state"
+                    ;;
+                *) die "未知服务期望状态 ${previous_state}；拒绝解除流量限制。" ;;
+            esac
+            if set_desired_state "$target_state"; then unblock_op_rc=0; else unblock_op_rc=$?; fi
+            capture_traffic_quota_expected_state "$unblock_tx_dir" || die '提交服务期望状态后核验失败；事务已中止。'
+            (( unblock_op_rc == 0 )) || die '服务期望状态写入失败。'
+            finalize_traffic_quota_transaction "$unblock_tx_dir" || die '流量解除事务最终状态校验失败。'
+            unset ABOX_DIE_HOOK
+            if [[ -n "$unblock_old_die_hook" ]]; then ABOX_DIE_HOOK="$unblock_old_die_hook"; fi
+            ABOX_TRAFFIC_TX_DIR=''
+            rm -rf -- "$unblock_tx_dir" || die '流量解除事务清理失败；状态已提交但恢复材料清理失败。'
             msg "${GREEN}流量限制已解除。${NC}"
             pause_return
             ;;
         *) return 0 ;;
     esac
+}
+
+remove_ss_source_whitelist_rules() {
+    local failed=0 cmd proto line rule
+    [[ -n "${SS_PORT:-}" ]] || return 0
+    for cmd in "$IPT" "$IPT6"; do
+        command -v "$cmd" >/dev/null 2>&1 || continue
+        "$cmd" -w -S INPUT >/dev/null 2>&1 || continue
+        for proto in tcp udp; do
+            while :; do
+                line=$("$cmd" -w -S INPUT 2>/dev/null | awk -v p="$proto" -v port="$SS_PORT" '''$0 ~ "^-A INPUT " && $0 ~ ("-p " p) && $0 ~ ("--dport " port) && $0 ~ ("--comment \"?A-Box-" port "-" p "-WL6?\"?($| )") {print; exit}''') || { failed=1; break; }
+                [[ -n "$line" ]] || break
+                line=${line//\"/}
+                rule="${line#-A INPUT }"
+                # Word-splitting is intentional: all A-Box comments and source
+                # addresses are whitespace-free, and iptables itself tokenizes
+                # the normalized -S form.
+                "$cmd" -w -D INPUT $rule >/dev/null 2>&1 || { failed=1; break; }
+            done
+        done
+    done
+    (( failed == 0 ))
 }
 
 manage_ss_whitelist() {
@@ -6895,7 +7308,7 @@ manage_ss_whitelist() {
         pause_return
         return 1
     }
-    load_abox_env "$ABOX_ENV" 2>/dev/null || true
+    load_optional_abox_env_or_die
     [[ -z "${SS_PORT:-}" ]] && { msg "${RED}[!] 未检测到已部署的 SS-2022 服务端口。${NC}"; pause_return; return; }
     msg "${CYAN}======================================================================${NC}"
     msg "${BOLD}${GREEN}SS-2022 白名单 IP 管理 / SS-2022 Whitelist Manager${NC}"
@@ -6941,6 +7354,11 @@ manage_ss_whitelist() {
             found=0
             if [[ "$del_ip" == *:* ]]; then
                 valid_ipv6_cidr "$del_ip" || { msg "${RED}[!] IPv6 白名单地址非法: $del_ip${NC}"; pause_return; return; }
+                if ! has_ipv6 || ! command -v ip6tables >/dev/null 2>&1 || ! "$IPT6" -w -S INPUT >/dev/null 2>&1; then
+                    msg "${YELLOW}[!] 当前系统没有可用的 IPv6 防火墙，无法移除 IPv6 白名单；IPv4 规则未受影响。${NC}"
+                    pause_return
+                    return
+                fi
                 for proto in tcp udp; do
                     while :; do
                         if iptables_rule_check "$IPT6" INPUT -p "$proto" --dport "$SS_PORT" -s "$del_ip" -m comment --comment "A-Box-${SS_PORT}-${proto}-WL6" -j ACCEPT; then check_rc=0; else check_rc=$?; fi
@@ -6996,6 +7414,7 @@ manage_ss_whitelist() {
             pause_return
             ;;
         4)
+            remove_ss_source_whitelist_rules || die '旧的 SS-2022 来源白名单规则无法完整删除；拒绝切换为全网开放。'
             for proto in tcp udp; do
                 while :; do
                     if iptables_rule_check "$IPT" INPUT -p "$proto" --dport "$SS_PORT" -m comment --comment "A-Box-${SS_PORT}-${proto}-DROP" -j DROP; then check_rc=0; else check_rc=$?; fi
@@ -7426,24 +7845,14 @@ run_remote_bash_script() {
     msg "${YELLOW}[*] SHA256: ${sha}${NC}"
     bash -n "$tmp" || { rm -f "$tmp"; die "远程脚本语法校验失败: $label"; }
     confirm_remote_script_hash "$label" "$url" "$sha" || { rm -f "$tmp"; msg "${YELLOW}[*] Remote script execution canceled: ${label}${NC}"; return 130; }
-    # Third-party code is explicitly opt-in, but it must not inherit reusable
-    # credentials from the A-Box controller environment. In particular, a
-    # remote helper must never receive GITHUB_TOKEN merely because A-Box used
-    # it for release metadata earlier in this process.
-    env \
-        -u GITHUB_TOKEN \
-        -u GH_TOKEN \
-        -u GIT_AUTH_TOKEN \
-        -u CF_API_TOKEN \
-        -u CF_API_KEY \
-        -u CLOUDFLARE_API_TOKEN \
-        -u AWS_ACCESS_KEY_ID \
-        -u AWS_SECRET_ACCESS_KEY \
-        -u AWS_SESSION_TOKEN \
-        -u HTTPS_PROXY \
-        -u HTTP_PROXY \
-        -u ALL_PROXY \
-        -u NO_PROXY \
+    # Third-party code is explicitly opt-in, but must not inherit any exported
+    # controller credentials (including secrets unknown to this script). Start
+    # from an empty environment and pass only the minimum non-secret runtime context.
+    env -i \
+        PATH="$PATH" \
+        HOME="${HOME:-/root}" \
+        LANG="${LANG:-C.UTF-8}" \
+        TERM="${TERM:-dumb}" \
         bash "$tmp" "$@"
     local rc=$?
     rm -f "$tmp"
@@ -11652,18 +12061,17 @@ EOF_SNI_PRIORITY
     [[ -s "$tmp" ]] || { rm -f "$raw" "$generated" "$tmp" "$append_tmp"; die 'SNI candidate filtering produced an empty library.'; }
 
     if [[ "$profile" == 'mini' ]]; then
-        # Keep the same candidate library semantics as full mode, but cap the default
-        # library size to the production-grade high-signal range. Operators can still
-        # override this with ABOX_SNI_MINI_MAX when needed.
-        max_count="${ABOX_SNI_MINI_MAX:-4096}"
+        max_count="${ABOX_SNI_MINI_MAX:-$ABOX_SNI_DEFAULT_MAX}"
     else
-        max_count="${ABOX_SNI_FULL_MAX:-4096}"
+        max_count="${ABOX_SNI_FULL_MAX:-$ABOX_SNI_DEFAULT_MAX}"
     fi
     if ! [[ "$max_count" =~ ^[0-9]+$ ]]; then
-        max_count=4096
+        max_count="$ABOX_SNI_DEFAULT_MAX"
     fi
-    if (( max_count <= 0 || max_count > 4096 )); then
-        max_count=4096
+    if (( max_count == 0 )); then
+        max_count="$ABOX_SNI_HARD_MAX"
+    elif (( max_count > ABOX_SNI_HARD_MAX )); then
+        max_count="$ABOX_SNI_HARD_MAX"
     fi
     out_tmp=$(mktemp "${out}.A-Box-new.XXXXXX") || { rm -f "$raw" "$generated" "$tmp"; die 'SNI candidate output temporary file creation failed.'; }
     if ! awk -v n="$max_count" 'NR<=n {print}' "$tmp" > "$out_tmp"; then
@@ -11699,7 +12107,7 @@ asn_lookup_ip() {
     uid=$(stat -c %u "$cache_dir" 2>/dev/null) || return 1
     gid=$(stat -c %g "$cache_dir" 2>/dev/null) || return 1
     mode=$(stat -c %a "$cache_dir" 2>/dev/null) || return 1
-    [[ "$uid" == 0 && "$gid" == 0 && "$mode" =~ ^0700$ ]] || return 1
+    [[ "$uid" == 0 && "$gid" == 0 && "$mode" =~ ^0?700$ ]] || return 1
     cache_file="$cache_dir/$(printf '%s' "$ip" | tr -c 'A-Za-z0-9_.:-' '_')"
     if [[ -s "$cache_file" ]]; then
         cat "$cache_file"
@@ -11766,8 +12174,30 @@ sni_probe_domain() {
     printf '%s\t%s\tapp=%ss\tttfb=%ss\ttotal=%ss\thttp=%s\tcode=%s\tip=%s\n' "$score" "$domain" "$t_app" "$t_start" "$t_total" "$http_version" "$code" "$remote_ip" >> "$raw"
 }
 
+sni_cert_san_matches() {
+    local domain="${1,,}" sanext="${2:-}" value suffix prefix
+    local -a entries=()
+    valid_domain "$domain" || return 1
+    # Parse comma-separated DNS SAN entries as literal hostnames. Never interpolate
+    # a domain into a grep regular expression: dots in the hostname are regex
+    # wildcards and can otherwise produce false-positive certificate matches.
+    mapfile -t entries < <(printf '%s\n' "$sanext" | tr ',' '\n' | sed -nE 's/.*DNS:([^[:space:]]+).*/\1/p')
+    for value in "${entries[@]}"; do
+        value="${value,,}"
+        [[ "$value" == "$domain" ]] && return 0
+        if [[ "$value" == \*.* ]]; then
+            suffix="${value#*.}"
+            [[ "$domain" == *."$suffix" ]] || continue
+            prefix="${domain%.$suffix}"
+            # X.509 wildcard DNS SANs match exactly one left-most label.
+            [[ -n "$prefix" && "$prefix" != *.* ]] && return 0
+        fi
+    done
+    return 1
+}
+
 sni_openssl_check() {
-    local domain="$1" timeout_s="${2:-5}" out cert sanext rest alpn='none' tls13=0 san=0
+    local domain="$1" timeout_s="${2:-5}" out cert sanext alpn='none' tls13=0 san=0
     command -v openssl >/dev/null 2>&1 || { printf 'tls13=unknown\talpn=unknown\tsan=unknown'; return 0; }
     out=$(printf '' | timeout "$timeout_s" openssl s_client -connect "${domain}:443" -servername "$domain" -alpn 'h2,http/1.1' -tls1_3 -showcerts 2>/dev/null | tr -d '\000') || out=''
     if [[ -n "$out" ]]; then
@@ -11777,12 +12207,7 @@ sni_openssl_check() {
         cert=$(awk 'BEGIN{p=0}/-----BEGIN CERTIFICATE-----/{p=1} p{print} /-----END CERTIFICATE-----/{exit}' <<< "$out")
         if [[ -n "$cert" ]]; then
             sanext=$(printf '%s\n' "$cert" | openssl x509 -noout -ext subjectAltName 2>/dev/null | tr '\n' ' ' || true)
-            if grep -qi "DNS:${domain}\b" <<< "$sanext"; then
-                san=1
-            else
-                rest="${domain#*.}"
-                grep -qi "DNS:\*\.${rest}\b" <<< "$sanext" && san=1
-            fi
+            sni_cert_san_matches "$domain" "$sanext" && san=1
         fi
     fi
     printf 'tls13=%s\talpn=%s\tsan=%s' "$tls13" "$alpn" "$san"
@@ -12362,6 +12787,21 @@ strip_abox_cron_blocks_from_file() {
     ' "$input" > "$output" || return 1
 }
 
+commit_crontab_if_unchanged() {
+    local snapshot="$1" candidate="$2" live rc=0
+    [[ -f "$snapshot" && ! -L "$snapshot" && -f "$candidate" && ! -L "$candidate" ]] || return 1
+    live=$(mktemp) || return 1
+    if ! read_crontab_to_file "$live"; then rm -f -- "$live"; return 1; fi
+    if ! cmp -s -- "$snapshot" "$live"; then
+        rm -f -- "$live"
+        printf '%s\n' 'A-Box cron update aborted: crontab changed concurrently; no overwrite was attempted.' >&2
+        return 2
+    fi
+    rm -f -- "$live"
+    crontab "$candidate" >/dev/null 2>&1 || rc=1
+    return "$rc"
+}
+
 install_abox_cron_block() {
     local name="$1" line="$2" current tmp
     [[ -n "$name" && -n "$line" ]] || return 1
@@ -12380,8 +12820,11 @@ install_abox_cron_block() {
         printf '%s\n' "$line"
         printf '%s\n' "# A-Box ${name} END"
     } >> "$tmp" || { rm -f -- "$current" "$tmp"; die 'crontab 临时内容写入失败。'; }
-    if ! crontab "$tmp" >/dev/null 2>&1; then
+    local commit_rc=0
+    commit_crontab_if_unchanged "$current" "$tmp" || commit_rc=$?
+    if (( commit_rc != 0 )); then
         rm -f -- "$current" "$tmp"
+        if (( commit_rc == 2 )); then die 'crontab 在提交前发生并发修改；已中止以保护外部任务。'; fi
         die 'crontab 写入失败；原有 crontab 未被覆盖。'
     fi
     rm -f -- "$current" "$tmp"
@@ -12400,7 +12843,7 @@ remove_abox_cron_block() {
         rm -f -- "$current" "$tmp"
         return 1
     fi
-    crontab "$tmp" >/dev/null 2>&1 || rc=1
+    commit_crontab_if_unchanged "$current" "$tmp" || rc=$?
     rm -f -- "$current" "$tmp"
     return "$rc"
 }
@@ -12417,7 +12860,7 @@ remove_all_abox_cron_blocks() {
         rm -f -- "$current" "$tmp"
         return 1
     fi
-    crontab "$tmp" >/dev/null 2>&1 || rc=1
+    commit_crontab_if_unchanged "$current" "$tmp" || rc=$?
     rm -f -- "$current" "$tmp"
     return "$rc"
 }
@@ -12498,7 +12941,7 @@ append_managed_service_state_entry() {
     printf '%s\n' "$line" >> "$dest"
 }
 
-restore_managed_service_state() {
+_apply_managed_service_state_file() {
     local state_file="${1:-}" expected_file="${2:-}" line srv active enabled extra seen="|"
     [[ -r "$state_file" && -f "$state_file" && ! -L "$state_file" ]] || return 1
     [[ "$(stat -c %u:%g "$state_file" 2>/dev/null || true)" == 0:0 ]] || return 1
@@ -12582,6 +13025,56 @@ restore_managed_service_state() {
     done < "$state_file"
 }
 
+restore_managed_service_state() {
+    local state_file="${1:-}" expected_file="${2:-}" tx_dir before_file post_file line srv before after rc=0
+    [[ -r "$state_file" && -f "$state_file" && ! -L "$state_file" ]] || return 1
+    validate_services_state_file "$state_file" || return 1
+    tx_dir=$(mktemp -d /run/A-Box-service-restore.XXXXXX) || return 1
+    chmod 700 "$tx_dir" || { rm -rf -- "$tx_dir"; return 1; }
+    before_file="$tx_dir/before.state"; post_file="$tx_dir/post.state"
+    : > "$before_file" || { rm -rf -- "$tx_dir"; return 1; }
+    while IFS='|' read -r srv _active _enabled extra; do
+        [[ -n "$srv" ]] || continue
+        [[ -z "${extra:-}" ]] || { rm -rf -- "$tx_dir"; return 1; }
+        before=$(managed_service_state_value "$srv" 2>/dev/null) || { rm -rf -- "$tx_dir"; return 1; }
+        printf '%s\n' "$before" >> "$before_file" || { rm -rf -- "$tx_dir"; return 1; }
+    done < "$state_file"
+    chmod 600 "$before_file" || { rm -rf -- "$tx_dir"; return 1; }
+
+    if _apply_managed_service_state_file "$state_file" "$expected_file"; then
+        rm -rf -- "$tx_dir" || return 1
+        return 0
+    else
+        rc=$?
+    fi
+
+    # The low-level applier may have changed a prefix of services before a later
+    # command failed. Capture the exact observable intermediate state; if any
+    # query fails, preserve the recovery snapshot instead of guessing.
+    : > "$post_file" || { printf '%s\n' "A-Box service restore failed; recovery state preserved at $tx_dir" >&2; return 1; }
+    while IFS='|' read -r srv _active _enabled extra; do
+        [[ -n "$srv" ]] || continue
+        after=$(managed_service_state_value "$srv" 2>/dev/null) || { printf '%s\n' "A-Box service restore failed; state query unavailable, recovery state preserved at $tx_dir" >&2; return 1; }
+        printf '%s\n' "$after" >> "$post_file" || { printf '%s\n' "A-Box service restore failed; recovery state preserved at $tx_dir" >&2; return 1; }
+    done < "$state_file"
+    chmod 600 "$post_file" || { printf '%s\n' "A-Box service restore failed; recovery state preserved at $tx_dir" >&2; return 1; }
+    if cmp -s -- "$before_file" "$post_file"; then
+        # No service state changed; avoid needlessly restarting/stopping a stack
+        # when the original operation failed before its first effective mutation.
+        rm -rf -- "$tx_dir" || return 1
+        return "$rc"
+    fi
+
+    # Roll back only if the live state still equals the captured intermediate state.
+    # _apply_managed_service_state_file performs this precondition check before mutation.
+    if ! _apply_managed_service_state_file "$before_file" "$post_file"; then
+        printf '%s\n' "A-Box service restore rollback incomplete or conflicted; recovery state preserved at $tx_dir" >&2
+        return 1
+    fi
+    rm -rf -- "$tx_dir" || return 1
+    return "$rc"
+}
+
 extract_abox_iptables_rules() {
     local snapshot="$1" mode="${2:-all}"
     awk -v mode="$mode" '''
@@ -12606,18 +13099,26 @@ capture_abox_iptables_snapshot() {
     local out="$1" family="${2:-4}" cmd all
     [[ "$family" == 6 ]] && cmd=ip6tables-save || cmd=iptables-save
     if ! command -v "$cmd" >/dev/null 2>&1; then
-        [[ "$family" == 6 ]] || return 1
+        [[ "$family" == 6 ]] && ! has_ipv6 || return 1
         : > "$out"
         return 0
     fi
     all=$(mktemp) || return 1
-    "$cmd" > "$all" 2>/dev/null || { rm -f "$all"; return 1; }
+    if ! "$cmd" > "$all" 2>/dev/null; then
+        rm -f "$all"
+        if [[ "$family" == 6 ]] && ! has_ipv6; then
+            : > "$out"
+            return 0
+        fi
+        return 1
+    fi
     extract_abox_iptables_rules "$all" all > "$out" || { rm -f "$all"; return 1; }
     rm -f "$all"
 }
 
 restore_abox_iptables_snapshot() {
     local snapshot="$1" family="${2:-4}" mode="${3:-all}" cmd tmp
+    [[ "$family" == 6 ]] && ! has_ipv6 && return 0
     [[ -s "$snapshot" ]] || return 0
     [[ "$family" == 6 ]] && cmd=ip6tables-restore || cmd=iptables-restore
     tmp=$(mktemp) || return 1
@@ -13416,8 +13917,8 @@ restore_cron_from_file() {
     fi
     strip_abox_cron_blocks_from_file "$current" "$tmp" || { rm -f "$tmp" "$current" "$err"; return 1; }
     cat "$f" >> "$tmp" || { rm -f "$tmp" "$current" "$err"; return 1; }
-    crontab "$tmp"
-    local rc=$?
+    local rc=0
+    commit_crontab_if_unchanged "$current" "$tmp" || rc=$?
     rm -f "$tmp" "$current" "$err"
     return "$rc"
 }
@@ -13594,7 +14095,7 @@ restore_latest_backup_silent() {
     backend=$(cat "$work/meta/firewall.backend" 2>/dev/null || echo iptables); [[ "$backend" == iptables ]] || mode=special
     restore_abox_iptables_snapshot "$work/meta/iptables.snapshot" 4 "$mode" || { rm -rf "$work"; return 1; }
     restore_abox_iptables_snapshot "$work/meta/ip6tables.snapshot" 6 "$mode" || { rm -rf "$work"; return 1; }
-    load_abox_env "$ABOX_ENV" >/dev/null 2>&1 || true
+    load_abox_env "$ABOX_ENV" >/dev/null 2>&1 || { rm -rf "$work"; return 1; }
     enforce_ss_whitelist_order "${SS_PORT:-}" || { rm -rf "$work"; return 1; }
     save_firewall_rules >/dev/null 2>&1 || { rm -rf "$work"; return 1; }
     if [[ "${INIT_SYS:-}" == systemd ]]; then systemctl daemon-reload >/dev/null 2>&1 || { rm -rf "$work"; return 1; }; fi
@@ -13672,20 +14173,24 @@ restore_from_backup() {
         [[ "$path" == /usr/local/bin/sb ]] && continue
         restore_auxiliary_path_from_backup "$root" "$path" || die "Restore failed: $path"
     done <<< "$aux_paths"
-    chmod 700 "$ABOX_DIR" 2>/dev/null || true
-    chmod 600 "$ABOX_ENV" 2>/dev/null || true
+    chmod 700 "$ABOX_DIR" 2>/dev/null || die '恢复后的 A-Box 目录权限加固失败。'
+    chmod 600 "$ABOX_ENV" 2>/dev/null || die '恢复后的 .env 权限加固失败。'
     regenerate_runtime_assets_after_restore || die 'Regenerate trusted A-Box runtime helpers and cron blocks failed.'
     apply_native_firewall_rules_from_state || die 'Restore native firewall rules failed.'
     backend=$(cat "$work/meta/firewall.backend" 2>/dev/null || echo iptables)
     [[ "$backend" == iptables ]] || mode=special
     restore_abox_iptables_snapshot "$work/meta/iptables.snapshot" 4 "$mode" || die 'IPv4 A-Box firewall restore failed.'
     restore_abox_iptables_snapshot "$work/meta/ip6tables.snapshot" 6 "$mode" || die 'IPv6 A-Box firewall restore failed.'
-    load_abox_env "$ABOX_ENV" >/dev/null 2>&1 || true
+    load_abox_env "$ABOX_ENV" >/dev/null 2>&1 || die '恢复后的 A-Box 环境文件校验失败。'
     enforce_ss_whitelist_order "${SS_PORT:-}" || die 'Restored SS whitelist order validation failed.'
     save_firewall_rules || die 'Restored A-Box firewall persistence failed.'
     if [[ "${INIT_SYS:-}" == systemd ]]; then systemctl daemon-reload >/dev/null 2>&1 || die 'systemd daemon-reload after restore failed.'; fi
     restore_managed_service_state "$work/meta/services.state" || die 'Restored service state failed validation/startup.'
-    for srv in xray sing-box hysteria; do abox_owns_service "$srv" && record_core_family_ownership "$srv" || true; done
+    for srv in xray sing-box hysteria; do
+        if abox_owns_service "$srv"; then
+            record_core_family_ownership "$srv" || die "Restored ${srv} ownership manifest update failed; restore was not committed."
+        fi
+    done
     commit_deployment_transaction
     rm -rf "$work"
     msg "${GREEN}[*] Restore completed.${NC}"
@@ -14354,7 +14859,7 @@ view_config() {
         VLESS_URL="vless://$UUID@$F_IP:$VLESS_PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$VISION_SNI_E&fp=chrome&pbk=$PUBLIC_KEY_E&sid=$SHORT_ID_E&type=tcp#A-Box-VLESS-Vision"
         msg "${GREEN}${VLESS_URL}${NC}"
         if [[ "$CORE" == 'xray' ]] && xray_reality_requires_mlkem; then
-            msg "${YELLOW}当前 Xray $(effective_xray_version) 的 REALITY 服务端涉及较新的兼容门槛；Mihomo 请使用下方完整 YAML。部分 Shadowrocket / sing-box 版本可能无法建立连接。A-Box 默认使用经过当前 iOS + XHTTP/REALITY 兼容性权衡的版本 Xray $ABOX_XRAY_DEFAULT_VERSION（该 pin 为 upstream prerelease）；更高 prerelease 版本请显式设置 ABOX_XRAY_VERSION。${NC}"
+            msg "${YELLOW}当前 Xray $(effective_xray_version) 的 REALITY 服务端涉及较新的兼容门槛；Mihomo 请使用下方完整 YAML。部分 Shadowrocket / sing-box 版本可能无法建立连接。A-Box 默认使用经过当前 iOS + XHTTP/REALITY 兼容性权衡的版本 Xray $ABOX_XRAY_DEFAULT_VERSION（兼容性固定版，非 26.9.x ML-KEM prerelease）；更高 prerelease 版本请显式设置 ABOX_XRAY_VERSION。${NC}"
         fi
         generate_qr "$VLESS_URL"
     fi
@@ -14660,7 +15165,7 @@ update_script() {
 force_update_geo() {
     clear
     init_system_environment
-    load_abox_env "$ABOX_ENV" 2>/dev/null || true
+    load_optional_abox_env_or_die
     if ! abox_owns_service xray; then
         msg "${YELLOW}[!] 未检测到 A-Box 托管的 Xray；不会创建或运行 Geo 更新任务。${NC}"
         pause_return
@@ -14705,6 +15210,20 @@ restart_service_soft() {
     fi
 }
 
+enable_abox_service_soft() {
+    local srv="$1" state
+    abox_owns_service "$srv" || return 1
+    if [[ "${INIT_SYS:-}" == systemd ]]; then
+        systemctl enable "$srv" >/dev/null 2>&1 || return 1
+    elif [[ "${INIT_SYS:-}" == openrc ]]; then
+        rc-update add "$srv" default >/dev/null 2>&1 || return 1
+    else
+        return 1
+    fi
+    state=$(managed_service_state_value "$srv") || return 1
+    [[ "$state" == "$srv|1|1" ]]
+}
+
 start_abox_service_soft() {
     local srv="$1"
     abox_owns_service "$srv" || return 1
@@ -14724,12 +15243,72 @@ start_abox_service_soft() {
     fi
 }
 
+core_expected_listen_ports() {
+    local core="$1" cfg="$2"
+    case "$core" in
+        xray)
+            jq -r '.inbounds[]?.port // empty | if type == "number" then tostring else empty end' "$cfg" 2>/dev/null
+            ;;
+        singbox)
+            jq -r '.inbounds[]?.listen_port // empty | if type == "number" then tostring else empty end' "$cfg" 2>/dev/null
+            ;;
+        hysteria)
+            # Hysteria 2 config uses listen: :PORT (or [::]:PORT).
+            awk '
+                $1 == "listen:" {
+                    v=$0; sub(/^[[:space:]]*listen:[[:space:]]*/, "", v)
+                    sub(/^.*:/, "", v); gsub(/[^0-9]/, "", v)
+                    if (v != "") print v
+                }
+            ' "$cfg" 2>/dev/null
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+core_ports_listening() {
+    local core="$1" cfg="$2" port any=0 line
+    while IFS= read -r port; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        any=1
+        if ! ss -H -lntup 2>/dev/null | awk -v p=":${port}" '$5 ~ p"$" {found=1} END{exit !found}'; then
+            msg "${RED}[!] ${core} 端口 ${port} 未处于监听状态。${NC}"
+            return 1
+        fi
+    done < <(core_expected_listen_ports "$core" "$cfg" | awk '!seen[$0]++')
+    (( any == 1 ))
+}
+
+core_post_upgrade_health_gate() {
+    local core="$1" cfg bin
+    case "$core" in
+        xray)
+            cfg='/usr/local/etc/xray/config.json'; bin='/usr/local/bin/xray'
+            [[ -x "$bin" && -f "$cfg" ]] || return 1
+            XRAY_LOCATION_ASSET=/usr/local/share/xray "$bin" run -test -config "$cfg" >/dev/null 2>&1 || return 1
+            ;;
+        singbox)
+            cfg='/etc/sing-box/config.json'; bin='/usr/local/bin/sing-box'
+            [[ -x "$bin" && -f "$cfg" ]] || return 1
+            "$bin" check -c "$cfg" >/dev/null 2>&1 || return 1
+            ;;
+        hysteria)
+            cfg='/etc/hysteria/config.yaml'; bin='/usr/local/bin/hysteria'
+            [[ -x "$bin" && -f "$cfg" ]] || return 1
+            ;;
+        *) return 1 ;;
+    esac
+    is_service_running "$core" || return 1
+    core_ports_listening "$core" "$cfg"
+}
+
 upgrade_xray_core_only() {
-    local was_active=0 backup='' tmp xray_zip xray_ext old_ver new_ver
+    local was_active=0 active_state='' backup='' tmp xray_zip xray_ext old_ver new_ver
     abox_owns_service xray || die '拒绝升级：xray 不是 A-Box 托管服务。'
     msg "${YELLOW}[*] Upgrading Xray-core binary only; node parameters will be preserved...${NC}"
     get_architecture
-    is_service_running xray && was_active=1 || true
+    active_state=$(service_active_state_value xray 2>/dev/null) || die '无法可靠查询 Xray 服务状态；拒绝在状态未知时升级核心。'
+    case "$active_state" in 1) was_active=1 ;; 0) was_active=0 ;; *) die 'Xray 服务状态响应无效；拒绝继续升级。' ;; esac
     [[ -x /usr/local/bin/xray ]] && old_ver=$(/usr/local/bin/xray version 2>/dev/null | head -n 1 || true)
     local target_ref="$(effective_xray_version)" current_tag='' cmp=0
     if [[ -z "${ABOX_XRAY_VERSION:-}" && -n "$old_ver" ]]; then
@@ -14760,11 +15339,13 @@ upgrade_xray_core_only() {
     fi
     [[ -f /usr/local/bin/xray ]] && { backup="$tmp/xray.backup"; cp -a /usr/local/bin/xray "$backup" || { rm -rf "$tmp"; die 'Xray binary backup failed.'; }; }
     install_binary_atomically "$xray_ext/xray" /usr/local/bin/xray || { rm -rf "$tmp"; die 'Xray binary atomic install failed.'; }
-    if [[ "$was_active" == '1' ]] && ! restart_service_soft xray; then
-        msg "${RED}[!] New Xray failed to restart. Rolling back binary...${NC}"
-        rollback_binary_install /usr/local/bin/xray "$backup" >/dev/null 2>&1 || true
-        restart_service_soft xray >/dev/null 2>&1 || true
-        rm -rf "$tmp"; die 'Xray core upgrade rolled back because service restart failed.'
+    if [[ "$was_active" == '1' ]]; then
+        if ! restart_service_soft xray || ! core_post_upgrade_health_gate xray; then
+            msg "${RED}[!] New Xray failed post-upgrade health checks. Rolling back binary...${NC}"
+            rollback_binary_install /usr/local/bin/xray "$backup" >/dev/null 2>&1 || true
+            restart_service_soft xray >/dev/null 2>&1 || true
+            rm -rf "$tmp"; die 'Xray core upgrade rolled back because post-upgrade health checks failed.'
+        fi
     fi
     msg "${GREEN}[OK] Xray-core upgraded.${NC} ${old_ver:-unknown} -> ${new_ver:-unknown}"
     rm -rf -- "$tmp"
@@ -14772,11 +15353,12 @@ upgrade_xray_core_only() {
 }
 
 upgrade_singbox_core_only() {
-    local was_active=0 backup='' tmp sb_tar sb_ext sb_path old_ver new_ver
+    local was_active=0 active_state='' backup='' tmp sb_tar sb_ext sb_path old_ver new_ver
     abox_owns_service sing-box || die '拒绝升级：sing-box 不是 A-Box 托管服务。'
     msg "${YELLOW}[*] Upgrading sing-box binary only; node parameters will be preserved...${NC}"
     get_architecture
-    is_service_running sing-box && was_active=1 || true
+    active_state=$(service_active_state_value sing-box 2>/dev/null) || die '无法可靠查询 sing-box 服务状态；拒绝在状态未知时升级核心。'
+    case "$active_state" in 1) was_active=1 ;; 0) was_active=0 ;; *) die 'sing-box 服务状态响应无效；拒绝继续升级。' ;; esac
     [[ -x /usr/local/bin/sing-box ]] && old_ver=$(/usr/local/bin/sing-box version 2>/dev/null | head -n 1 || true)
     tmp=$(mktemp -d /tmp/A-Box-core-singbox.XXXXXX) || die 'sing-box core upgrade temp directory failed.'
     ABOX_CORE_UPGRADE_TMP="$tmp"
@@ -14793,11 +15375,13 @@ upgrade_singbox_core_only() {
     fi
     [[ -f /usr/local/bin/sing-box ]] && { backup="$tmp/sing-box.backup"; cp -a /usr/local/bin/sing-box "$backup" || { rm -rf "$tmp"; die 'sing-box binary backup failed.'; }; }
     install_binary_atomically "$sb_path" /usr/local/bin/sing-box || { rm -rf "$tmp"; die 'sing-box binary atomic install failed.'; }
-    if [[ "$was_active" == '1' ]] && ! restart_service_soft sing-box; then
-        msg "${RED}[!] New sing-box failed to restart. Rolling back binary...${NC}"
-        rollback_binary_install /usr/local/bin/sing-box "$backup" >/dev/null 2>&1 || true
-        restart_service_soft sing-box >/dev/null 2>&1 || true
-        rm -rf "$tmp"; die 'sing-box core upgrade rolled back because service restart failed.'
+    if [[ "$was_active" == '1' ]]; then
+        if ! restart_service_soft sing-box || ! core_post_upgrade_health_gate singbox; then
+            msg "${RED}[!] New sing-box failed post-upgrade health checks. Rolling back binary...${NC}"
+            rollback_binary_install /usr/local/bin/sing-box "$backup" >/dev/null 2>&1 || true
+            restart_service_soft sing-box >/dev/null 2>&1 || true
+            rm -rf "$tmp"; die 'sing-box core upgrade rolled back because post-upgrade health checks failed.'
+        fi
     fi
     msg "${GREEN}[OK] sing-box upgraded.${NC} ${old_ver:-unknown} -> ${new_ver:-unknown}"
     rm -rf -- "$tmp"
@@ -14805,11 +15389,12 @@ upgrade_singbox_core_only() {
 }
 
 upgrade_hysteria_core_only() {
-    local was_active=0 backup='' tmp hy2_bin old_ver new_ver
+    local was_active=0 active_state='' backup='' tmp hy2_bin old_ver new_ver
     abox_owns_service hysteria || die '拒绝升级：hysteria 不是 A-Box 托管服务。'
     msg "${YELLOW}[*] Upgrading Hysteria 2 binary only; node parameters will be preserved. Hysteria has no documented standalone config-check command; active services are validated by restart with automatic binary rollback on failure.${NC}"
     get_architecture
-    is_service_running hysteria && was_active=1 || true
+    active_state=$(service_active_state_value hysteria 2>/dev/null) || die '无法可靠查询 Hysteria 服务状态；拒绝在状态未知时升级核心。'
+    case "$active_state" in 1) was_active=1 ;; 0) was_active=0 ;; *) die 'Hysteria 服务状态响应无效；拒绝继续升级。' ;; esac
     [[ -x /usr/local/bin/hysteria ]] && old_ver=$(/usr/local/bin/hysteria version 2>/dev/null | head -n 1 || true)
     tmp=$(mktemp -d /tmp/A-Box-core-hysteria.XXXXXX) || die 'Hysteria core upgrade temp directory failed.'
     ABOX_CORE_UPGRADE_TMP="$tmp"
@@ -14820,11 +15405,13 @@ upgrade_hysteria_core_only() {
     [[ -n "$new_ver" ]] || { rm -rf "$tmp"; die 'Hysteria staged binary execution check failed.'; }
     [[ -f /usr/local/bin/hysteria ]] && { backup="$tmp/hysteria.backup"; cp -a /usr/local/bin/hysteria "$backup" || { rm -rf "$tmp"; die 'Hysteria binary backup failed.'; }; }
     install_binary_atomically "$hy2_bin" /usr/local/bin/hysteria || { rm -rf "$tmp"; die 'Hysteria binary atomic install failed.'; }
-    if [[ "$was_active" == '1' ]] && ! restart_service_soft hysteria; then
-        msg "${RED}[!] New Hysteria failed to restart. Rolling back binary...${NC}"
-        rollback_binary_install /usr/local/bin/hysteria "$backup" >/dev/null 2>&1 || true
-        restart_service_soft hysteria >/dev/null 2>&1 || true
-        rm -rf "$tmp"; die 'Hysteria core upgrade rolled back because service restart failed.'
+    if [[ "$was_active" == '1' ]]; then
+        if ! restart_service_soft hysteria || ! core_post_upgrade_health_gate hysteria; then
+            msg "${RED}[!] New Hysteria failed post-upgrade health checks. Rolling back binary...${NC}"
+            rollback_binary_install /usr/local/bin/hysteria "$backup" >/dev/null 2>&1 || true
+            restart_service_soft hysteria >/dev/null 2>&1 || true
+            rm -rf "$tmp"; die 'Hysteria core upgrade rolled back because post-upgrade health checks failed.'
+        fi
     fi
     msg "${GREEN}[OK] Hysteria upgraded.${NC} ${old_ver:-unknown} -> ${new_ver:-unknown}"
     rm -rf -- "$tmp"
@@ -14837,28 +15424,39 @@ restore_core_upgrade_transaction_traps() {
     restore_saved_trap TERM "$ABOX_CORE_TX_PREV_TRAP_TERM"
     restore_saved_trap HUP "$ABOX_CORE_TX_PREV_TRAP_HUP"
     ABOX_CORE_TX_PREV_TRAP_EXIT=''; ABOX_CORE_TX_PREV_TRAP_INT=''; ABOX_CORE_TX_PREV_TRAP_TERM=''; ABOX_CORE_TX_PREV_TRAP_HUP=''
-    ABOX_CORE_UPGRADE_TARGETS=''
 }
 
 core_upgrade_transaction_rollback() {
     [[ "${ABOX_CORE_UPGRADE_ACTIVE:-0}" == 1 ]] || return 0
     local backup="${ABOX_CORE_UPGRADE_BACKUP:-}" targets="${ABOX_CORE_UPGRADE_TARGETS:-}" srv core_tmp="${ABOX_CORE_UPGRADE_TMP:-}"
+    # Disable recursive EXIT handling but retain backup/target/temp context until
+    # the prior snapshot is actually restored and verified.
     ABOX_CORE_UPGRADE_ACTIVE=0
-    ABOX_CORE_UPGRADE_BACKUP=''
-    ABOX_CORE_UPGRADE_TARGETS=''
-    ABOX_CORE_UPGRADE_TMP=''
     ABOX_DIE_HOOK=''
     restore_core_upgrade_transaction_traps
     msg "${YELLOW}[!] Core upgrade failed or was interrupted; restoring the exact pre-upgrade snapshot.${NC}"
-    stop_all_managed_services >/dev/null 2>&1 || true
-    local remove_failed=0
+    if ! stop_all_managed_services >/dev/null 2>&1; then
+        msg "${RED}[!] Core-upgrade rollback aborted: one or more managed services could not be confirmed stopped. Backup retained: ${backup:-missing}${NC}" >&2
+        return 1
+    fi
     for srv in $targets; do
         case "$srv" in singbox) srv='sing-box' ;; esac
-        remove_core_family_force "$srv" || remove_failed=1
+        if ! remove_core_family_force "$srv"; then
+            msg "${RED}[!] Core-upgrade rollback aborted: unable to remove ${srv} safely. Backup retained: ${backup:-missing}${NC}" >&2
+            return 1
+        fi
     done
-    (( remove_failed == 0 )) || msg "${RED}[!] Core-upgrade rollback could not completely remove one or more managed core files before restore.${NC}"
-    restore_latest_backup_silent "$ABOX_DIR/backups" "$backup" || msg "${RED}[!] Core upgrade rollback failed: ${backup:-missing}${NC}"
-    [[ -n "$core_tmp" ]] && rm -rf -- "$core_tmp"
+    if ! restore_latest_backup_silent "$ABOX_DIR/backups" "$backup"; then
+        msg "${RED}[!] Core upgrade rollback failed: ${backup:-missing}. Recovery context retained.${NC}" >&2
+        return 1
+    fi
+    if [[ -n "$core_tmp" ]]; then
+        rm -rf -- "$core_tmp" || { msg "${RED}[!] Prior core state restored, but upgrade staging cleanup failed: $core_tmp${NC}" >&2; return 1; }
+    fi
+    ABOX_CORE_UPGRADE_BACKUP=''
+    ABOX_CORE_UPGRADE_TARGETS=''
+    ABOX_CORE_UPGRADE_TMP=''
+    return 0
 }
 
 core_upgrade_transaction_signal_abort() {
@@ -14909,7 +15507,7 @@ commit_core_upgrade_transaction() {
 upgrade_current_cores_only() {
     clear
     init_system_environment
-    load_abox_env "$ABOX_ENV" 2>/dev/null || true
+    load_optional_abox_env_or_die
     local targets=() answer t
     if abox_owns_service xray && { [[ -x /usr/local/bin/xray || -f /usr/local/etc/xray/config.json ]] || service_unit_exists xray; }; then targets+=(xray); fi
     if abox_owns_service sing-box && { [[ -x /usr/local/bin/sing-box || -f /etc/sing-box/config.json ]] || service_unit_exists sing-box; }; then targets+=(singbox); fi
@@ -15123,171 +15721,108 @@ prepare_noninteractive_service_control() {
 }
 
 manual_stop_managed_stack() {
-    local srv failed=0 services previous_state state pre_state changed_pre changed_expected tx_dir
-    local -a changed_services=()
+    local srv failed=0 services previous_state pre_state changed_pre changed_expected tx_dir before after active enabled
     prepare_noninteractive_service_control
     services=$(expected_managed_services) || die '无法读取有效的 A-Box 部署状态。'
     previous_state=$(get_desired_state) || die '无法读取当前 A-Box 期望状态。'
     tx_dir=$(mktemp -d /run/A-Box-service-tx.XXXXXX) || die '无法创建服务状态事务目录。'
     chmod 700 "$tx_dir" || { rm -rf -- "$tx_dir"; die '服务状态事务目录权限设置失败。'; }
-    pre_state="$tx_dir/pre.state"
-    changed_pre="$tx_dir/changed-pre.state"
-    changed_expected="$tx_dir/changed-expected.state"
+    pre_state="$tx_dir/pre.state"; changed_pre="$tx_dir/changed-pre.state"; changed_expected="$tx_dir/changed-expected.state"
     capture_managed_service_state "$pre_state" || { rm -rf -- "$tx_dir"; die '无法保存服务运行/启用状态快照。'; }
     : > "$changed_pre"; : > "$changed_expected"
 
     while IFS= read -r srv; do
         [[ -n "$srv" ]] || continue
-        state=$(service_active_state_value "$srv" 2>/dev/null) || { failed=1; break; }
-        if [[ "$state" == 1 ]]; then
-            append_managed_service_state_entry "$pre_state" "$changed_pre" "$srv" || { failed=1; break; }
-            if stop_abox_service "$srv"; then
-                printf '%s|0|0\n' "$srv" >> "$changed_expected" || { failed=1; break; }
-                changed_services+=("$srv")
-            else
-                # The stop helper can fail after a partial stop/disable. Probe the
-                # current state only to classify a known intermediate state; do not
-                # claim rollback ownership for an indeterminate service.
-                local post_state
-                post_state=$(managed_service_state_value "$srv" 2>/dev/null || true)
-                if [[ "$post_state" == "$srv|0|0" || "$post_state" == "$srv|0|1" ]]; then
-                    printf '%s\n' "$post_state" >> "$changed_expected" 2>/dev/null || true
-                    changed_services+=("$srv")
-                fi
-                failed=1
-                break
-            fi
-        elif [[ "$state" != 0 ]]; then
-            failed=1
-            break
+        before=$(managed_service_state_value "$srv" 2>/dev/null) || { failed=1; break; }
+        IFS='|' read -r _ active enabled <<< "$before"
+        [[ "$active" == 0 && "$enabled" == 0 ]] && continue
+        stop_abox_service "$srv" || failed=1
+        after=$(managed_service_state_value "$srv" 2>/dev/null || true)
+        if [[ -z "$after" ]]; then
+            append_managed_service_state_entry "$pre_state" "$changed_pre" "$srv" || failed=1
+            printf '%s\n' "$srv|0|0" >> "$changed_expected" || failed=1
+        elif [[ "$after" != "$before" ]]; then
+            append_managed_service_state_entry "$pre_state" "$changed_pre" "$srv" || failed=1
+            printf '%s\n' "$after" >> "$changed_expected" || failed=1
         fi
+        [[ "$after" == "$srv|0|0" ]] || failed=1
+        (( failed == 0 )) || break
     done <<< "$services"
 
-    if (( failed == 0 )); then
-        while IFS= read -r srv; do
-            [[ -n "$srv" ]] || continue
-            local final_state
-            final_state=$(managed_service_state_value "$srv" 2>/dev/null) || { failed=1; break; }
-            [[ "$final_state" == "$srv|0|0" ]] || { failed=1; break; }
-        done <<< "$services"
-    fi
-
     service_tx_rollback() {
-        local rc=0
-        if (( ${#changed_services[@]} )); then
-            restore_managed_service_state "$changed_pre" "$changed_expected" || rc=$?
-        fi
-        return "$rc"
+        [[ ! -s "$changed_pre" ]] && return 0
+        [[ -s "$changed_expected" ]] || return 1
+        restore_managed_service_state "$changed_pre" "$changed_expected"
     }
-    service_tx_fail() {
-        local rc=0 recovery="$tx_dir"
-        if ! service_tx_rollback; then
-            printf '%s\n' "A-Box service rollback incomplete or conflicted; recovery state preserved at $recovery" >&2
-            return 1
-        fi
-        rm -rf -- "$tx_dir" || return 1
-        return 1
-    }
-
     if (( failed != 0 )); then
-        service_tx_fail || true
-        die '至少一个托管服务停止失败；未提交 MANUAL_STOPPED 状态。'
+        if ! service_tx_rollback; then printf '%s\n' "A-Box service rollback incomplete; recovery state preserved at $tx_dir" >&2; else rm -rf -- "$tx_dir"; fi
+        die '至少一个托管服务停止/禁用失败；未提交 MANUAL_STOPPED 状态。'
     fi
     set_desired_state MANUAL_STOPPED || {
-        service_tx_fail || true
-        die '服务已停止但 MANUAL_STOPPED 状态提交失败；已尝试恢复原运行状态。'
+        if ! service_tx_rollback; then printf '%s\n' "A-Box service rollback incomplete; recovery state preserved at $tx_dir" >&2; else rm -rf -- "$tx_dir"; fi
+        die '服务状态提交失败；已尝试恢复原运行/启用状态。'
     }
     rm -rf -- "$tx_dir" || die '服务状态事务清理失败；服务已按预期停止，但未能清理事务材料。'
     printf 'A-Box managed stack stopped; Intent=MANUAL_STOPPED\n'
 }
 
 manual_start_managed_stack() {
-    local srv failed=0 services previous_state previous_block_period='' block_state_present=0 state pre_state changed_pre changed_expected tx_dir
+    local srv failed=0 services previous_state previous_block_period='' block_state_present=0 before after active enabled tx_dir
     prepare_noninteractive_service_control
     services=$(expected_managed_services) || die '无法读取有效的 A-Box 部署状态。'
     previous_state=$(get_desired_state) || die '无法读取当前 A-Box 期望状态。'
     if [[ -e "$ABOX_TRAFFIC_BLOCK_STATE" || -L "$ABOX_TRAFFIC_BLOCK_STATE" ]]; then
-        previous_block_period=$(get_traffic_block_period) || die '无法读取当前流量封禁周期状态。'
+        previous_block_period=$(get_traffic_block_period) || die '无法读取当前流量封禁周期状态.'
         block_state_present=1
     fi
     tx_dir=$(mktemp -d /run/A-Box-service-tx.XXXXXX) || die '无法创建服务状态事务目录。'
     chmod 700 "$tx_dir" || { rm -rf -- "$tx_dir"; die '服务状态事务目录权限设置失败。'; }
-    pre_state="$tx_dir/pre.state"
-    changed_pre="$tx_dir/changed-pre.state"
-    changed_expected="$tx_dir/changed-expected.state"
+    local pre_state="$tx_dir/pre.state" changed_pre="$tx_dir/changed-pre.state" changed_expected="$tx_dir/changed-expected.state"
     capture_managed_service_state "$pre_state" || { rm -rf -- "$tx_dir"; die '无法保存服务运行/启用状态快照。'; }
     : > "$changed_pre"; : > "$changed_expected"
 
     while IFS= read -r srv; do
         [[ -n "$srv" ]] || continue
         abox_owns_service "$srv" || { failed=1; break; }
-        state=$(service_active_state_value "$srv" 2>/dev/null) || { failed=1; break; }
-        case "$state" in
-            0)
-                append_managed_service_state_entry "$pre_state" "$changed_pre" "$srv" || { failed=1; break; }
-                if start_abox_service_soft "$srv"; then
-                    printf '%s|1|1\n' "$srv" >> "$changed_expected" || { failed=1; break; }
-                else
-                    # start_abox_service_soft enables before restart. Capture only
-                    # known reachable intermediate states so rollback can restore
-                    # them without guessing about external changes.
-                    local post_state
-                    post_state=$(managed_service_state_value "$srv" 2>/dev/null || true)
-                    if [[ "$post_state" == "$srv|0|1" || "$post_state" == "$srv|1|1" ]]; then
-                        printf '%s\n' "$post_state" >> "$changed_expected" 2>/dev/null || true
-                    fi
-                    failed=1
-                    break
-                fi
-                ;;
-            1) ;;
-            *) failed=1; break ;;
-        esac
+        before=$(managed_service_state_value "$srv" 2>/dev/null) || { failed=1; break; }
+        IFS='|' read -r _ active enabled <<< "$before"
+        [[ "$active" == 1 && "$enabled" == 1 ]] && continue
+        if [[ "$active" == 1 ]]; then
+            enable_abox_service_soft "$srv" || failed=1
+        else
+            start_abox_service_soft "$srv" || failed=1
+        fi
+        after=$(managed_service_state_value "$srv" 2>/dev/null || true)
+        if [[ -z "$after" ]]; then
+            append_managed_service_state_entry "$pre_state" "$changed_pre" "$srv" || failed=1
+            printf '%s\n' "$srv|1|1" >> "$changed_expected" || failed=1
+        elif [[ "$after" != "$before" ]]; then
+            append_managed_service_state_entry "$pre_state" "$changed_pre" "$srv" || failed=1
+            printf '%s\n' "$after" >> "$changed_expected" || failed=1
+        fi
+        [[ "$after" == "$srv|1|1" ]] || failed=1
+        (( failed == 0 )) || break
     done <<< "$services"
 
-    if (( failed == 0 )); then
-        while IFS= read -r srv; do
-            [[ -n "$srv" ]] || continue
-            local final_state
-            final_state=$(managed_service_state_value "$srv" 2>/dev/null) || { failed=1; break; }
-            [[ "$final_state" == "$srv|1|1" ]] || { failed=1; break; }
-        done <<< "$services"
-    fi
-
     service_tx_rollback() {
-        local rc=0
-        if [[ -s "$changed_pre" ]]; then
-            restore_managed_service_state "$changed_pre" "$changed_expected" || rc=$?
-        fi
-        return "$rc"
+        [[ ! -s "$changed_pre" ]] && return 0
+        [[ -s "$changed_expected" ]] || return 1
+        restore_managed_service_state "$changed_pre" "$changed_expected"
     }
-    service_tx_fail() {
-        if ! service_tx_rollback; then
-            printf '%s\n' "A-Box service rollback incomplete or conflicted; recovery state preserved at $tx_dir" >&2
-            return 1
-        fi
-        rm -rf -- "$tx_dir" || return 1
-        return 1
-    }
-
     if (( failed == 0 )); then
-        if ! clear_traffic_block_period || ! set_desired_state RUNNING; then
-            failed=1
-        fi
+        clear_traffic_block_period || failed=1
+        (( failed != 0 )) || set_desired_state RUNNING || failed=1
     fi
     if (( failed != 0 )); then
-        if (( block_state_present == 1 )); then
-            set_traffic_block_period "$previous_block_period" >/dev/null 2>&1 || true
-        else
-            clear_traffic_block_period >/dev/null 2>&1 || true
-        fi
+        if (( block_state_present == 1 )); then set_traffic_block_period "$previous_block_period" >/dev/null 2>&1 || true; else clear_traffic_block_period >/dev/null 2>&1 || true; fi
         set_desired_state "$previous_state" >/dev/null 2>&1 || true
-        service_tx_fail || true
-        die '至少一个托管服务启动或状态提交失败；已尝试回滚本次启动并恢复原状态。'
+        if ! service_tx_rollback; then printf '%s\n' "A-Box service rollback incomplete; recovery state preserved at $tx_dir" >&2; else rm -rf -- "$tx_dir"; fi
+        die '至少一个托管服务启动/启用或状态提交失败；已尝试回滚本次操作。'
     fi
     rm -rf -- "$tx_dir" || die '服务状态事务清理失败；服务已按预期启动，但未能清理事务材料。'
     printf 'A-Box managed stack started; Intent=RUNNING\n'
 }
+
 
 show_cli_help() {
     cat <<'EOF_HELP'
@@ -15392,6 +15927,7 @@ run_self_tests() {
     [[ "$(build_ss2022_uri 203.0.113.10 2053 'abc+/=')" == 'ss://2022-blake3-aes-128-gcm:abc%2B%2F%3D@203.0.113.10:2053#A-Box-SS' ]] || { echo 'FAIL: SS-2022 SIP002/SIP022 URI percent encoding'; failures=$((failures + 1)); }
 
     ABOX_SNI_FULL_MAX=0 write_sni_candidate_library full "$tmp/sni-full.txt"
+    grep -Fq 'ABOX_SNI_HARD_MAX=16384' "$0" || { echo 'FAIL: SNI hard ceiling missing'; failures=$((failures + 1)); }
     sni_count=$(wc -l < "$tmp/sni-full.txt" | tr -d ' ')
     [[ "$sni_count" =~ ^[0-9]+$ && "$sni_count" -ge 2500 ]] || { echo "FAIL: SNI library size < 2500 ($sni_count)"; failures=$((failures + 1)); }
     grep -qx 'www.confluent.io' "$tmp/sni-full.txt" || { echo 'FAIL: SNI library missing www.confluent.io'; failures=$((failures + 1)); }
@@ -15405,10 +15941,27 @@ run_self_tests() {
     [[ "$mini_count" =~ ^[0-9]+$ && "$mini_count" -eq "$sni_count" ]] || { echo "FAIL: SNI mini library does not match full library ($mini_count vs $sni_count)"; failures=$((failures + 1)); }
     declare -f asn_lookup_ip >/dev/null || { echo 'FAIL: ASN lookup function missing'; failures=$((failures + 1)); }
     declare -f sni_org_cdn_penalty >/dev/null || { echo 'FAIL: ASN/CDN scoring function missing'; failures=$((failures + 1)); }
+    declare -F sni_cert_san_matches >/dev/null || { echo 'FAIL: literal SAN matcher missing'; failures=$((failures + 1)); }
+    assert_ok sni_cert_san_matches foo.example.com 'X509v3 Subject Alternative Name: DNS:foo.example.com'
+    assert_ok sni_cert_san_matches foo.example.com 'DNS:*.example.com'
+    assert_bad sni_cert_san_matches foo.example.com 'DNS:fooXexampleYcom'
+    assert_bad sni_cert_san_matches foo.bar.example.com 'DNS:*.example.com'
+    assert_ok sni_cert_san_matches foo.bar.example.com 'DNS:*.bar.example.com'
+    assert_bad sni_cert_san_matches example.com 'DNS:*.example.com'
+    if (( EUID == 0 )); then
+        _asn_test_cache="$tmp/asn-cache"
+        mkdir -m 700 -- "$_asn_test_cache" || { echo 'FAIL: ASN cache fixture creation'; failures=$((failures + 1)); }
+        printf '%s\n' $'asn=AS13335\tcountry=US\torg=Cloudflare, Inc.' > "$_asn_test_cache/1.1.1.1" || { echo 'FAIL: ASN cache fixture write'; failures=$((failures + 1)); }
+        chown root:root "$_asn_test_cache" "$_asn_test_cache/1.1.1.1" 2>/dev/null || true
+        chmod 700 "$_asn_test_cache" || { echo 'FAIL: ASN cache fixture permissions'; failures=$((failures + 1)); }
+        [[ "$(asn_lookup_ip 1.1.1.1 "$_asn_test_cache" 2>/dev/null)" == $'asn=AS13335	country=US	org=Cloudflare, Inc.' ]] || { echo 'FAIL: ASN cache lookup rejects a valid root-owned 0700 directory'; failures=$((failures + 1)); }
+    fi
     [[ "$(tr_msg confirm_local_sni_full)" != *'远程执行第三方脚本'* ]] || { echo 'FAIL: local SNI prompt still says remote third-party'; failures=$((failures + 1)); }
+    grep -Fq 'en:reality_non443_warn)' "$0" || { echo 'FAIL: English non-443 SNI warning translation missing'; failures=$((failures + 1)); }
+    grep -Fq 'en:apple_sni_warn)' "$0" || { echo 'FAIL: English Apple/iCloud SNI warning translation missing'; failures=$((failures + 1)); }
     declare -F sni_domain_public_dns >/dev/null 2>&1 || { echo 'FAIL: SNI public-DNS guard missing'; failures=$((failures + 1)); }
-    grep -Fq 'need_cmd_pkg groupadd passwd shadow shadow-utils' "$0" || { echo 'FAIL: Alpine group management dependency gate missing'; failures=$((failures + 1)); }
-    grep -Fq 'need_cmd_pkg useradd passwd shadow shadow-utils' "$0" || { echo 'FAIL: Alpine user management dependency gate missing'; failures=$((failures + 1)); }
+    grep -Fq 'need_cmd_pkg groupadd passwd shadow-utils shadow' "$0" || { echo 'FAIL: group management dependency mapping missing'; failures=$((failures + 1)); }
+    grep -Fq 'need_cmd_pkg useradd passwd shadow-utils shadow' "$0" || { echo 'FAIL: user management dependency mapping missing'; failures=$((failures + 1)); }
     grep -Fq 'addgroup -S "$group"' "$0" || { echo 'FAIL: Alpine BusyBox addgroup fallback missing'; failures=$((failures + 1)); }
     grep -Fq 'adduser -S -D -H -s /sbin/nologin -G "$group" "$user"' "$0" || { echo 'FAIL: Alpine BusyBox adduser fallback missing'; failures=$((failures + 1)); }
     getent() { printf '%s\n' '1.1.1.1 STREAM example.com'; }
@@ -15417,6 +15970,11 @@ run_self_tests() {
     assert_bad sni_domain_public_dns example.com
     unset -f getent
     assert_ok valid_public_ip 1.1.1.1
+    assert_bad valid_public_ip 224.0.0.1
+    assert_bad valid_public_ip 239.255.255.255
+    assert_bad valid_public_ip 192.88.99.1
+    assert_bad valid_public_ip 64:ff9b::8.8.8.8
+    assert_bad valid_public_ip ::ffff:8.8.8.8
     assert_ok valid_public_ip 2606:4700:4700::1111
     assert_bad valid_public_ip 10.0.0.1
     assert_bad valid_public_ip 192.168.1.1
@@ -15506,7 +16064,8 @@ run_self_tests() {
     grep -Fq 'command_user="abox-singbox:abox-singbox"' "$0" || { echo 'FAIL: Sing-box OpenRC service must drop root UID'; failures=$((failures + 1)); }
     grep -Fq 'User=abox-hysteria' "$0" || { echo 'FAIL: Hysteria systemd unit must drop root UID'; failures=$((failures + 1)); }
     grep -Fq 'command_user="abox-hysteria:abox-hysteria"' "$0" || { echo 'FAIL: Hysteria OpenRC service must drop root UID'; failures=$((failures + 1)); }
-    grep -q 'SagerNet/sing-box:singbox_core.tar.gz) release_ref="${ABOX_SINGBOX_VERSION:-v1.14.2}"' "$0" || { echo 'FAIL: sing-box default stable pin is not v1.14.2'; failures=$((failures + 1)); }
+    grep -q 'SagerNet/sing-box:singbox_core.tar.gz) release_ref="${ABOX_SINGBOX_VERSION:-$ABOX_SINGBOX_DEFAULT_VERSION}"' "$0" || { echo 'FAIL: sing-box default stable pin resolver changed'; failures=$((failures + 1)); }
+    grep -Fq "ABOX_SINGBOX_DEFAULT_VERSION='v1.14.2'" "$0" || { echo 'FAIL: sing-box stable pin missing'; failures=$((failures + 1)); }
     grep -q 'XTLS/Xray-core:xray_core.zip) release_ref="${ABOX_XRAY_VERSION:-$ABOX_XRAY_DEFAULT_VERSION}"' "$0" || { echo 'FAIL: Xray default pin resolver changed'; failures=$((failures + 1)); }
     [[ "$(effective_xray_version)" == "$ABOX_XRAY_DEFAULT_VERSION" ]] || { echo 'FAIL: effective Xray default version'; failures=$((failures + 1)); }
     ( ABOX_XRAY_VERSION=v26.9.8 xray_reality_requires_mlkem ) || { echo 'FAIL: Xray 26.9.8 must require REALITY ML-KEM'; failures=$((failures + 1)); }
@@ -15515,11 +16074,14 @@ run_self_tests() {
     ( ABOX_XRAY_VERSION=v26.9 xray_reality_requires_mlkem ) >/dev/null 2>&1 && { echo 'FAIL: malformed Xray version accepted'; failures=$((failures + 1)); }
     grep -Fq 'support-x25519mlkem768: $clash_mlkem' "$0" || { echo 'FAIL: Clash REALITY ML-KEM flag must be version-aware'; failures=$((failures + 1)); }
     grep -Fq 'ABOX_HYSTERIA_APP_VERSION:-app/v2.13.0' "$0" || { echo 'FAIL: Hysteria v2.13.0 compatibility pin missing'; failures=$((failures + 1)); }
-    grep -Fq "ABOX_XRAY_DEFAULT_VERSION='v26.6.27'" "$0" || { echo 'FAIL: Xray iOS/XHTTP compatibility pin missing'; failures=$((failures + 1)); }
-    [[ "$(xray_version_compare v26.6.27 v26.3.27)" == '1' ]] || { echo 'FAIL: Xray version comparison'; failures=$((failures + 1)); }
-    [[ "$(xray_version_compare v26.6.27 v26.6.27)" == '0' ]] || { echo 'FAIL: Xray compatibility pin comparison'; failures=$((failures + 1)); }
+    grep -Fq "ABOX_XRAY_DEFAULT_VERSION='v26.7.28'" "$0" || { echo 'FAIL: Xray iOS/XHTTP compatibility pin missing'; failures=$((failures + 1)); }
+    grep -Fq 'ABOX_SNI_DEFAULT_MAX=8192' "$0" || { echo 'FAIL: SNI default max missing'; failures=$((failures + 1)); }
+    [[ "$(xray_version_compare v26.7.28 v26.3.27)" == '1' ]] || { echo 'FAIL: Xray version comparison'; failures=$((failures + 1)); }
+    [[ "$(xray_version_compare v26.7.28 v26.7.28)" == '0' ]] || { echo 'FAIL: Xray compatibility pin comparison'; failures=$((failures + 1)); }
     [[ "$(xray_version_compare v26.3.27 v26.3.27)" == '0' ]] || { echo 'FAIL: Xray equal version comparison'; failures=$((failures + 1)); }
-    [[ "$(xray_version_compare v26.3.27 v26.6.27)" == '-1' ]] || { echo 'FAIL: Xray reverse version comparison'; failures=$((failures + 1)); }
+    [[ "$(xray_version_compare v26.3.27 v26.7.28)" == '-1' ]] || { echo 'FAIL: Xray reverse version comparison'; failures=$((failures + 1)); }
+    [[ "$(xray_version_compare v9223372036854775808.0.0 v26.9.8)" == '1' ]] || { echo 'FAIL: Xray huge-version comparison overflow regression'; failures=$((failures + 1)); }
+    [[ "$(xray_version_compare v18446744073709551616.0.0 v26.9.8)" == '1' ]] || { echo 'FAIL: Xray extra-large version comparison regression'; failures=$((failures + 1)); }
     grep -Fq "ABOX_XRAY_REALITY_MLKEM_MIN_VERSION='v26.9.8'" "$0" || { echo 'FAIL: Xray REALITY ML-KEM threshold constant missing'; failures=$((failures + 1)); }
     runtime_guard_impl_count=$(grep -Fc '( umask 077; set -C; : > "$RUNTIME_LOCK" )' "$0" || true)
     [[ "$runtime_guard_impl_count" =~ ^[0-9]+$ && "$runtime_guard_impl_count" -ge 3 ]] || { echo 'FAIL: all background helpers must recreate the runtime lock after /run recreation'; failures=$((failures + 1)); }
@@ -15527,6 +16089,7 @@ run_self_tests() {
     [[ "$runtime_guard_count" =~ ^[0-9]+$ && "$runtime_guard_count" -ge 3 ]] || { echo 'FAIL: all background helpers must honor the global A-Box runtime lock'; failures=$((failures + 1)); }
     grep -Fq 'systemctl disable "$srv"' "$0" || { echo 'FAIL: traffic quota stop path must disable systemd autostart'; failures=$((failures + 1)); }
     grep -Fq 'rc-update del "$srv" default' "$0" || { echo 'FAIL: traffic quota stop path must remove OpenRC autostart'; failures=$((failures + 1)); }
+    grep -Fq 'start-stop-daemon --stop --pidfile "$pidfile" --exec "$exe" --retry TERM/5/KILL/1' "$0" || { echo 'FAIL: OpenRC stop fallback must bind PID to expected executable'; failures=$((failures + 1)); }
     ( verify_github_asset_digest /dev/null '' ) >/dev/null 2>&1 && { echo 'FAIL: missing GitHub digest must be rejected'; failures=$((failures + 1)); }
     grep -q '\[\[ "\${digest#sha256:}" =~ \^\[A-Fa-f0-9\]{64}\$ \]\]' "$0" || { echo 'FAIL: fetch helper must prevalidate GitHub digest before mirror retry'; failures=$((failures + 1)); }
     ( ABOX_ASSUME_YES_OTA=1 confirm_ota_script_hash 0000000000000000000000000000000000000000000000000000000000000000 https://example.com/script.sh ) >/dev/null 2>&1 && { echo 'FAIL: ABOX_ASSUME_YES_OTA must be rejected without allowlist'; failures=$((failures + 1)); }
@@ -15695,6 +16258,10 @@ run_self_tests() {
     validate_abox_env_semantics >/dev/null 2>&1 && { echo 'FAIL: invalid HY2 bandwidth state accepted'; failures=$((failures + 1)); }
     unset CORE MODE HY2_BASE_PORT HY2_UP HY2_DOWN HY2_HOP HY2_HOP_IMPL
     assert_ok valid_github_download_url XTLS/Xray-core https://github.com/XTLS/Xray-core/releases/download/v26.9.30/Xray-linux-64.zip v26.9.30
+    assert_ok valid_github_download_url HyNetworks/hysteria https://github.com/HyNetworks/hysteria/releases/download/app/v2.13.0/hysteria-linux-amd64 app/v2.13.0 hysteria-linux-amd64
+    assert_bad valid_github_download_url HyNetworks/hysteria https://github.com/HyNetworks/hysteria/releases/download/app/v2.13.0/../../evil app/v2.13.0 hysteria-linux-amd64
+    assert_bad valid_github_download_url HyNetworks/hysteria 'https://github.com/HyNetworks/hysteria/releases/download/app/v2.13.0/hysteria-linux-amd64?x=1' app/v2.13.0 hysteria-linux-amd64
+    assert_bad valid_github_download_url HyNetworks/hysteria 'https://github.com/HyNetworks/hysteria/releases/download/app/v2.13.0/hysteria-linux-arm64' app/v2.13.0 hysteria-linux-amd64
     assert_bad valid_github_download_url XTLS/Xray-core https://github.com/XTLS/Xray-core/releases/download/v26.9.29/Xray-linux-64.zip v26.9.30
     assert_bad valid_github_download_url XTLS/Xray-core https://github.com/SagerNet/sing-box/releases/download/v1.14.1/Xray-linux-64.zip v26.9.30
 
@@ -15974,7 +16541,7 @@ EOF_SELFTEST_IPT
     mkdir -p "$tmp/xray" "$tmp/sing-box"
     printf '%s\n' 'sentinel' > "$tmp/xray/sentinel.txt"
     ln -s "$tmp/xray/sentinel.txt" "$tmp/xray/config.json.tmp.$$"
-    XRAY_CONFIG_PATH="$tmp/xray/config.json" build_xray_config ALL
+    build_xray_config ALL "$tmp/xray/config.json"
     [[ "$(cat "$tmp/xray/sentinel.txt" 2>/dev/null)" == 'sentinel' ]] || { echo 'FAIL: Xray config generation followed a predictable temp-file symlink'; failures=$((failures + 1)); }
     [[ -L "$tmp/xray/config.json.tmp.$$" ]] || { echo 'FAIL: Xray config generation touched the predictable temp symlink'; failures=$((failures + 1)); }
     rm -f "$tmp/xray/config.json.tmp.$$"
@@ -15982,7 +16549,7 @@ EOF_SELFTEST_IPT
     [[ "$(stat -c %a "$tmp/xray/config.json" 2>/dev/null)" == '600' ]] || { echo 'FAIL: Xray config permissions must be 0600'; failures=$((failures + 1)); }
     local saved_vision_sni="$VISION_SNI" saved_vless_sni="$VLESS_SNI"
     unset VISION_SNI VLESS_SNI
-    XRAY_CONFIG_PATH="$tmp/xray/default-sni.json" build_xray_config VISION
+    build_xray_config VISION "$tmp/xray/default-sni.json"
     jq -e '.inbounds[] | select(.protocol=="vless" and .streamSettings.realitySettings.serverNames[0]=="www.microsoft.com")' "$tmp/xray/default-sni.json" >/dev/null 2>&1 || { echo 'FAIL: default REALITY SNI must be www.microsoft.com'; failures=$((failures + 1)); }
     VISION_SNI="$saved_vision_sni" VLESS_SNI="$saved_vless_sni"
     jq -e '.inbounds[] | select(.protocol=="shadowsocks" and .port==2053 and .settings.network=="tcp,udp")' "$tmp/xray/config.json" >/dev/null 2>&1 || { echo 'FAIL: Xray SS-2022 2053 tcp,udp'; failures=$((failures + 1)); }
@@ -15993,7 +16560,7 @@ EOF_SELFTEST_IPT
     assert_bad valid_github_download_url HyNetworks/hysteria https://example.com/HyNetworks/hysteria/releases/download/app/v2.12.2/hysteria-linux-amd64
     printf '%s\n' 'sentinel' > "$tmp/sing-box/sentinel.txt"
     ln -s "$tmp/sing-box/sentinel.txt" "$tmp/sing-box/config.json.tmp.$$"
-    SINGBOX_CONFIG_PATH="$tmp/sing-box/config.json" build_singbox_config ALL
+    build_singbox_config ALL "$tmp/sing-box/config.json"
     [[ "$(cat "$tmp/sing-box/sentinel.txt" 2>/dev/null)" == 'sentinel' ]] || { echo 'FAIL: Sing-box config generation followed a predictable temp-file symlink'; failures=$((failures + 1)); }
     [[ -L "$tmp/sing-box/config.json.tmp.$$" ]] || { echo 'FAIL: Sing-box config generation touched the predictable temp symlink'; failures=$((failures + 1)); }
     rm -f "$tmp/sing-box/config.json.tmp.$$"
@@ -16139,6 +16706,9 @@ PY_SELFTEST_YAML
     grep -Fq 'rm -rf -- "$report_dir" || return 1' "$0" || { echo 'FAIL: preflight report directory cleanup missing'; failures=$((failures + 1)); }
     grep -Fq 'local redacted_json redacted_headers' "$0" || { echo 'FAIL: redaction self-test variables are not separated'; failures=$((failures + 1)); }
     grep -Fq 'target_ref="$(effective_xray_version)"' "$0" || { echo 'FAIL: Xray core-only upgrade must use centralized compatibility version'; failures=$((failures + 1)); }
+    grep -q '^core_post_upgrade_health_gate() {' "$0" || { echo 'FAIL: core post-upgrade health gate missing'; failures=$((failures + 1)); }
+    grep -Fq 'core_post_upgrade_health_gate xray' "$0" || { echo 'FAIL: Xray post-upgrade health gate not enforced'; failures=$((failures + 1)); }
+    grep -Fq 'core_post_upgrade_health_gate singbox' "$0" || { echo 'FAIL: sing-box post-upgrade health gate not enforced'; failures=$((failures + 1)); }
     _traffic_menu=$(sed -n '/^traffic_management_menu() {$/,/^manage_ss_whitelist()/p' "$0") || _traffic_menu=''
     _setup_line=$(grep -n -m1 'setup_traffic_monitor' <<< "$_traffic_menu" | cut -d: -f1 || true)
     _update_line=$(grep -n -m1 'update_traffic_state_atomically "$limit_gb" "$mode_choice"' <<< "$_traffic_menu" | cut -d: -f1 || true)
@@ -16318,6 +16888,18 @@ EOF_SVC_TEST_RCUPDATE
         echo 'FAIL: persisted .env accepted non-canonical port with leading zero'
         failures=$((failures + 1))
     fi
+    declare -F load_optional_abox_env_or_die >/dev/null 2>&1 || { echo 'FAIL: safe optional env loader missing'; failures=$((failures + 1)); }
+    if ! ( unset ABOX_DIE_HOOK; ABOX_ENV="$tmp/.env-not-present"; load_optional_abox_env_or_die ); then
+        echo 'FAIL: optional env loader rejected a genuinely absent first-install state'
+        failures=$((failures + 1))
+    fi
+    _invalid_env="$tmp/.env-invalid-existing"
+    printf '%s\n' 'UNKNOWN_KEY=unexpected' > "$_invalid_env" || { echo 'FAIL: invalid env fixture creation'; failures=$((failures + 1)); }
+    chmod 600 "$_invalid_env" || { echo 'FAIL: invalid env fixture chmod'; failures=$((failures + 1)); }
+    if ( unset ABOX_DIE_HOOK; ABOX_ENV="$_invalid_env"; load_optional_abox_env_or_die ) >/dev/null 2>&1; then
+        echo 'FAIL: optional env loader accepted an existing invalid state file'
+        failures=$((failures + 1))
+    fi
     if (( failures > 0 )); then
         echo "SELF_TEST_FAILED=$failures"
         selftest_cleanup
@@ -16429,7 +17011,9 @@ main_loop() {
         abox_owns_service "$_srv" && is_service_running "$_srv" || continue
         _pid=$(managed_service_pid "$_srv" 2>/dev/null || true); _pid=${_pid%%$'\n'*}
         case "$_srv" in xray) _exe=/usr/local/bin/xray ;; sing-box) _exe=/usr/local/bin/sing-box ;; hysteria) _exe=/usr/local/bin/hysteria ;; esac
-        pid_exe_matches "$_pid" "$_exe" && record_core_family_ownership "$_srv" || true
+        if pid_exe_matches "$_pid" "$_exe"; then
+            record_core_family_ownership "$_srv" || msg "${YELLOW}[!] Ownership migration for active ${_srv} could not be verified; destructive maintenance will remain blocked until registration succeeds.${NC}" >&2
+        fi
     done
     GLOBAL_PUBLIC_IP=$(get_public_ip || true)
     while true; do
