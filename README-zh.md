@@ -8,7 +8,7 @@ Linux 网络网关一键工具箱。
   <img width="804" height="867" alt="A-Box_github" src="https://github.com/user-attachments/assets/4f51a6a1-5d1b-49db-90df-98ffae63d1ca" />
 </p>
 
-A-Box 是一个独立 Bash 脚本，用于部署和维护 Linux 网络网关服务。本文档对应的脚本构建版本为 `2026-10-09-sni-modular-release-v165`，当前脚本配置的默认核心版本为 Xray `v26.7.28`、sing-box `v1.14.2`。
+A-Box 是一个独立 Bash 脚本，用于部署和维护 Linux 网络网关服务。本文档对应的脚本构建版本为 `2026-10-09-audit-remediation-v166`，当前脚本配置的默认核心版本为 Xray `v26.7.28`、sing-box `v1.14.2`。
 
 支持 Xray-core、sing-box、官方 Hysteria 2 服务端、VLESS Vision REALITY、VLESS XHTTP REALITY、Shadowsocks-2022、客户端配置导出、本地 SNI 候选测试、备份恢复、防火墙管理、诊断、流量限制、健康检查和核心软件升级。
 
@@ -46,7 +46,7 @@ curl -fsSL https://ghproxy.net/https://raw.githubusercontent.com/alariclin/a-box
 - **维护：** 显示 SHA-256 并要求明确确认的脚本 OTA、Xray Geo 数据更新，以及不重置节点参数的核心程序单独升级。
 - **安全控制：** 部署前检查、受控服务归属/状态变更、防火墙处理，以及受支持操作的回滚路径。
 
-SNI 列表仅是候选项。域名出现在列表中，**不代表它从特定 VPS 当前可用，也不保证符合目标 REALITY 部署所需的 TLS/ALPN/SAN 条件**。使用前必须在目标网络实际验证。无法取得有效列表或有效备用副本时，SNI 工作流会拒绝继续，而不是使用未经验证的数据。
+SNI 列表仅是候选项。域名出现在列表中，**不代表它从特定 VPS 当前可用，也不保证符合目标 REALITY 部署所需的 TLS/ALPN/SAN 条件**。使用前必须在目标网络实际验证。mini 模式默认最多抽样 256 个候选，并对最多 60 个结果进行深度验证；full 模式使用更大的候选集。每次运行默认最多向外部 `ipinfo.io` 发起 40 次 ASN 查询（设置 `ABOX_SNI_ASN_LOOKUP_LIMIT=0` 可禁用），每次查询有较短超时，收到 HTTP 429 后停止后续请求。这些限制用于控制耗时，并不保证候选域名的质量。无法取得有效列表或有效备用副本时，SNI 工作流会拒绝继续，而不是使用未经验证的数据。
 
 ## 主菜单
 
@@ -94,7 +94,7 @@ SNI 列表仅是候选项。域名出现在列表中，**不代表它从特定 V
 | `sudo bash A-Box.sh --export-backup-key /secure/path/A-Box-recovery.key` | 将恢复密钥导出到受保护路径 |
 | `sudo bash A-Box.sh --convert-legacy-backup OLD.tar.gz [OUTPUT_DIR]` | 将旧版备份转换为 manifest v3 格式 |
 
-请妥善保护导出的恢复密钥和备份。`--self-test` 通过不能替代目标主机预检查、真实安装或客户端互通测试。
+请妥善保护导出的恢复密钥和备份。完全卸载时会为本次备份导出同名 `.key` 伴随密钥文件；请将归档和密钥分开保存，最好保存到异机。若密钥导出失败，完全卸载会中止，避免留下已知无法恢复的备份。`--self-test` 通过不能替代目标主机预检查、真实安装或客户端互通测试。
 
 ## 系统要求
 
