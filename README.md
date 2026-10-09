@@ -8,7 +8,7 @@ One-click Linux network gateway toolkit.
   <img width="804" height="867" alt="A-Box_github" src="https://github.com/user-attachments/assets/4f51a6a1-5d1b-49db-90df-98ffae63d1ca" />
 </p>
 
-A-Box is a standalone Bash script for deploying and maintaining Linux network gateway services. The script build documented here is `2026-10-09-sni-modular-release-v165`; its configured default core versions are Xray `v26.7.28` and sing-box `v1.14.2`.
+A-Box is a standalone Bash script for deploying and maintaining Linux network gateway services. The script build documented here is `2026-10-10-release-candidate-v170`; its configured default core versions are Xray `v26.7.28` and sing-box `v1.14.2`.
 
 It supports Xray-core, sing-box, the official Hysteria 2 server, VLESS Vision REALITY, VLESS XHTTP REALITY, Shadowsocks-2022, client configuration export, local SNI candidate testing, backup and restore, firewall management, diagnostics, traffic limits, health checks, and core software upgrades.
 
@@ -46,7 +46,7 @@ Use the official GitHub source by default. The mirror is a third-party service, 
 - **Maintenance:** controlled script OTA with displayed SHA-256 and explicit confirmation, Xray Geo data updates, and core-only upgrades that preserve node parameters.
 - **Safety controls:** deployment preflight checks, guarded service ownership/state changes, firewall handling, and rollback paths for supported operations.
 
-SNI entries are only candidates. A listed hostname is **not** a guarantee that it currently works from a particular VPS, supports the required TLS/ALPN/SAN characteristics, or is suitable for a specific REALITY deployment. Verify candidates on the target network before use. The SNI workflow fails closed when it cannot obtain a valid candidate list or fallback copy.
+The repository ships a curated seed list at [`data/sni-candidates.txt`](data/sni-candidates.txt). SNI entries are only candidates. A listed hostname is **not** a guarantee that it currently works from a particular VPS, supports the required TLS/ALPN/SAN characteristics, or is suitable for a specific REALITY deployment. Verify candidates on the target network before use. The SNI workflow fails closed when it cannot obtain a valid candidate list or fallback copy.
 
 ## Main Menu
 
@@ -80,19 +80,21 @@ The toolbox includes system and download benchmarks; IP quality, streaming avail
 
 ## Command-line Usage
 
-Run commands from the directory containing the downloaded script:
+The repository file is named `install.sh`. The curl examples below save it as `A-Box.sh`; either filename works if it is this script.
+
+Run commands from the directory containing the script:
 
 | Command | Purpose |
 |---|---|
-| `sudo bash A-Box.sh --help` | Show command-line help |
-| `sudo bash A-Box.sh --lang zh` / `--lang en` | Set the UI language and start the menu |
-| `sudo bash A-Box.sh --self-test` | Run built-in regression/self-tests |
-| `sudo bash A-Box.sh --preflight` or `--dry-run` | Run the preflight check without deploying a new node |
-| `sudo bash A-Box.sh --status` | Show managed configuration and service status |
-| `sudo bash A-Box.sh --start` / `--stop` | Start or stop managed services |
-| `sudo bash A-Box.sh --version` | Show script build metadata |
-| `sudo bash A-Box.sh --export-backup-key /secure/path/A-Box-recovery.key` | Export the recovery key to a protected path |
-| `sudo bash A-Box.sh --convert-legacy-backup OLD.tar.gz [OUTPUT_DIR]` | Convert a legacy backup to manifest v3 format |
+| `sudo bash install.sh --help` | Show command-line help |
+| `sudo bash install.sh --lang zh` / `--lang en` | Set the UI language and start the menu |
+| `sudo bash install.sh --self-test` | Run built-in regression/self-tests |
+| `sudo bash install.sh --preflight` or `--dry-run` | Run the preflight check without deploying a new node |
+| `sudo bash install.sh --status` | Show managed configuration and service status |
+| `sudo bash install.sh --start` / `--stop` | Start or stop managed services |
+| `sudo bash install.sh --version` | Show script build metadata |
+| `sudo bash install.sh --export-backup-key /secure/path/A-Box-recovery.key` | Export the recovery key to a protected path |
+| `sudo bash install.sh --convert-legacy-backup OLD.tar.gz [OUTPUT_DIR]` | Convert a legacy backup to manifest v3 format |
 
 Protect exported recovery keys and backups. A `--self-test` pass does not replace a target-host preflight, live installation, or client interoperability test.
 
