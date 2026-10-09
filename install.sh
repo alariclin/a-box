@@ -33,7 +33,7 @@ PUBLIC_IP_CACHE_TTL=600
 BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-10}
 LOCK_FALLBACK_DIR='/run/A-Box.lock.d'
 ABOX_LANG='zh'
-ABOX_BUILD='2026-10-09-audit-fix-v163'
+ABOX_BUILD='2026-10-09-sni-traffic-fix-v163'
 ABOX_BUILD_EPOCH=20261009163
 # Cross-client compatibility pin for Shadowrocket + Mihomo/Clash Verge + sing-box
 # with VLESS/REALITY and XHTTP as of 2026-10-08.
@@ -7117,7 +7117,9 @@ traffic_management_menu() {
     msg "${CYAN}======================================================================${NC}"
     msg "${YELLOW}[网卡 ${INTERFACE} 当前月流量统计]${NC}"
     if command -v vnstat >/dev/null 2>&1; then
-        vnstat -i "$INTERFACE" -m 2>/dev/null | awk 'NF && NR <= 8 { print; shown=1 } END { exit !shown }' || msg "${YELLOW}暂无本月统计数据，vnstat 正在收集中。${NC}"
+        # Do not cap the raw output at 8 lines: vnStat headers consume several
+        # lines, which previously hid every month after roughly the third row.
+        vnstat -i "$INTERFACE" -m 2>/dev/null | awk 'NF { print; shown=1 } END { exit !shown }' || msg "${YELLOW}暂无本月统计数据，vnstat 正在收集中。${NC}"
     fi
     if [[ -n "${TRAFFIC_LIMIT_GB:-}" ]]; then
         msg "当前设定: ${GREEN}${TRAFFIC_LIMIT_GB} GB${NC} | 模式: ${TRAFFIC_LIMIT_MODE:-total}"
@@ -12107,7 +12109,7 @@ asn_lookup_ip() {
     uid=$(stat -c %u "$cache_dir" 2>/dev/null) || return 1
     gid=$(stat -c %g "$cache_dir" 2>/dev/null) || return 1
     mode=$(stat -c %a "$cache_dir" 2>/dev/null) || return 1
-    [[ "$uid" == 0 && "$gid" == 0 && "$mode" =~ ^0?700$ ]] || return 1
+    [[ "$uid" == 0 && "$gid" == 0 && "$mode" =~ ^0700$ ]] || return 1
     cache_file="$cache_dir/$(printf '%s' "$ip" | tr -c 'A-Za-z0-9_.:-' '_')"
     if [[ -s "$cache_file" ]]; then
         cat "$cache_file"
@@ -12150,6 +12152,21 @@ sni_domain_public_dns() {
     (( any == 1 ))
 }
 
+sni_raw_score() {
+    local app="$1" start="$2" total="$3" penalty="$4"
+    # Preserve signed scores. Clamping negative values to 0 made many preferred
+    # domains tie at zero and then appear alphabetically instead of by score.
+    awk -v app="$app" -v start="$start" -v total="$total" -v p="$penalty" \
+        'BEGIN { printf "%d\n", int(app*1000 + start*220 + total*60 + p) }'
+}
+
+sni_adjust_score() {
+    local score="$1" adjustment="$2"
+    # Lower is better; keep ASN/country/CDN adjustments signed and sortable.
+    awk -v s="$score" -v a="$adjustment" \
+        'BEGIN { printf "%d\n", int(s) + int(a) }'
+}
+
 sni_probe_domain() {
     local domain="$1" raw="$2" timeout_s="${3:-6}" metrics code t_connect t_app t_start t_total http_version remote_ip penalty score tls_args=()
     [[ "$domain" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]] || return 0
@@ -12170,34 +12187,12 @@ sni_probe_domain() {
     penalty=$(sni_domain_penalty "$domain")
     [[ "$http_version" == '2' || "$http_version" == '3' ]] || penalty=$((penalty + 350))
     [[ "$code" =~ ^(2|3|4)[0-9][0-9]$ ]] || penalty=$((penalty + 120))
-    score=$(awk -v app="$t_app" -v start="$t_start" -v total="$t_total" -v p="$penalty" 'BEGIN{v=int(app*1000 + start*220 + total*60 + p); if(v<0)v=0; printf "%08d", v}')
+    score=$(sni_raw_score "$t_app" "$t_start" "$t_total" "$penalty")
     printf '%s\t%s\tapp=%ss\tttfb=%ss\ttotal=%ss\thttp=%s\tcode=%s\tip=%s\n' "$score" "$domain" "$t_app" "$t_start" "$t_total" "$http_version" "$code" "$remote_ip" >> "$raw"
 }
 
-sni_cert_san_matches() {
-    local domain="${1,,}" sanext="${2:-}" value suffix prefix
-    local -a entries=()
-    valid_domain "$domain" || return 1
-    # Parse comma-separated DNS SAN entries as literal hostnames. Never interpolate
-    # a domain into a grep regular expression: dots in the hostname are regex
-    # wildcards and can otherwise produce false-positive certificate matches.
-    mapfile -t entries < <(printf '%s\n' "$sanext" | tr ',' '\n' | sed -nE 's/.*DNS:([^[:space:]]+).*/\1/p')
-    for value in "${entries[@]}"; do
-        value="${value,,}"
-        [[ "$value" == "$domain" ]] && return 0
-        if [[ "$value" == \*.* ]]; then
-            suffix="${value#*.}"
-            [[ "$domain" == *."$suffix" ]] || continue
-            prefix="${domain%.$suffix}"
-            # X.509 wildcard DNS SANs match exactly one left-most label.
-            [[ -n "$prefix" && "$prefix" != *.* ]] && return 0
-        fi
-    done
-    return 1
-}
-
 sni_openssl_check() {
-    local domain="$1" timeout_s="${2:-5}" out cert sanext alpn='none' tls13=0 san=0
+    local domain="$1" timeout_s="${2:-5}" out cert sanext rest alpn='none' tls13=0 san=0
     command -v openssl >/dev/null 2>&1 || { printf 'tls13=unknown\talpn=unknown\tsan=unknown'; return 0; }
     out=$(printf '' | timeout "$timeout_s" openssl s_client -connect "${domain}:443" -servername "$domain" -alpn 'h2,http/1.1' -tls1_3 -showcerts 2>/dev/null | tr -d '\000') || out=''
     if [[ -n "$out" ]]; then
@@ -12207,7 +12202,12 @@ sni_openssl_check() {
         cert=$(awk 'BEGIN{p=0}/-----BEGIN CERTIFICATE-----/{p=1} p{print} /-----END CERTIFICATE-----/{exit}' <<< "$out")
         if [[ -n "$cert" ]]; then
             sanext=$(printf '%s\n' "$cert" | openssl x509 -noout -ext subjectAltName 2>/dev/null | tr '\n' ' ' || true)
-            sni_cert_san_matches "$domain" "$sanext" && san=1
+            if grep -qi "DNS:${domain}\b" <<< "$sanext"; then
+                san=1
+            else
+                rest="${domain#*.}"
+                grep -qi "DNS:\*\.${rest}\b" <<< "$sanext" && san=1
+            fi
         fi
     fi
     printf 'tls13=%s\talpn=%s\tsan=%s' "$tls13" "$alpn" "$san"
@@ -12254,14 +12254,80 @@ sni_verify_raw_report() {
         cdn_penalty=$(sni_org_cdn_penalty "$domain" "$target_org")
         add=$((add + cdn_penalty))
         [[ "$same_country" == '1' ]] && add=$((add - 250))
-        [[ "$asn_match" == '1' ]] && add=$((add - 1200))
-        adj=$(awk -v s="$score" -v a="$add" 'BEGIN{v=int(s)+int(a); if(v<0)v=0; printf "%08d", v}')
-        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tasn=%s\tcountry=%s\tasnmatch=%s\tsamecountry=%s\torg=%s\n' \
-            "$adj" "$domain" "$c3" "$c4" "$c5" "$c6" "$c7" "$c8" "$check" "$target_asn" "$target_country" "$asn_match" "$same_country" "$target_org" >> "$verified"
+        # Strongly prefer a tested target in the VPS's own ASN, but never let
+        # topology override hard TLS/SAN checks or erase explicit CDN risk.
+        [[ "$asn_match" == '1' ]] && add=$((add - 1500))
+        adj=$(sni_adjust_score "$score" "$add")
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tasn=%s\tcountry=%s\tasnmatch=%s\tsamecountry=%s\torg=%s\tcdnpenalty=%s\n' \
+            "$adj" "$domain" "$c3" "$c4" "$c5" "$c6" "$c7" "$c8" "$check" "$target_asn" "$target_country" "$asn_match" "$same_country" "$target_org" "$cdn_penalty" >> "$verified"
     done < "$raw_sorted"
     printf '\r[*] Stage 2 progress: %d/%d verified\n' "$(( n > verify_limit ? verify_limit : n ))" "$verify_limit" >&2
-    sort -n "$verified" -o "$verified"
+    LC_ALL=C sort -t $'\t' -k1,1n -k2,2 "$verified" -o "$verified"
     rm -rf "$asn_cache" 2>/dev/null || true
+}
+
+sni_report_fit_tier() {
+    local tls13="${1#tls13=}" alpn="${2#alpn=}" san="${3#san=}" \
+        asn_match="${4#asnmatch=}" same_country="${5#samecountry=}" \
+        cdn_penalty="${6#cdnpenalty=}"
+    [[ "$cdn_penalty" =~ ^-?[0-9]+$ ]] || cdn_penalty=0
+    if [[ "$tls13" != '1' || "$alpn" != 'h2' || "$san" != '1' ]]; then
+        printf 'D\n'
+    elif (( cdn_penalty >= 300 )); then
+        # Keep risky targets visible for analysis, but do not label them a safe fit.
+        printf 'R\n'
+    elif [[ "$asn_match" == '1' ]]; then
+        printf 'A\n'
+    elif [[ "$same_country" == '1' ]]; then
+        printf 'B\n'
+    else
+        printf 'C\n'
+    fi
+}
+
+sni_render_ranked_report() {
+    local report_file="${1:-}" requested_limit="${2:-100}" display_dir selected_file
+    local row score domain app ttfb total http code ip tls13 alpn san asn country asnmatch samecountry org cdnpenalty tier
+    local bucket count color heading rank local_bucket_file
+    [[ -s "$report_file" ]] || { msg "${YELLOW}[!] 没有可显示的 SNI 测试记录。${NC}"; return 1; }
+    valid_decimal_upto "$requested_limit" 200 || requested_limit=100
+    (( 10#$requested_limit >= 1 )) || requested_limit=100
+    display_dir=$(mktemp -d /tmp/A-Box-sni-display.XXXXXX) || return 1
+    selected_file="$display_dir/selected.tsv"
+    head -n "$requested_limit" "$report_file" > "$selected_file" || { rm -rf -- "$display_dir"; return 1; }
+    for bucket in A R B C D; do : > "$display_dir/$bucket.tsv"; done
+    while IFS= read -r row; do
+        IFS=$'\t' read -r score domain app ttfb total http code ip tls13 alpn san asn country asnmatch samecountry org cdnpenalty <<< "$row"
+        [[ "$score" =~ ^-?[0-9]+$ && -n "$domain" ]] || continue
+        tier=$(sni_report_fit_tier "$tls13" "$alpn" "$san" "$asnmatch" "$samecountry" "$cdnpenalty")
+        printf '%s\n' "$row" >> "$display_dir/$tier.tsv"
+    done < "$selected_file"
+    msg "${CYAN}显示前 ${requested_limit} 条已完成二阶段验证的结果（完整记录保存在 TSV 中）。${NC}"
+    for bucket in A R B C D; do
+        local_bucket_file="$display_dir/$bucket.tsv"
+        count=$(wc -l < "$local_bucket_file" | tr -d ' ')
+        (( count > 0 )) || continue
+        case "$bucket" in
+            A) color="$GREEN"; heading="A级优先｜TLS1.3+H2+SAN合格、同ASN、风险分较低" ;;
+            R) color="$YELLOW"; heading="风险复核｜协议检查通过，但CDN/网络风险分较高；同ASN信息仍会显示" ;;
+            B) color="$CYAN"; heading="B级良好｜协议检查通过、同国家/地区、风险分较低" ;;
+            C) color="$BLUE"; heading="C级可用候选｜协议检查通过，但未匹配同ASN/同地区" ;;
+            D) color="$RED"; heading="不合格/需复测｜TLS1.3、ALPN h2或SAN至少一项未通过" ;;
+        esac
+        msg "${color}[${heading}｜${count} 条]${NC}"
+        rank=0
+        while IFS= read -r row; do
+            IFS=$'\t' read -r score domain app ttfb total http code ip tls13 alpn san asn country asnmatch samecountry org cdnpenalty <<< "$row"
+            rank=$((rank + 1))
+            printf '%s%3d. [score=%s] %-38s app=%-10s ttfb=%-10s total=%-10s HTTP/%s code=%s %s %s %s ASN=%s country=%s sameASN=%s sameRegion=%s cdnRisk=%s IP=%s%s\n' \
+                "$color" "$rank" "$score" "$domain" "${app#app=}" "${ttfb#ttfb=}" "${total#total=}" \
+                "${http#http=}" "${code#code=}" "$tls13" "$alpn" "$san" "${asn#asn=}" \
+                "${country#country=}" "${asnmatch#asnmatch=}" "${samecountry#samecountry=}" \
+                "${cdnpenalty#cdnpenalty=}" "${ip#ip=}" "$NC"
+        done < "$local_bucket_file"
+    done
+    rm -rf -- "$display_dir"
+    return 0
 }
 
 run_builtin_sni_radar() {
@@ -12282,13 +12348,13 @@ run_builtin_sni_radar() {
         # Mini mode uses the same candidate library as full mode. It reduces concurrency and verification depth only.
         concurrency="${ABOX_SNI_MINI_CONCURRENCY:-8}"
         timeout_s="${ABOX_SNI_MINI_TIMEOUT:-5}"
-        topn=25
-        verify_limit="${ABOX_SNI_MINI_VERIFY:-180}"
+        topn="${ABOX_SNI_MINI_TOPN:-60}"
+        verify_limit="${ABOX_SNI_MINI_VERIFY:-240}"
     else
         concurrency="${ABOX_SNI_FULL_CONCURRENCY:-36}"
         timeout_s="${ABOX_SNI_FULL_TIMEOUT:-6}"
-        topn=35
-        verify_limit="${ABOX_SNI_FULL_VERIFY:-420}"
+        topn="${ABOX_SNI_FULL_TOPN:-100}"
+        verify_limit="${ABOX_SNI_FULL_VERIFY:-600}"
     fi
     valid_decimal_upto "$concurrency" 256 || die 'SNI concurrency must be an integer in 1..256.'
     (( 10#$concurrency >= 1 )) || die 'SNI concurrency must be >= 1.'
@@ -12296,13 +12362,16 @@ run_builtin_sni_radar() {
     (( 10#$timeout_s >= 1 )) || die 'SNI timeout must be >= 1 second.'
     valid_decimal_upto "$verify_limit" 2048 || die 'SNI verify limit must be an integer in 1..2048.'
     (( 10#$verify_limit >= 1 )) || die 'SNI verify limit must be >= 1.'
+    valid_decimal_upto "$topn" 200 || die 'SNI display count must be an integer in 1..200.'
+    (( 10#$topn >= 1 )) || die 'SNI display count must be >= 1.'
     progress_every=$(( concurrency * 2 ))
     (( progress_every < 20 )) && progress_every=20
     msg "${CYAN}======================================================================${NC}"
     msg "${BOLD}${GREEN}${title}${NC}"
     msg "${CYAN}======================================================================${NC}"
-    msg "${YELLOW}[*] Candidate library: ${total} domains | profile=${profile} | concurrency=${concurrency}${NC}"
+    msg "${YELLOW}[*] Candidate library: ${total} domains | profile=${profile} | concurrency=${concurrency} | deep-check=${verify_limit} | display=${topn}${NC}"
     msg "${YELLOW}[*] Stage 1: HTTPS/TLSv1.3 curl metrics. Stage 2: OpenSSL TLS1.3 + ALPN + SAN + ASN/topology scoring.${NC}"
+    msg "${YELLOW}[*] Same-ASN bonus is applied after mandatory TLS/SAN evaluation; high CDN-risk candidates are separated for review.${NC}"
     msg "${YELLOW}[*] Fully internal SNI library; no legacy remote SNI scripts or gist extraction are used.${NC}"
     msg "${YELLOW}[*] Progress is printed after each batch; large libraries can take several minutes on low-end VPS.${NC}"
     : > "$raw"
@@ -12327,7 +12396,7 @@ run_builtin_sni_radar() {
         rm -rf "$workdir"
         die 'SNI radar produced no valid HTTPS/TLS results. Check DNS, routing, firewall, curl/OpenSSL support.'
     fi
-    sort -n "$raw" > "$raw_sorted"
+    LC_ALL=C sort -t $'\t' -k1,1n -k2,2 "$raw" > "$raw_sorted"
     sni_verify_raw_report "$raw_sorted" "$report" "$verify_limit" "$timeout_s"
     if [[ ! -s "$report" ]]; then
         cp -f "$raw_sorted" "$report"
@@ -12340,22 +12409,24 @@ run_builtin_sni_radar() {
     path_mode_has_no_group_other_write "$saved_report" || die 'SNI record permission verification failed.'
     msg "${BLUE}----------------------------------------------------------------------${NC}"
     msg "${YELLOW}[ Top SNI Candidates / 优选 SNI 候选 ]${NC}"
-    awk -F'\t' -v n="$topn" 'NR<=n {printf "%2d. %-42s %s %s %s %s %s %s %s %s %s\n", NR, $2, $3, $4, $5, $6, $7, $9, $10, $11, $12}' "$report"
+    sni_render_ranked_report "$report" "$topn" || msg "${YELLOW}[!] 结果分级显示失败；完整 TSV 仍已保存。${NC}"
     msg "${BLUE}----------------------------------------------------------------------${NC}"
     msg "${GREEN}Saved: ${ABOX_DIR}/A-Box-sni-${profile}.tsv${NC}"
-    msg "${YELLOW}Use only domains with tls13=1 and san=1. Prefer asnmatch=1/samecountry=1 when available; avoid blindly using fixed Apple/Nike templates.${NC}"
+    msg "${YELLOW}A/B/C 等级仅表示本 VPS 的探测结果；风险复核和不合格项目不会因低延迟被标为优先推荐。${NC}"
     rm -rf "$workdir"
 }
 
 show_sni_preference_records() {
     clear
-    local files=() f profile topn=35 shown=0 mtime
+    local files=() f profile topn="${ABOX_SNI_RECORDS_TOPN:-100}" shown=0 mtime
     msg "${CYAN}======================================================================${NC}"
     if [[ "${ABOX_LANG:-zh}" == 'en' ]]; then
         msg "${BOLD}${GREEN}SNI Preference Records${NC}"
     else
         msg "${BOLD}${GREEN}SNI 优选记录${NC}"
     fi
+    valid_decimal_upto "$topn" 200 || topn=100
+    (( 10#$topn >= 1 )) || topn=100
     msg "${CYAN}======================================================================${NC}"
     for f in "$ABOX_DIR/A-Box-sni-full.tsv" "$ABOX_DIR/A-Box-sni-mini.tsv"; do
         [[ -s "$f" ]] && files+=("$f")
@@ -12379,7 +12450,7 @@ show_sni_preference_records() {
         else
             msg "${YELLOW}[${profile}] 保存路径: ${f} | 更新时间: ${mtime}${NC}"
         fi
-        awk -F'	' -v n="$topn" 'NF>=8 && NR<=n {printf "%2d. %-42s %s %s %s %s %s %s %s %s %s\n", NR, $2, $3, $4, $5, $6, $7, $9, $10, $11, $12}' "$f"
+        sni_render_ranked_report "$f" "$topn" || msg "${YELLOW}[!] 无法读取该记录的分级结果。${NC}"
         shown=1
     done
     msg "${BLUE}----------------------------------------------------------------------${NC}"
@@ -15941,21 +16012,6 @@ run_self_tests() {
     [[ "$mini_count" =~ ^[0-9]+$ && "$mini_count" -eq "$sni_count" ]] || { echo "FAIL: SNI mini library does not match full library ($mini_count vs $sni_count)"; failures=$((failures + 1)); }
     declare -f asn_lookup_ip >/dev/null || { echo 'FAIL: ASN lookup function missing'; failures=$((failures + 1)); }
     declare -f sni_org_cdn_penalty >/dev/null || { echo 'FAIL: ASN/CDN scoring function missing'; failures=$((failures + 1)); }
-    declare -F sni_cert_san_matches >/dev/null || { echo 'FAIL: literal SAN matcher missing'; failures=$((failures + 1)); }
-    assert_ok sni_cert_san_matches foo.example.com 'X509v3 Subject Alternative Name: DNS:foo.example.com'
-    assert_ok sni_cert_san_matches foo.example.com 'DNS:*.example.com'
-    assert_bad sni_cert_san_matches foo.example.com 'DNS:fooXexampleYcom'
-    assert_bad sni_cert_san_matches foo.bar.example.com 'DNS:*.example.com'
-    assert_ok sni_cert_san_matches foo.bar.example.com 'DNS:*.bar.example.com'
-    assert_bad sni_cert_san_matches example.com 'DNS:*.example.com'
-    if (( EUID == 0 )); then
-        _asn_test_cache="$tmp/asn-cache"
-        mkdir -m 700 -- "$_asn_test_cache" || { echo 'FAIL: ASN cache fixture creation'; failures=$((failures + 1)); }
-        printf '%s\n' $'asn=AS13335\tcountry=US\torg=Cloudflare, Inc.' > "$_asn_test_cache/1.1.1.1" || { echo 'FAIL: ASN cache fixture write'; failures=$((failures + 1)); }
-        chown root:root "$_asn_test_cache" "$_asn_test_cache/1.1.1.1" 2>/dev/null || true
-        chmod 700 "$_asn_test_cache" || { echo 'FAIL: ASN cache fixture permissions'; failures=$((failures + 1)); }
-        [[ "$(asn_lookup_ip 1.1.1.1 "$_asn_test_cache" 2>/dev/null)" == $'asn=AS13335	country=US	org=Cloudflare, Inc.' ]] || { echo 'FAIL: ASN cache lookup rejects a valid root-owned 0700 directory'; failures=$((failures + 1)); }
-    fi
     [[ "$(tr_msg confirm_local_sni_full)" != *'远程执行第三方脚本'* ]] || { echo 'FAIL: local SNI prompt still says remote third-party'; failures=$((failures + 1)); }
     grep -Fq 'en:reality_non443_warn)' "$0" || { echo 'FAIL: English non-443 SNI warning translation missing'; failures=$((failures + 1)); }
     grep -Fq 'en:apple_sni_warn)' "$0" || { echo 'FAIL: English Apple/iCloud SNI warning translation missing'; failures=$((failures + 1)); }
@@ -16110,6 +16166,15 @@ run_self_tests() {
     [[ "$(sni_domain_penalty maps.apple.com)" == '2400' ]] || { echo 'FAIL: Apple subdomain SNI penalty'; failures=$((failures + 1)); }
     [[ "$(sni_domain_penalty apple.com)" == '2400' ]] || { echo 'FAIL: Apple apex SNI penalty'; failures=$((failures + 1)); }
     [[ "$(sni_domain_penalty github.com)" == '2400' ]] || { echo 'FAIL: GitHub apex SNI penalty'; failures=$((failures + 1)); }
+    [[ "$(sni_raw_score 0.1 0.1 0.1 -220)" == '-92' ]] || { echo 'FAIL: SNI raw score must preserve negative ranking values'; failures=$((failures + 1)); }
+    [[ "$(sni_adjust_score -92 -1500)" == '-1592' ]] || { echo 'FAIL: SNI ASN bonus must preserve negative ranking values'; failures=$((failures + 1)); }
+    [[ "$(sni_report_fit_tier tls13=1 alpn=h2 san=1 asnmatch=1 samecountry=1 cdnpenalty=0)" == 'A' ]] || { echo 'FAIL: SNI same-ASN compatible tier'; failures=$((failures + 1)); }
+    [[ "$(sni_report_fit_tier tls13=1 alpn=h2 san=1 asnmatch=1 samecountry=1 cdnpenalty=500)" == 'R' ]] || { echo 'FAIL: SNI CDN-risk tier must override green recommendation'; failures=$((failures + 1)); }
+    [[ "$(sni_report_fit_tier tls13=1 alpn=h2 san=1 asnmatch=0 samecountry=1 cdnpenalty=0)" == 'B' ]] || { echo 'FAIL: SNI same-country compatible tier'; failures=$((failures + 1)); }
+    [[ "$(sni_report_fit_tier tls13=1 alpn=h2 san=1 asnmatch=0 samecountry=0 cdnpenalty=0)" == 'C' ]] || { echo 'FAIL: SNI other-ASN compatible tier'; failures=$((failures + 1)); }
+    [[ "$(sni_report_fit_tier tls13=1 alpn=http/1.1 san=1 asnmatch=1 samecountry=1 cdnpenalty=0)" == 'D' ]] || { echo 'FAIL: SNI incompatible ALPN tier'; failures=$((failures + 1)); }
+    ! grep -Fq 'NR <= 8' <(sed -n '/^traffic_management_menu() {$/,/^manage_ss_whitelist()/p' "$0") || { echo 'FAIL: monthly vnStat display must not truncate after 8 raw lines'; failures=$((failures + 1)); }
+    grep -Fq 'ABOX_SNI_FULL_TOPN:-100' "$0" || { echo 'FAIL: full SNI result display count default'; failures=$((failures + 1)); }
     ! grep -q '^MAIN_LOCK=/run/A-Box.lock$' "$0" || { echo 'FAIL: helper health probe still depends on interactive main lock'; failures=$((failures + 1)); }
     traffic_writer_body=$(sed -n '/write_private_line() {/,/^read_desired() {/p' "$0") || { echo 'FAIL: traffic helper writer static extraction'; failures=$((failures + 1)); }
     ! grep -q 'path_parent_chain_safe "\$dest"' <<< "$traffic_writer_body" || { echo 'FAIL: traffic helper calls main-only function'; failures=$((failures + 1)); }
