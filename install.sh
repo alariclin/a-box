@@ -8861,8 +8861,12 @@ snapshot_dns_state() {
     return 0
 }apply_host_dns() {
     local mode="$1" v4="$2" v6="$3" backend dropin answer
-    # mode: plain | dot
+    # mode: plain | dot; DoT is supported only by active systemd-resolved.
     backend=$(dns_backend_detect)
+    if [[ "$mode" == 'dot' && "$backend" != 'resolved' ]]; then
+        msg "${RED}当前 DNS 后端 $backend 不支持真实 DoT 配置；未修改 DNS。${NC}"
+        return 1
+    fi
     msg "检测到 DNS 后端 / backend: ${YELLOW}${backend}${NC}"
     msg "将应用 IPv4 DNS: ${YELLOW}${v4}${NC}  IPv6 DNS: ${YELLOW}${v6:-none}${NC}  模式: ${YELLOW}${mode}${NC}"
     read -r -p '确认修改本机 DNS？可回滚。Confirm host DNS change? [Y/N]: ' answer
@@ -8926,56 +8930,192 @@ EOF_DNS
     msg "${GREEN}本机 DNS 已更新。可用菜单回滚。${NC}"
 }
 
+dns_probe_once() {
+    local server="$1" port="${2:-53}" name="${3:-example.com}"
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$server" "$port" "$name" <<'PY_DNS_PROBE'
+import ipaddress, os, socket, struct, sys, time
+server, port, name = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+try:
+    addr = ipaddress.ip_address(server)
+    family = socket.AF_INET6 if addr.version == 6 else socket.AF_INET
+    ident = int.from_bytes(os.urandom(2), 'big')
+    qname = b''.join(bytes([len(x)]) + x for x in name.rstrip('.').encode('ascii').split(b'.')) + b'\0'
+    packet = struct.pack('!HHHHHH', ident, 0x0100, 1, 0, 0, 0) + qname + struct.pack('!HH', 1, 1)
+    sock = socket.socket(family, socket.SOCK_DGRAM); sock.settimeout(1.8)
+    t0 = time.monotonic(); sock.sendto(packet, (server, port)); data, _ = sock.recvfrom(4096)
+    elapsed = (time.monotonic() - t0) * 1000; sock.close()
+    if len(data) < 12: raise RuntimeError('short DNS response')
+    rid, flags, qd, an, ns, ar = struct.unpack('!HHHHHH', data[:12])
+    if rid != ident or not (flags & 0x8000) or (flags & 15) != 0 or an < 1: raise RuntimeError('DNS response failed')
+    print(f'{elapsed:.1f}')
+except Exception:
+    raise SystemExit(1)
+PY_DNS_PROBE
+}
+
+dns_auto_prefer() {
+    local server result successes median best='' best_ms=999999 round v6
+    local -a candidates=('1.1.1.1' '8.8.8.8' '9.9.9.9' '208.67.222.222') timings=()
+    command -v python3 >/dev/null 2>&1 || { msg "${RED}自动 DNS 测速需要 Python 3。${NC}"; pause_return; return 1; }
+    clear
+    msg "${CYAN}DNS 自动优选 / real DNS latency test${NC}"
+    msg '对 example.com A 记录进行 3 轮真实 DNS 查询，按可用率和中位数比较。'
+    for server in "${candidates[@]}"; do
+        timings=(); successes=0
+        for round in 1 2 3; do
+            result=$(dns_probe_once "$server" 53 example.com 2>/dev/null || true)
+            if [[ "$result" =~ ^[0-9]+([.][0-9]+)?$ ]]; then timings+=("$result"); successes=$((successes+1)); fi
+        done
+        if (( successes >= 2 )); then
+            median=$(printf '%s\n' "${timings[@]}" | LC_ALL=C sort -n | awk 'NR==2{print;exit}')
+            msg "${YELLOW}$server${NC}: $successes/3 成功 | 中位数 $median ms"
+            if awk -v a="$median" -v b="$best_ms" 'BEGIN{exit !(a+0 < b+0)}'; then best="$server"; best_ms="$median"; fi
+        else
+            msg "${YELLOW}$server${NC}: $successes/3 成功，样本不足，排除"
+        fi
+    done
+    [[ -n "$best" ]] || { msg "${RED}没有候选通过可用性门槛；系统 DNS 未修改。${NC}"; pause_return; return 1; }
+    v6=''
+    case "$best" in
+        1.1.1.1) v6='2606:4700:4700::1111' ;;
+        8.8.8.8) v6='2001:4860:4860::8888' ;;
+        9.9.9.9) v6='2620:fe::fe' ;;
+        208.67.222.222) v6='2620:119:35::35' ;;
+    esac
+    msg "${GREEN}本次测试最佳候选: $best（中位数 $best_ms ms）${NC}"
+    msg '这是当前 VPS、当前网络下的样本，不保证对所有域名和未来网络始终最优。'
+    read -r -p '将它应用为系统 DNS？[Y/N]: ' result
+    is_yes "$result" || { msg '已取消。'; pause_return; return 0; }
+    apply_host_dns plain "$best" "$v6"; pause_return
+}
+
+dns_install_dnscrypt_proxy() {
+    command -v dnscrypt-proxy >/dev/null 2>&1 && return 0
+    read -r -p 'DoH 将通过本机 dnscrypt-proxy 转发。是否安装系统包？[Y/N]: ' answer
+    is_yes "$answer" || return 1
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update && apt-get install -y dnscrypt-proxy || return 1
+    elif command -v apk >/dev/null 2>&1; then
+        apk add dnscrypt-proxy || return 1
+    else
+        msg "${YELLOW}当前发行版没有已验证的软件包安装路径；未下载未知二进制。${NC}"
+        return 1
+    fi
+    command -v dnscrypt-proxy >/dev/null 2>&1
+}
+
+dns_enable_doh() {
+    local backend config answer tmp rc
+    backend=$(dns_backend_detect)
+    [[ "$backend" == resolved ]] && command -v systemctl >/dev/null 2>&1 || {
+        msg "${YELLOW}自动 DoH 目前仅支持运行中的 systemd-resolved 后端；当前为 $backend，DNS 未修改。${NC}"
+        return 1
+    }
+    dns_install_dnscrypt_proxy || { msg "${YELLOW}dnscrypt-proxy 未安装；DNS 未修改。${NC}"; return 1; }
+    config='/etc/dnscrypt-proxy/dnscrypt-proxy.toml'
+    [[ -f "$config" && ! -L "$config" ]] || { msg "${RED}未找到安全的配置文件：$config${NC}"; return 1; }
+    read -r -p '设置 Cloudflare DoH（本机 127.0.0.1:53），并由 systemd-resolved 转发。确认？[Y/N]: ' answer
+    is_yes "$answer" || return 0
+    rm -rf -- "$DNS_BACKUP_DIR"
+    mkdir -p "$DNS_BACKUP_DIR" && chmod 700 "$DNS_BACKUP_DIR" || return 1
+    snapshot_dns_state "$DNS_BACKUP_DIR" || { msg "${RED}DNS 回滚快照失败，未修改设置。${NC}"; return 1; }
+    tmp=$(umask 077; mktemp /tmp/A-Box-doh-config.XXXXXX) || return 1
+    python3 - "$config" "$tmp" <<'PY_DOH_EDIT'
+import re, sys
+source, target = sys.argv[1:3]
+with open(source, encoding='utf-8') as f: text = f.read()
+def setting(name, value):
+    global text
+    active = re.compile(r'(?m)^\s*' + re.escape(name) + r'\s*=.*$')
+    if active.search(text):
+        text, n = active.subn(name + ' = ' + value, text, count=1)
+    else:
+        commented = re.compile(r'(?m)^\s*#\s*' + re.escape(name) + r'\s*=.*$')
+        text, n = commented.subn(name + ' = ' + value, text, count=1)
+    if n != 1: raise SystemExit('configuration key unavailable: ' + name)
+setting('listen_addresses', "['127.0.0.1:53']")
+setting('server_names', "['cloudflare1', 'cloudflare2']")
+setting('dnscrypt_servers', 'false')
+setting('doh_servers', 'true')
+if '[static.cloudflare1]' not in text:
+    text += "\\n\\n[static.cloudflare1]\\nstamp = 'sdns://AgcAAAAAAAAABzEuMS4xLjEABzEuMS4xLjEKL2Rucy1xdWVyeQ'\\n"
+if '[static.cloudflare2]' not in text:
+    text += "\\n[static.cloudflare2]\\nstamp = 'sdns://AgcAAAAAAAAABzEuMC4wLjEABzEuMC4wLjEKL2Rucy1xdWVyeQ'\\n"
+with open(target, 'w', encoding='utf-8') as f: f.write(text)
+PY_DOH_EDIT
+    rc=$?
+    if (( rc != 0 )); then rm -f -- "$tmp"; restore_dns_snapshot "$DNS_BACKUP_DIR" || true; return 1; fi
+    install -m 644 "$tmp" "$config" || { rm -f -- "$tmp"; restore_dns_snapshot "$DNS_BACKUP_DIR" || true; return 1; }
+    rm -f -- "$tmp"
+    if ! dnscrypt-proxy -config "$config" -check >/dev/null 2>&1; then
+        msg "${RED}dnscrypt-proxy 配置检查失败；正在回滚。${NC}"
+        restore_dns_snapshot "$DNS_BACKUP_DIR" || true; return 1
+    fi
+    systemctl enable --now dnscrypt-proxy >/dev/null 2>&1 || systemctl restart dnscrypt-proxy >/dev/null 2>&1 || {
+        restore_dns_snapshot "$DNS_BACKUP_DIR" || true
+        msg "${RED}dnscrypt-proxy 无法启动，已尝试回滚。${NC}"; return 1;
+    }
+    if ! dns_probe_once 127.0.0.1 53 example.com >/dev/null 2>&1; then
+        restore_dns_snapshot "$DNS_BACKUP_DIR" || true
+        msg "${RED}本机 DoH 解析检查失败，已尝试回滚。${NC}"; return 1
+    fi
+    write_file_atomically_from_stdin /etc/systemd/resolved.conf.d/99-abox-dns.conf 644 <<'EOF_DOH' || { restore_dns_snapshot "$DNS_BACKUP_DIR" || true; return 1; }
+[Resolve]
+DNS=127.0.0.1
+FallbackDNS=
+Domains=~.
+DNSOverTLS=no
+EOF_DOH
+    systemctl restart systemd-resolved >/dev/null 2>&1 || { restore_dns_snapshot "$DNS_BACKUP_DIR" || true; return 1; }
+    if resolvectl query example.com >/dev/null 2>&1; then
+        write_file_atomically_from_stdin "$DNS_STATE_FILE" 600 <<< 'backend=resolved;mode=doh;proxy=dnscrypt-proxy' || true
+        msg "${GREEN}DoH 已启用且本机查询通过；可用 DNS 菜单回滚。${NC}"
+        msg "${YELLOW}DoH 加密的是 DNS 到所选上游的解析链路，不代表 VPS 所有流量都被隐藏。${NC}"
+    else
+        restore_dns_snapshot "$DNS_BACKUP_DIR" || true
+        msg "${RED}systemd-resolved 查询失败；已尝试回滚。${NC}"; return 1
+    fi
+}
+
 dns_menu() {
     clear
-    local c mode v4 v6 answer
+    local c v4 v6
     msg "${CYAN}======================================================================${NC}"
     msg "${BOLD}${GREEN}VPS 本机 DNS / Host DNS${NC}"
     msg "${CYAN}======================================================================${NC}"
     msg "后端: ${YELLOW}$(dns_backend_detect)${NC}"
-    if [[ -r /etc/resolv.conf ]]; then
-        msg "${YELLOW}当前 /etc/resolv.conf 摘要:${NC}"
-        grep -E '^(nameserver|search|options)' /etc/resolv.conf 2>/dev/null | head -8 || true
-    fi
-    msg "${YELLOW}1. 明文 DNS（IPv4+可选 IPv6 nameserver）${NC}"
-    msg "${YELLOW}2. 隐私 DNS DoT（systemd-resolved DNSOverTLS=yes）${NC}"
-    msg "${YELLOW}3. 使用 Cloudflare 1.1.1.1 / 2606:4700:4700::1111${NC}"
-    msg "${YELLOW}4. 使用 Quad9 9.9.9.9 / 2620:fe::fe${NC}"
-    msg "${YELLOW}5. 回滚到上次 A-Box DNS 变更前${NC}"
+    if [[ -r /etc/resolv.conf ]]; then grep -E '^(nameserver|search|options)' /etc/resolv.conf 2>/dev/null | head -8 || true; fi
+    msg "${YELLOW}1. 自定义明文 DNS（可选 IPv6）${NC}"
+    msg "${YELLOW}2. 隐私 DNS DoT（仅 systemd-resolved 后端）${NC}"
+    msg "${YELLOW}3. Cloudflare DNS${NC}"
+    msg "${YELLOW}4. Quad9 DNS${NC}"
+    msg "${YELLOW}5. 自动实测优选 DNS（3 轮延迟/可用性）${NC}"
+    msg "${YELLOW}6. 隐私 DNS DoH（dnscrypt-proxy，本地转发）${NC}"
+    msg "${YELLOW}7. 回滚到上次 A-Box DNS 变更前${NC}"
     msg "${GREEN}0. 返回${NC}"
-    read -r -p 'Select [0-5]: ' c
+    read -r -p 'Select [0-7]: ' c
     case "$c" in
         1)
             read -r -p 'IPv4 DNS (e.g. 1.1.1.1): ' v4
             valid_ipv4_cidr "$v4" && [[ "$v4" != */* ]] || { msg "${RED}非法 IPv4 DNS${NC}"; pause_return; return 1; }
-            read -r -p 'IPv6 DNS (可空, e.g. 2606:4700:4700::1111): ' v6
-            [[ -z "$v6" ]] || valid_ipv6_cidr "$v6" || { msg "${RED}非法 IPv6 DNS${NC}"; pause_return; return 1; }
-            [[ -z "$v6" || "$v6" != */* ]] || { msg "${RED}请填写地址而非 CIDR${NC}"; pause_return; return 1; }
-            apply_host_dns plain "$v4" "$v6"
-            pause_return
-            ;;
+            read -r -p 'IPv6 DNS（可空）: ' v6
+            [[ -z "$v6" ]] || { valid_ipv6_cidr "$v6" && [[ "$v6" != */* ]]; } || { msg "${RED}非法 IPv6 DNS${NC}"; pause_return; return 1; }
+            apply_host_dns plain "$v4" "$v6"; pause_return ;;
         2)
             read -r -p 'DoT resolver IPv4 (e.g. 1.1.1.1): ' v4
             valid_ipv4_cidr "$v4" && [[ "$v4" != */* ]] || { msg "${RED}非法 IPv4${NC}"; pause_return; return 1; }
-            read -r -p 'DoT resolver IPv6 (可空): ' v6
+            read -r -p 'DoT resolver IPv6（可空）: ' v6
             [[ -z "$v6" ]] || { valid_ipv6_cidr "$v6" && [[ "$v6" != */* ]]; } || { msg "${RED}非法 IPv6${NC}"; pause_return; return 1; }
-            apply_host_dns dot "$v4" "$v6"
-            pause_return
-            ;;
+            apply_host_dns dot "$v4" "$v6"; pause_return ;;
         3) apply_host_dns plain '1.1.1.1' '2606:4700:4700::1111'; pause_return ;;
         4) apply_host_dns plain '9.9.9.9' '2620:fe::fe'; pause_return ;;
-        5)
-            if [[ -f "$DNS_BACKUP_DIR/COMPLETE" ]]; then
-                restore_dns_snapshot "$DNS_BACKUP_DIR" && msg "${GREEN}DNS 已回滚。${NC}" || msg "${RED}DNS 回滚失败。${NC}"
-            else
-                msg "${YELLOW}[!] 无 DNS 回滚快照。${NC}"
-            fi
-            pause_return
-            ;;
+        5) dns_auto_prefer ;;
+        6) dns_enable_doh; pause_return ;;
+        7) if [[ -f "$DNS_BACKUP_DIR/COMPLETE" ]]; then restore_dns_snapshot "$DNS_BACKUP_DIR" && msg "${GREEN}DNS 已回滚。${NC}" || msg "${RED}DNS 回滚失败。${NC}"; else msg "${YELLOW}[!] 无 DNS 回滚快照。${NC}"; fi; pause_return ;;
         *) return 0 ;;
     esac
 }
-
 
 tune_vps() {
     clear
@@ -13947,6 +14087,8 @@ PY_SELFTEST_TAR
     grep -Fq 'IP_PREF_FILE=' "$0" || { echo 'FAIL: IP preference state file missing'; failures=$((failures + 1)); }
     grep -Fq 'ip_preference_menu()' "$0" || { echo 'FAIL: IP preference menu missing'; failures=$((failures + 1)); }
     grep -Fq 'dns_menu()' "$0" || { echo 'FAIL: DNS menu missing'; failures=$((failures + 1)); }
+    grep -Fq 'dns_auto_prefer()' "$0" || { echo 'FAIL: DNS auto tester missing'; failures=$((failures + 1)); }
+    grep -Fq 'dns_enable_doh()' "$0" || { echo 'FAIL: DNS-over-HTTPS support missing'; failures=$((failures + 1)); }
     grep -Fq 'timezone_menu()' "$0" || { echo 'FAIL: timezone menu missing'; failures=$((failures + 1)); }
     grep -Fq 'run_mirrored_test_script()' "$0" || { echo 'FAIL: test mirror fallback missing'; failures=$((failures + 1)); }
     grep -Fq "ABOX_TEST_MIRROR_RELEASE='test-tools-mirror-v173'" "$0" || { echo 'FAIL: test tool mirror release missing'; failures=$((failures + 1)); }
