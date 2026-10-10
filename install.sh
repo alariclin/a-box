@@ -8688,80 +8688,115 @@ detect_country_for_timezone() {
     printf '%s\n' "${body^^}"
 }
 
-timezone_menu() {
-    clear
-    local cur suggested country answer custom snap c
-    cur=$(current_timezone_name)
-    msg "${CYAN}======================================================================${NC}"
-    msg "${BOLD}${GREEN}时区设置 / Timezone${NC}"
-    msg "${CYAN}======================================================================${NC}"
-    msg "当前时区 / Current: ${YELLOW}${cur}${NC}"
-    country=$(detect_country_for_timezone 2>/dev/null || true)
-    if [[ -n "$country" ]]; then
-        suggested=$(timezone_for_country "$country")
-        msg "公网 IP 国家启发式 / Geo heuristic: ${YELLOW}${country}${NC} → ${YELLOW}${suggested:-unknown}${NC}"
-    else
-        suggested=''
-        msg "${YELLOW}[!] 无法从公网 IP 推断国家；可手动输入 IANA 时区。${NC}"
+timezone_list_entries() {
+    if command -v timedatectl >/dev/null 2>&1; then timedatectl list-timezones 2>/dev/null || true
+    elif [[ -d /usr/share/zoneinfo ]]; then
+        find /usr/share/zoneinfo \( -type f -o -type l \) 2>/dev/null |
+            sed 's#^/usr/share/zoneinfo/##' |
+            grep -E '^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+.-]+)*$' |
+            grep -Ev '^(posix|right|SystemV)/|^(zone|iso3166|tzdata|leap|localtime|posixrules|Factory)$'
     fi
-    msg "${YELLOW}1. 应用启发式推荐时区（需确认）${NC}"
-    msg "${YELLOW}2. 自定义 IANA 时区（如 Asia/Shanghai）${NC}"
-    msg "${YELLOW}3. 回滚到上次 A-Box 时区变更前快照${NC}"
+    printf '%s\n' UTC
+}
+
+timezone_apply_with_rollback() {
+    local target="$1" snap rollback stage
+    valid_timezone_name "$target" || { msg "${RED}非法或不存在的时区: $target${NC}"; return 1; }
+    snap=$(mktemp -d /etc/ddr/.tz-snap.XXXXXX) || return 1
+    chmod 700 "$snap" && snapshot_timezone_state "$snap" || { rm -rf -- "$snap"; msg "${RED}时区快照失败，未修改。${NC}"; return 1; }
+    if ! apply_timezone_name "$target"; then
+        restore_timezone_snapshot "$snap" || msg "${RED}旧时区恢复失败，请检查系统。${NC}"
+        rm -rf -- "$snap"; msg "${RED}时区应用失败，已尝试回滚。${NC}"; return 1
+    fi
+    rollback='/etc/ddr/.tz-rollback'
+    stage=$(mktemp -d /etc/ddr/.tz-rollback-new.XXXXXX) || { restore_timezone_snapshot "$snap" || true; rm -rf -- "$snap"; return 1; }
+    cp -a "$snap"/. "$stage"/ && rm -rf -- "$rollback" && mv -- "$stage" "$rollback" || {
+        restore_timezone_snapshot "$snap" || true; rm -rf -- "$snap" "$stage"; return 1;
+    }
+    write_file_atomically_from_stdin "$TZ_STATE_FILE" 600 <<< "applied=$target" || true
+    rm -rf -- "$snap"
+    msg "${GREEN}时区已设置为 $target；原时区已保存，可回滚。${NC}"
+}
+
+timezone_choose_from_list() {
+    local query="${1:-}" page=0 step=25 input tz confirm idx start end
+    local -a all=() filtered=()
+    mapfile -t all < <(timezone_list_entries | awk 'NF && !seen[$0]++' | LC_ALL=C sort -u)
+    for tz in "${all[@]}"; do [[ -z "$query" || "${tz,,}" == *"${query,,}"* ]] && filtered+=("$tz"); done
+    (( ${#filtered[@]} )) || { msg "${YELLOW}没有匹配时区。${NC}"; return 1; }
+    while true; do
+        clear; msg "${CYAN}================ IANA 时区列表 / Time zones ================${NC}"
+        msg "Current: $(current_timezone_name) | Query: ${query:-ALL} | Total: ${#filtered[@]}"
+        start=$((page*step)); end=$((start+step)); ((end>${#filtered[@]})) && end=${#filtered[@]}
+        for ((idx=start; idx<end; idx++)); do printf '%4d. %s\n' "$((idx+1))" "${filtered[$idx]}"; done
+        read -r -p '输入编号；n/p 翻页；s 搜索；0 返回: ' input || return 0
+        case "${input,,}" in
+            n|next) ((end<${#filtered[@]})) && page=$((page+1)) ;;
+            p|prev) ((page>0)) && page=$((page-1)) ;;
+            s|search) read -r -p '时区关键词: ' query || return 0; page=0; filtered=(); for tz in "${all[@]}"; do [[ -z "$query" || "${tz,,}" == *"${query,,}"* ]] && filtered+=("$tz"); done ;;
+            0|'') return 0 ;;
+            *[!0-9]*) msg "${YELLOW}请输入编号或 n/p/s/0。${NC}"; sleep 1 ;;
+            *) ((input>=1 && input<=${#filtered[@]})) || { msg "${YELLOW}编号超出范围。${NC}"; sleep 1; continue; }
+               tz="${filtered[$((input-1))]}"; read -r -p "确认设置为 $tz ? [Y/N]: " confirm
+               if is_yes "$confirm"; then timezone_apply_with_rollback "$tz"; pause_return; return 0; fi ;;
+        esac
+    done
+}
+
+timezone_locale_ntp_menu() {
+    clear
+    local c ntp synced now page=0 input start end i target
+    local -a locales=()
+    now=$(date '+%Y-%m-%d %H:%M:%S %Z (%z)' 2>/dev/null || date)
+    ntp='unknown'; synced='unknown'
+    if command -v timedatectl >/dev/null 2>&1; then
+        ntp=$(timedatectl show -p NTP --value 2>/dev/null || printf unknown)
+        synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || printf unknown)
+    fi
+    msg "${CYAN}================ 时间、时区与地区 / Time & Region ================${NC}"
+    msg "当前时间: $now | 时区: $(current_timezone_name) | NTP: $ntp | 已同步: $synced"
+    msg "${YELLOW}1. 全部时区编号列表${NC}"
+    msg "${YELLOW}2. 搜索时区后按编号选择${NC}"
+    msg "${YELLOW}3. 修改系统 Locale（只列出已安装语言包）${NC}"
+    msg "${YELLOW}4. 启用 NTP 自动时间同步${NC}"
+    msg "${YELLOW}5. 回滚时区修改前快照${NC}"
     msg "${GREEN}0. 返回${NC}"
-    read -r -p 'Select [0-3]: ' c
+    read -r -p 'Select [0-5]: ' c
     case "$c" in
-        1)
-            [[ -n "$suggested" ]] || { msg "${RED}[!] 无可用启发式推荐。${NC}"; pause_return; return 1; }
-            msg "将设置时区为: ${YELLOW}${suggested}${NC}"
-            read -r -p '确认应用? [Y/N]: ' answer
-            is_yes "$answer" || { msg "${YELLOW}已取消。${NC}"; pause_return; return 0; }
-            snap=$(mktemp -d /etc/ddr/.tz-snap.XXXXXX) || die '时区快照目录创建失败。'
-            chmod 700 "$snap" || die '时区快照权限失败。'
-            snapshot_timezone_state "$snap" || die '时区快照失败。'
-            if apply_timezone_name "$suggested"; then
-                ensure_abox_dir_owned "$ABOX_DIR"
-                write_file_atomically_from_stdin "$TZ_STATE_FILE" 600 <<< "applied=${suggested};snapshot=${snap}" || true
-                # Keep only one rollback snapshot pointer
-                rm -rf -- "$DNS_BACKUP_DIR/../.tz-rollback" 2>/dev/null || true
-                mkdir -p /etc/ddr/.tz-rollback && rm -rf /etc/ddr/.tz-rollback/* && cp -a "$snap"/. /etc/ddr/.tz-rollback/ && rm -rf -- "$snap"
-                msg "${GREEN}时区已设置为 ${suggested}${NC}"
-            else
-                restore_timezone_snapshot "$snap" || true
-                rm -rf -- "$snap"
-                die '时区应用失败，已尝试回滚。'
-            fi
-            pause_return
-            ;;
-        2)
-            read -r -p 'IANA timezone (e.g. Asia/Shanghai): ' custom
-            valid_timezone_name "$custom" || { msg "${RED}[!] 非法或不存在的时区: $custom${NC}"; pause_return; return 1; }
-            read -r -p "确认设置为 ${custom}? [Y/N]: " answer
-            is_yes "$answer" || { pause_return; return 0; }
-            snap=$(mktemp -d /etc/ddr/.tz-snap.XXXXXX) || die '时区快照目录创建失败。'
-            chmod 700 "$snap"
-            snapshot_timezone_state "$snap" || die '时区快照失败。'
-            if apply_timezone_name "$custom"; then
-                mkdir -p /etc/ddr/.tz-rollback && rm -rf /etc/ddr/.tz-rollback/* && cp -a "$snap"/. /etc/ddr/.tz-rollback/ && rm -rf -- "$snap"
-                write_file_atomically_from_stdin "$TZ_STATE_FILE" 600 <<< "applied=${custom}" || true
-                msg "${GREEN}时区已设置为 ${custom}${NC}"
-            else
-                restore_timezone_snapshot "$snap" || true
-                rm -rf -- "$snap"
-                die '时区应用失败，已尝试回滚。'
-            fi
-            pause_return
-            ;;
+        1) timezone_choose_from_list '' ;;
+        2) read -r -p '搜索城市/地区/时区: ' input || return 0; timezone_choose_from_list "$input" ;;
         3)
-            if [[ -d /etc/ddr/.tz-rollback ]]; then
-                restore_timezone_snapshot /etc/ddr/.tz-rollback && msg "${GREEN}已回滚时区快照。${NC}" || msg "${RED}回滚失败。${NC}"
-            else
-                msg "${YELLOW}[!] 无可用时区回滚快照。${NC}"
-            fi
-            pause_return
+            if command -v localectl >/dev/null 2>&1; then mapfile -t locales < <(localectl list-locales 2>/dev/null | awk 'NF&&!seen[$0]++' | sort -u); fi
+            ((${#locales[@]})) || mapfile -t locales < <(locale -a 2>/dev/null | awk 'NF&&!seen[$0]++' | sort -u)
+            ((${#locales[@]})) || { msg "${YELLOW}没有可用 Locale；需先安装/生成语言包。${NC}"; pause_return; return 1; }
+            while true; do
+                clear; msg "${GREEN}可用 Locale（编号选择）${NC}"
+                start=$((page*25)); end=$((start+25)); ((end>${#locales[@]})) && end=${#locales[@]}
+                for ((i=start;i<end;i++)); do printf '%4d. %s\n' "$((i+1))" "${locales[$i]}"; done
+                read -r -p '编号/n/p/0: ' input || return 0
+                case "${input,,}" in
+                    n) ((end<${#locales[@]})) && page=$((page+1)) ;;
+                    p) ((page>0)) && page=$((page-1)) ;;
+                    0|'') break ;;
+                    *[!0-9]*) msg "${YELLOW}请输入编号/n/p/0。${NC}"; sleep 1 ;;
+                    *) ((input>=1&&input<=${#locales[@]})) || continue
+                       target="${locales[$((input-1))]}"; read -r -p "确认设置 LANG=$target? [Y/N]: " c
+                       is_yes "$c" || continue
+                       if command -v localectl >/dev/null 2>&1; then localectl set-locale "LANG=$target"
+                       elif command -v update-locale >/dev/null 2>&1; then update-locale "LANG=$target"
+                       else msg "${RED}缺少 localectl/update-locale，未修改。${NC}"; fi
+                       pause_return; return 0 ;;
+                esac
+            done
             ;;
+        4) if command -v timedatectl >/dev/null 2>&1; then timedatectl set-ntp true && msg "${GREEN}已请求启用 NTP。${NC}" || msg "${RED}启用 NTP 失败。${NC}"; else msg "${YELLOW}本系统没有 timedatectl，请使用发行版对应的 chrony/openntpd 服务。${NC}"; fi; pause_return ;;
+        5) if [[ -d /etc/ddr/.tz-rollback ]]; then restore_timezone_snapshot /etc/ddr/.tz-rollback && msg "${GREEN}时区已回滚。${NC}" || msg "${RED}回滚失败。${NC}"; else msg "${YELLOW}无可用时区快照。${NC}"; fi; pause_return ;;
         *) return 0 ;;
     esac
 }
+
+timezone_menu() { timezone_locale_ntp_menu; }
+
 
 dns_backend_detect() {
     if command -v resolvectl >/dev/null 2>&1 && systemctl is-active --quiet systemd-resolved 2>/dev/null; then
