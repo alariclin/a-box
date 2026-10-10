@@ -8933,23 +8933,17 @@ dns_menu() {
 
 tune_vps() {
     clear
-    msg "${CYAN}VPS 系统工具 / VPS system tools${NC}"
-    msg "${YELLOW}1. 应用可回滚调优 (BBR/FQ/limits)${NC}"
-    msg "${YELLOW}2. 恢复调优前状态${NC}"
-    msg "${YELLOW}3. IP 协议偏好 (IPv4 / IPv6 / dual)${NC}"
-    msg "${YELLOW}4. 本机 DNS (明文 / DoT，可回滚)${NC}"
-    msg "${YELLOW}5. 时区 (启发式推荐 / 自定义，可回滚)${NC}"
-    msg "${YELLOW}6. 体验模式 / 下载源 (fast·strict·mirror) [U2/U5]${NC}"
-    msg "${GREEN}0. 返回${NC}"
+    msg "$CYAN======================================================================$NC"
+    msg "$BOLD$GREEN VPS 一键优化 / VPS one-click optimization $NC"
+    msg "$CYAN======================================================================$NC"
+    msg "$YELLOW 1. 一键应用可用的 BBR/FQ 与系统调优（可回滚） / Apply BBR/FQ tuning (rollback supported) $NC"
+    msg "$YELLOW 2. 恢复调优前状态 / Restore pre-tuning state $NC"
+    msg "$GREEN 0. 返回 / Back $NC"
     local c
-    read -r -p 'Select [0-6]: ' c
+    read -r -p 'Select [0-2]: ' c
     case "$c" in
         1) apply_vps_tune; pause_return ;;
         2) restore_vps_tune; pause_return ;;
-        3) ip_preference_menu ;;
-        4) dns_menu ;;
-        5) timezone_menu ;;
-        6) ux_mode_menu ;;
         *) return 0 ;;
     esac
 }
@@ -11891,40 +11885,152 @@ preflight_check() {
 }
 
 
+# Optional Wallos module loader. Core proxy installation remains standalone.
+wallos_menu() {
+    local module_dir="$ABOX_DIR/modules"
+    local module="$ABOX_DIR/modules/wallos.sh"
+    local tmp sums asset
+    ensure_abox_dir_owned "$ABOX_DIR" || return 1
+    install -d -m 700 "$module_dir" || return 1
+    if [[ -f "$module" && ! -L "$module" ]] &&
+       grep -Fxq '# A-Box Wallos integration module v173' "$module" 2>/dev/null &&
+       bash -n "$module" >/dev/null 2>&1; then
+        # shellcheck disable=SC1090
+        . "$module"
+        wallos_menu_impl
+        return $?
+    fi
+    tmp=$(umask 077; mktemp /tmp/A-Box-Wallos-module.XXXXXX.sh) || return 1
+    if ! curl -fLsS --connect-timeout 10 --max-time 45 \
+        'https://raw.githubusercontent.com/alariclin/a-box/main/modules/wallos.sh' -o "$tmp"; then
+        rm -f -- "$tmp"
+        tmp=$(umask 077; mktemp /tmp/A-Box-Wallos-module.XXXXXX.sh) || return 1
+        sums=$(umask 077; mktemp /tmp/A-Box-Wallos-sums.XXXXXX) || { rm -f -- "$tmp"; return 1; }
+        asset='A-Box-Wallos-module-v173.sh'
+        if ! curl -fLsS --connect-timeout 10 --max-time 45 \
+            "https://github.com/alariclin/a-box/releases/download/wallos-mirror-v$WALLOS_DEFAULT_VERSION/SHA256SUMS" -o "$sums" ||
+           ! curl -fLsS --connect-timeout 10 --max-time 45 \
+            "https://github.com/alariclin/a-box/releases/download/wallos-mirror-v$WALLOS_DEFAULT_VERSION/$asset" -o "$tmp" ||
+           ! grep -Fq "  $asset" "$sums"; then
+            rm -f -- "$tmp" "$sums"
+            msg "$RED Wallos 模块主源和灾备源均不可用。/ Wallos module upstream and mirror are unavailable.$NC"
+            return 1
+        fi
+        (cd "$(dirname "$tmp")" && grep -F "  $asset" "$sums" > "$sums.one" && sha256sum -c "$sums.one") || {
+            rm -f -- "$tmp" "$sums" "$sums.one"
+            msg "$RED Wallos 模块灾备校验失败，拒绝加载。/ Wallos module checksum verification failed.$NC"
+            return 1
+        }
+        rm -f -- "$sums" "$sums.one"
+    fi
+    if ! grep -Fxq '# A-Box Wallos integration module v173' "$tmp" ||
+       ! grep -Fq 'wallos_menu_impl()' "$tmp" || ! bash -n "$tmp"; then
+        rm -f -- "$tmp"
+        msg "$RED Wallos 模块结构或 Bash 语法检查失败。/ Wallos module validation failed.$NC"
+        return 1
+    fi
+    install -m 600 "$tmp" "$module" || { rm -f -- "$tmp"; return 1; }
+    chown root:root "$module" || { rm -f -- "$tmp" "$module"; return 1; }
+    rm -f -- "$tmp"
+    # shellcheck disable=SC1090
+    . "$module"
+    wallos_menu_impl
+}
+
+host_network_menu() {
+    clear
+    msg "$CYAN======================================================================$NC"
+    msg "$BOLD$GREEN网络与系统区域设置 / Network and locale settings$NC"
+    msg "$CYAN======================================================================$NC"
+    msg "$YELLOW 1. IP 协议偏好（IPv4 / IPv6 / 双栈） / IP preference$NC"
+    msg "$YELLOW 2. 本机 DNS（明文 / DoT / 自动优选 / DoH） / Host DNS$NC"
+    msg "$YELLOW 3. 时区与地区（完整编号选择） / Timezone and locale$NC"
+    msg "$YELLOW 4. 快速/严格模式与下载源 / Fast, strict and download source$NC"
+    msg "$GREEN 0. 返回 / Back$NC"
+    local c
+    read -r -p 'Select [0-4]: ' c
+    case "$c" in
+        1) ip_preference_menu ;;
+        2) dns_menu ;;
+        3) timezone_menu ;;
+        4) ux_mode_menu ;;
+        *) return 0 ;;
+    esac
+}
+
 vps_benchmark_menu() {
     clear
-    msg "${CYAN}======================================================================${NC}"
-    msg "${BOLD}${GREEN}$(tr_msg toolbox_title)${NC}"
-    msg "${CYAN}======================================================================${NC}"
-    if [[ "${ABOX_LANG:-zh}" == 'en' ]]; then
-        msg "${YELLOW}1. System benchmark and download speed${NC}"
-        msg "${YELLOW}2. IP quality, streaming unlock and route test${NC}"
-        msg "${YELLOW}3. Local SNI preference${NC}"
-        msg "${YELLOW}4. Mini host local SNI preference${NC}"
-        msg "${YELLOW}5. Cloudflare WARP manager (egress IP masking / streaming unlock)${NC}"
-        msg "${YELLOW}6. Allocate 2G Swap (prevent OOM crashes)${NC}"
-        msg "${YELLOW}7. Backup / Restore A-Box configuration${NC}"
-        msg "${YELLOW}8. Export redacted diagnostic bundle${NC}"
-        msg "${YELLOW}9. Full dry-run preflight check${NC}"
-        msg "${YELLOW}10. SNI preference records${NC}"
-        msg "${YELLOW}11. Multi-UUID / lightweight subscription export [U4]${NC}"
-        msg "${GREEN}0. Back${NC}"
-    else
-        msg "${YELLOW}1. 本机配置和下载测速${NC}"
-        msg "${YELLOW}2. IP纯净度、流媒体解锁与回程测试${NC}"
-        msg "${YELLOW}3. 本地 SNI 优选${NC}"
-        msg "${YELLOW}4. 微型主机本地 SNI 优选${NC}"
-        msg "${YELLOW}5. Cloudflare WARP 一键接管 (出站 IP 伪装/流媒体解锁)${NC}"
-        msg "${YELLOW}6. Swap 虚拟内存一键划拨 2G (防 OOM 宕机)${NC}"
-        msg "${YELLOW}7. 配置备份 / 恢复${NC}"
-        msg "${YELLOW}8. 导出脱敏诊断包${NC}"
-        msg "${YELLOW}9. 完整 Dry-run 预检查${NC}"
-        msg "${YELLOW}10. SNI 优选记录${NC}"
-        msg "${YELLOW}11. 轻量多 UUID / 订阅导出 [U4]${NC}"
-        msg "${GREEN}0. 返回主菜单${NC}"
-    fi
+    msg "$CYAN======================================================================$NC"
+    msg "$BOLD$GREEN$(tr_msg toolbox_title)$NC"
+    msg "$CYAN======================================================================$NC"
+    case "$ABOX_LANG" in
+        en)
+            msg "$YELLOW 1. System benchmark and download speed $NC"
+            msg "$YELLOW 2. IP quality, streaming unlock and route test $NC"
+            msg "$YELLOW 3. Local SNI preference $NC"
+            msg "$YELLOW 4. Mini-host local SNI preference $NC"
+            msg "$YELLOW 5. Cloudflare WARP manager $NC"
+            msg "$YELLOW 6. Allocate 2G Swap $NC"
+            msg "$YELLOW 7. Backup / Restore A-Box configuration $NC"
+            msg "$YELLOW 8. Export redacted diagnostic bundle $NC"
+            msg "$YELLOW 9. Full dry-run preflight check $NC"
+            msg "$YELLOW 10. SNI preference records $NC"
+            msg "$YELLOW 11. Multi-UUID / lightweight subscription export $NC"
+            msg "$YELLOW 12. Wallos install / update / backup $NC"
+            msg "$YELLOW 13. IP / DNS / timezone / locale / download sources $NC"
+            msg "$GREEN 0. Back $NC"
+            ;;
+        ru)
+            msg "$YELLOW 1. Тест системы и скорости загрузки $NC"
+            msg "$YELLOW 2. Качество IP, стриминг и маршрут $NC"
+            msg "$YELLOW 3. Локальный подбор SNI $NC"
+            msg "$YELLOW 4. Облегчённый подбор SNI $NC"
+            msg "$YELLOW 5. Управление Cloudflare WARP $NC"
+            msg "$YELLOW 6. Создать Swap 2 ГБ $NC"
+            msg "$YELLOW 7. Резервная копия / восстановление A-Box $NC"
+            msg "$YELLOW 8. Диагностический архив без секретов $NC"
+            msg "$YELLOW 9. Полная предварительная проверка $NC"
+            msg "$YELLOW 10. Записи результатов SNI $NC"
+            msg "$YELLOW 11. Несколько UUID / экспорт подписки $NC"
+            msg "$YELLOW 12. Wallos: установка / обновление / резервная копия $NC"
+            msg "$YELLOW 13. IP / DNS / часовой пояс / локаль / источники загрузки $NC"
+            msg "$GREEN 0. Назад $NC"
+            ;;
+        fa)
+            msg "$YELLOW 1. آزمون سیستم و سرعت دانلود $NC"
+            msg "$YELLOW 2. کیفیت IP، بازشدن رسانه و مسیر $NC"
+            msg "$YELLOW 3. بهینه‌سازی محلی SNI $NC"
+            msg "$YELLOW 4. بهینه‌سازی سبک SNI $NC"
+            msg "$YELLOW 5. مدیریت Cloudflare WARP $NC"
+            msg "$YELLOW 6. ایجاد Swap دو گیگابایتی $NC"
+            msg "$YELLOW 7. پشتیبان‌گیری / بازیابی A-Box $NC"
+            msg "$YELLOW 8. گزارش تشخیصی بدون اسرار $NC"
+            msg "$YELLOW 9. پیش‌آزمایی کامل $NC"
+            msg "$YELLOW 10. سوابق نتیجه SNI $NC"
+            msg "$YELLOW 11. چند UUID / خروجی اشتراک $NC"
+            msg "$YELLOW 12. نصب / به‌روزرسانی / پشتیبان‌گیری Wallos $NC"
+            msg "$YELLOW 13. IP / DNS / منطقه زمانی / locale / منبع دانلود $NC"
+            msg "$GREEN 0. بازگشت $NC"
+            ;;
+        *)
+            msg "$YELLOW 1. 本机配置和下载测速 $NC"
+            msg "$YELLOW 2. IP纯净度、流媒体解锁与回程测试 $NC"
+            msg "$YELLOW 3. 本地 SNI 优选 $NC"
+            msg "$YELLOW 4. 微型主机本地 SNI 优选 $NC"
+            msg "$YELLOW 5. Cloudflare WARP 一键接管 $NC"
+            msg "$YELLOW 6. Swap 虚拟内存一键划拨 2G $NC"
+            msg "$YELLOW 7. 配置备份 / 恢复 $NC"
+            msg "$YELLOW 8. 导出脱敏诊断包 $NC"
+            msg "$YELLOW 9. 完整 Dry-run 预检查 $NC"
+            msg "$YELLOW 10. SNI 优选记录 $NC"
+            msg "$YELLOW 11. 轻量多 UUID / 订阅导出 $NC"
+            msg "$YELLOW 12. Wallos 订阅管理（一键安装/升级/备份） $NC"
+            msg "$YELLOW 13. IP / DNS / 时区 / 地区 / 下载源设置 $NC"
+            msg "$GREEN 0. 返回主菜单 $NC"
+            ;;
+    esac
     local bench_choice
-    read -r -p 'Select [0-11]: ' bench_choice
+    read -r -p 'Select [0-13]: ' bench_choice
     case "$bench_choice" in
         1)
             confirm_yes_no "$(tprintf confirm_remote 'System benchmark and download speed')" && run_remote_bash_script 'System benchmark and download speed' 'https://bench.sh'
@@ -11943,6 +12049,8 @@ vps_benchmark_menu() {
         9) preflight_check ;;
         10) show_sni_preference_records ;;
         11) multi_uuid_menu ;;
+        12) wallos_menu ;;
+        13) host_network_menu ;;
         *) return 0 ;;
     esac
 }
