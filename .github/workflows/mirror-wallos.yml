@@ -1,0 +1,112 @@
+name: Mirror Wallos stable source and images
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 1"
+  push:
+    branches: [main]
+    paths:
+      - "modules/wallos.sh"
+      - ".github/workflows/mirror-wallos.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wallos-stable-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout A-Box
+        uses: actions/checkout@v4
+
+      - name: Install mirror tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq skopeo
+
+      - name: Fetch latest stable source and pinned multi-architecture images
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+
+          curl -fLsS --retry 3 --connect-timeout 10 --max-time 60 \
+            https://api.github.com/repos/ellite/Wallos/releases/latest -o "$work/release.json"
+          jq -e '(.draft == false) and (.prerelease == false)' "$work/release.json" >/dev/null
+          tag="$(jq -er '.tag_name' "$work/release.json")"
+          version="${tag#v}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Unexpected Wallos stable version tag: $tag" >&2
+            exit 1
+          }
+          echo "Mirroring Wallos $tag"
+
+          source_asset="Wallos-v${version}-source.tar.gz"
+          curl -fLsS --retry 3 --connect-timeout 10 --max-time 600 \
+            "https://api.github.com/repos/ellite/Wallos/tarball/$tag" -o "$work/$source_asset"
+          tar -tzf "$work/$source_asset" | grep -Eq '/Dockerfile$'
+          tar -tzf "$work/$source_asset" | grep -Eq '/LICENSE\.md$'
+
+          # Save docker-archive files one architecture at a time. Installer
+          # loads only the archive matching uname -m when Docker Hub is down.
+          for arch in amd64 arm64; do
+            raw="$work/wallos-$arch.tar"
+            asset="Wallos-v${version}-linux-${arch}.tar.gz"
+            skopeo copy --retry-times 3 --override-os linux --override-arch "$arch" \
+              "docker://docker.io/bellamy/wallos:$version" \
+              "docker-archive:$raw:bellamy/wallos:$version"
+            gzip -1 "$raw"
+            mv "$raw.gz" "$work/$asset"
+          done
+
+          cp modules/wallos.sh "$work/A-Box-Wallos-module-v173.sh"
+          grep -Fxq '# A-Box Wallos integration module v173' "$work/A-Box-Wallos-module-v173.sh"
+          bash -n "$work/A-Box-Wallos-module-v173.sh"
+
+          {
+            echo "Project: https://github.com/ellite/Wallos"
+            echo "Upstream stable tag: $tag"
+            echo "Release URL: https://github.com/ellite/Wallos/releases/tag/$tag"
+            echo "Container source: docker.io/bellamy/wallos:$version"
+            echo "Mirror generated at UTC: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "A-Box module: v173"
+            echo "License: GPL-3.0; upstream source archive is included."
+          } > "$work/WALLOS-MIRROR-MANIFEST.txt"
+
+          (
+            cd "$work"
+            sha256sum "$source_asset" \
+              "Wallos-v${version}-linux-amd64.tar.gz" \
+              "Wallos-v${version}-linux-arm64.tar.gz" \
+              "A-Box-Wallos-module-v173.sh" \
+              "WALLOS-MIRROR-MANIFEST.txt" > SHA256SUMS
+          )
+
+          mirror_tag="wallos-mirror-v$version"
+          if gh release view "$mirror_tag" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$mirror_tag" "$work/$source_asset" \
+              "$work/Wallos-v${version}-linux-amd64.tar.gz" \
+              "$work/Wallos-v${version}-linux-arm64.tar.gz" \
+              "$work/A-Box-Wallos-module-v173.sh" \
+              "$work/WALLOS-MIRROR-MANIFEST.txt" "$work/SHA256SUMS" \
+              --clobber --repo "$GH_REPO"
+          else
+            gh release create "$mirror_tag" \
+              "$work/$source_asset" \
+              "$work/Wallos-v${version}-linux-amd64.tar.gz" \
+              "$work/Wallos-v${version}-linux-arm64.tar.gz" \
+              "$work/A-Box-Wallos-module-v173.sh" \
+              "$work/WALLOS-MIRROR-MANIFEST.txt" "$work/SHA256SUMS" \
+              --title "Wallos disaster-recovery mirror $tag" \
+              --notes "Pinned A-Box disaster-recovery assets for upstream Wallos $tag. Includes upstream source, Linux amd64/arm64 Docker archives, an A-Box installer module, and SHA256SUMS. Source is GPL-3.0." \
+              --repo "$GH_REPO"
+          fi
