@@ -48,6 +48,7 @@ ABOX_BUILD='2026-10-10-v173-upgrade-candidate'
 ABOX_BUILD_EPOCH=20261010173
 WALLOS_DEFAULT_VERSION='5.8.3'
 WALLOS_DIR='/opt/wallos'
+ABOX_TEST_MIRROR_RELEASE='test-tools-mirror-v173'
 # Cross-client compatibility pin for Shadowrocket + Mihomo/Clash Verge + sing-box
 # with VLESS/REALITY and XHTTP as of 2026-10-08.
 # Xray 26.9.8/26.9.9 introduces the newer REALITY ML-KEM ClientHello gate;
@@ -11889,7 +11890,7 @@ preflight_check() {
 wallos_menu() {
     local module_dir="$ABOX_DIR/modules"
     local module="$ABOX_DIR/modules/wallos.sh"
-    local tmp sums asset
+    local tmp sums asset expected actual
     ensure_abox_dir_owned "$ABOX_DIR" || return 1
     install -d -m 700 "$module_dir" || return 1
     if [[ -f "$module" && ! -L "$module" ]] &&
@@ -11916,12 +11917,14 @@ wallos_menu() {
             msg "$RED Wallos 模块主源和灾备源均不可用。/ Wallos module upstream and mirror are unavailable.$NC"
             return 1
         fi
-        (cd "$(dirname "$tmp")" && grep -F "  $asset" "$sums" > "$sums.one" && sha256sum -c "$sums.one") || {
-            rm -f -- "$tmp" "$sums" "$sums.one"
+        expected=$(awk -v asset="$asset" '$2 == asset { print $1; exit }' "$sums")
+        actual=$(sha256sum "$tmp" | awk '{ print $1 }')
+        [[ "$expected" =~ ^[a-fA-F0-9]{64}$ && "$expected" == "$actual" ]] || {
+            rm -f -- "$tmp" "$sums"
             msg "$RED Wallos 模块灾备校验失败，拒绝加载。/ Wallos module checksum verification failed.$NC"
             return 1
         }
-        rm -f -- "$sums" "$sums.one"
+        rm -f -- "$sums"
     fi
     if ! grep -Fxq '# A-Box Wallos integration module v173' "$tmp" ||
        ! grep -Fq 'wallos_menu_impl()' "$tmp" || ! bash -n "$tmp"; then
@@ -11958,6 +11961,96 @@ host_network_menu() {
     esac
 }
 
+validate_test_script() {
+    local file="$1" size first
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    size=$(wc -c < "$file" 2>/dev/null | tr -d ' ') || return 1
+    [[ "$size" =~ ^[0-9]+$ ]] && (( size >= 1000 && size <= 10485760 )) || return 1
+    IFS= read -r first < "$file" || return 1
+    [[ "$first" =~ ^#!.*(bash|env[[:space:]]+bash) ]] || return 1
+    if head -n 20 "$file" | grep -Eiq '<!doctype[[:space:]]+html|<html'; then return 1; fi
+    bash -n "$file" >/dev/null 2>&1 || return 1
+    return 0
+}
+
+run_mirrored_test_script() {
+    local label="$1" upstream_url="$2" asset="$3"
+    shift 3
+    local work up_file mirror_file sums manifest expected sha_up sha_mirror selected source='' answer
+    work=$(umask 077; mktemp -d /tmp/A-Box-test-tool.XXXXXX) || die '测试脚本临时目录创建失败。'
+    chmod 700 "$work" || { rm -rf -- "$work"; return 1; }
+    up_file="$work/upstream.sh"
+    mirror_file="$work/mirror.sh"
+    sums="$work/SHA256SUMS"
+    manifest="$work/MIRROR-MANIFEST.txt"
+    selected=''
+
+    if curl -fLsS --retry 1 --connect-timeout 10 --max-time 180 "$upstream_url" -o "$up_file" && validate_test_script "$up_file"; then
+        sha_up=$(sha256sum "$up_file" | awk '{print $1}')
+        msg "$CYAN upstream / 原作者源: $upstream_url$NC"
+        msg "$CYAN SHA256: $sha_up$NC"
+    else
+        rm -f -- "$up_file"
+        msg "$YELLOW [!] 原作者源不可用或返回内容校验失败，将尝试 A-Box 固定快照。/ Upstream unavailable or invalid; trying the A-Box snapshot.$NC"
+    fi
+
+    if curl -fLsS --connect-timeout 10 --max-time 45 \
+        "https://github.com/alariclin/a-box/releases/download/$ABOX_TEST_MIRROR_RELEASE/SHA256SUMS" -o "$sums" &&
+       curl -fLsS --connect-timeout 10 --max-time 45 \
+        "https://github.com/alariclin/a-box/releases/download/$ABOX_TEST_MIRROR_RELEASE/MIRROR-MANIFEST.txt" -o "$manifest"; then
+        expected=$(awk -v asset="$asset" '$2 == asset {print $1; exit}' "$sums")
+    else
+        expected=''
+    fi
+
+    if [[ -s "$up_file" ]] && validate_test_script "$up_file"; then
+        sha_up=$(sha256sum "$up_file" | awk '{print $1}')
+        if [[ "$expected" =~ ^[a-fA-F0-9]{64}$ && "$sha_up" == "$expected" ]]; then
+            selected="$up_file"
+            source="upstream (matches A-Box's pinned snapshot)"
+        else
+            msg "$YELLOW [!] 上游内容与 A-Box 固定摘要不同，可能是新版本，也可能是内容变化。/ Upstream differs from the pinned snapshot.$NC"
+            read -r -p '若你信任该上游且要运行尚未进入 A-Box 快照的脚本，请输入大写 YES；否则回车使用灾备快照: ' answer
+            if [[ "$answer" == 'YES' ]]; then
+                selected="$up_file"
+                source='upstream newer/unpinned snapshot (explicitly approved)'
+            fi
+        fi
+    fi
+
+    if [[ -z "$selected" ]]; then
+        if ! curl -fLsS --connect-timeout 10 --max-time 180 \
+            "https://github.com/alariclin/a-box/releases/download/$ABOX_TEST_MIRROR_RELEASE/$asset" -o "$mirror_file"; then
+            rm -rf -- "$work"
+            msg "$RED 原作者源不可用且 A-Box 灾备资产无法下载；本次未执行任何脚本。/ Upstream and mirror are unavailable; no script was executed.$NC"
+            return 1
+        fi
+        expected=$(awk -v asset="$asset" '$2 == asset {print $1; exit}' "$sums" 2>/dev/null || true)
+        sha_mirror=$(sha256sum "$mirror_file" | awk '{print $1}')
+        if [[ ! "$expected" =~ ^[a-fA-F0-9]{64}$ || "$sha_mirror" != "$expected" ]] || ! validate_test_script "$mirror_file"; then
+            rm -rf -- "$work"
+            msg "$RED A-Box 灾备脚本摘要或 Bash 校验失败，拒绝执行。/ Mirror checksum or Bash validation failed; refusing to run.$NC"
+            return 1
+        fi
+        selected="$mirror_file"
+        source="A-Box release snapshot $ABOX_TEST_MIRROR_RELEASE"
+    fi
+
+    local chosen_sha
+    chosen_sha=$(sha256sum "$selected" | awk '{print $1}')
+    msg "$GREEN Test tool / 测试工具: $label$NC"
+    msg "$CYAN selected source / 采用来源: $source$NC"
+    msg "$CYAN SHA256: $chosen_sha$NC"
+    if ! confirm_yes_no "即将执行上面显示的脚本；脚本会访问第三方测试服务，可能消耗流量并收集公开 IP 信息。继续？/ Execute this test script? [Y/N]: "; then
+        rm -rf -- "$work"
+        return 130
+    fi
+    chmod 600 "$selected"
+    env -i PATH="$PATH" HOME="${HOME:-/root}" LANG="${LANG:-C.UTF-8}" TERM="${TERM:-dumb}" bash "$selected" "$@"
+    local rc=$?
+    rm -rf -- "$work"
+    return "$rc"
+}
 vps_benchmark_menu() {
     clear
     msg "$CYAN======================================================================$NC"
@@ -12033,11 +12126,11 @@ vps_benchmark_menu() {
     read -r -p 'Select [0-13]: ' bench_choice
     case "$bench_choice" in
         1)
-            confirm_yes_no "$(tprintf confirm_remote 'System benchmark and download speed')" && run_remote_bash_script 'System benchmark and download speed' 'https://bench.sh'
+            run_mirrored_test_script 'System benchmark and download speed' 'https://bench.sh' 'bench.sh'
             pause_return
             ;;
         2)
-            confirm_yes_no "$(tprintf confirm_remote 'IP quality, streaming unlock and route test')" && run_remote_bash_script 'IP quality, streaming unlock and route test' 'https://Check.Place' -I
+            run_mirrored_test_script 'IP quality, streaming unlock and route test' 'https://Check.Place' 'Check.Place.sh' -I
             pause_return
             ;;
         3) run_local_sni_benchmark ;;
@@ -13810,6 +13903,8 @@ PY_SELFTEST_TAR
     grep -Fq 'ip_preference_menu()' "$0" || { echo 'FAIL: IP preference menu missing'; failures=$((failures + 1)); }
     grep -Fq 'dns_menu()' "$0" || { echo 'FAIL: DNS menu missing'; failures=$((failures + 1)); }
     grep -Fq 'timezone_menu()' "$0" || { echo 'FAIL: timezone menu missing'; failures=$((failures + 1)); }
+    grep -Fq 'run_mirrored_test_script()' "$0" || { echo 'FAIL: test mirror fallback missing'; failures=$((failures + 1)); }
+    grep -Fq "ABOX_TEST_MIRROR_RELEASE='test-tools-mirror-v173'" "$0" || { echo 'FAIL: test tool mirror release missing'; failures=$((failures + 1)); }
     grep -Fq 'ABOX_CORE_MIRROR_BASE_DEFAULT=' "$0" || { echo 'FAIL: core disaster mirror base missing'; failures=$((failures + 1)); }
     grep -Fq '截至当前 / Usage up to now' "$0" || { echo 'FAIL: traffic up-to-now banner missing'; failures=$((failures + 1)); }
     grep -Fq 'one_click_reality_deploy()' "$0" || { echo 'FAIL: one-click Reality missing'; failures=$((failures + 1)); }
