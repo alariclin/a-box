@@ -8814,42 +8814,52 @@ snapshot_dns_state() {
     chmod 700 "$dir" || return 1
     dns_backend_detect > "$dir/backend" || return 1
     [[ -f /etc/resolv.conf || -L /etc/resolv.conf ]] && cp -a /etc/resolv.conf "$dir/resolv.conf" 2>/dev/null || true
-    if [[ -d /etc/systemd/resolved.conf.d ]]; then
-        mkdir -p "$dir/resolved.conf.d"
-        cp -a /etc/systemd/resolved.conf.d/. "$dir/resolved.conf.d/" 2>/dev/null || true
+    if [[ -f /etc/systemd/resolved.conf ]]; then cp -a /etc/systemd/resolved.conf "$dir/resolved.conf" || return 1; fi
+    if [[ -f /etc/systemd/resolved.conf.d/99-abox-dns.conf ]]; then
+        mkdir -p "$dir/resolved.conf.d" || return 1
+        cp -a /etc/systemd/resolved.conf.d/99-abox-dns.conf "$dir/resolved.conf.d/99-abox-dns.conf" || return 1
     fi
-    if [[ -f /etc/systemd/resolved.conf ]]; then
-        cp -a /etc/systemd/resolved.conf "$dir/resolved.conf" 2>/dev/null || true
+    if [[ -f /etc/dnscrypt-proxy/dnscrypt-proxy.toml ]]; then
+        mkdir -p "$dir/dnscrypt-proxy" || return 1
+        cp -a /etc/dnscrypt-proxy/dnscrypt-proxy.toml "$dir/dnscrypt-proxy/dnscrypt-proxy.toml" || return 1
+        printf '%s\n' present > "$dir/dnscrypt-config-state"
+    else
+        printf '%s\n' absent > "$dir/dnscrypt-config-state"
     fi
-    printf '%s\n' 'ok' > "$dir/COMPLETE" || return 1
-}
-
-restore_dns_snapshot() {
-    local dir="$1" backend
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet dnscrypt-proxy 2>/dev/null; then
+        printf '%s\n' active > "$dir/dnscrypt-service-state"
+    else
+        printf '%s\n' inactive > "$dir/dnscrypt-service-state"
+    fi
+    printf '%s\n' ok > "$dir/COMPLETE" || return 1
+}restore_dns_snapshot() {
+    local dir="$1" backend config_state svc_state
     [[ -f "$dir/COMPLETE" ]] || return 1
     backend=$(tr -d '[:space:]' < "$dir/backend" 2>/dev/null || true)
-    if [[ -e "$dir/resolv.conf" ]]; then
-        cp -a "$dir/resolv.conf" /etc/resolv.conf || return 1
-    fi
-    if [[ -f "$dir/resolved.conf" ]]; then
-        cp -a "$dir/resolved.conf" /etc/systemd/resolved.conf || return 1
-    fi
-    if [[ -d "$dir/resolved.conf.d" ]]; then
-        mkdir -p /etc/systemd/resolved.conf.d
+    if [[ -e "$dir/resolv.conf" || -L "$dir/resolv.conf" ]]; then cp -a "$dir/resolv.conf" /etc/resolv.conf || return 1; fi
+    if [[ -f "$dir/resolved.conf" ]]; then cp -a "$dir/resolved.conf" /etc/systemd/resolved.conf || return 1; fi
+    if [[ -f "$dir/resolved.conf.d/99-abox-dns.conf" ]]; then
+        mkdir -p /etc/systemd/resolved.conf.d || return 1
+        cp -a "$dir/resolved.conf.d/99-abox-dns.conf" /etc/systemd/resolved.conf.d/99-abox-dns.conf || return 1
+    else
         rm -f /etc/systemd/resolved.conf.d/99-abox-dns.conf 2>/dev/null || true
-        # restore only our drop-in removal; leave other operator files
     fi
-    rm -f /etc/systemd/resolved.conf.d/99-abox-dns.conf 2>/dev/null || true
-    if [[ "$backend" == 'resolved' ]] && command -v systemctl >/dev/null 2>&1; then
-        systemctl restart systemd-resolved >/dev/null 2>&1 || true
+    config_state=$(tr -d '[:space:]' < "$dir/dnscrypt-config-state" 2>/dev/null || true)
+    if [[ "$config_state" == present && -f "$dir/dnscrypt-proxy/dnscrypt-proxy.toml" ]]; then
+        install -d -m 755 /etc/dnscrypt-proxy || return 1
+        cp -a "$dir/dnscrypt-proxy/dnscrypt-proxy.toml" /etc/dnscrypt-proxy/dnscrypt-proxy.toml || return 1
     fi
-    if [[ "$backend" == 'networkmanager' ]] && command -v systemctl >/dev/null 2>&1; then
-        systemctl reload NetworkManager >/dev/null 2>&1 || true
+    if [[ "$backend" == resolved ]] && command -v systemctl >/dev/null 2>&1; then
+        systemctl restart systemd-resolved >/dev/null 2>&1 || return 1
+    fi
+    if [[ "$backend" == networkmanager ]] && command -v systemctl >/dev/null 2>&1; then systemctl reload NetworkManager >/dev/null 2>&1 || true; fi
+    svc_state=$(tr -d '[:space:]' < "$dir/dnscrypt-service-state" 2>/dev/null || true)
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files dnscrypt-proxy.service >/dev/null 2>&1; then
+        if [[ "$svc_state" == active ]]; then systemctl restart dnscrypt-proxy >/dev/null 2>&1 || return 1
+        else systemctl stop dnscrypt-proxy >/dev/null 2>&1 || true; fi
     fi
     return 0
-}
-
-apply_host_dns() {
+}apply_host_dns() {
     local mode="$1" v4="$2" v6="$3" backend dropin answer
     # mode: plain | dot
     backend=$(dns_backend_detect)
