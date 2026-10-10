@@ -8832,7 +8832,9 @@ snapshot_dns_state() {
         printf '%s\n' inactive > "$dir/dnscrypt-service-state"
     fi
     printf '%s\n' ok > "$dir/COMPLETE" || return 1
-}restore_dns_snapshot() {
+}
+
+restore_dns_snapshot() {
     local dir="$1" backend config_state svc_state
     [[ -f "$dir/COMPLETE" ]] || return 1
     backend=$(tr -d '[:space:]' < "$dir/backend" 2>/dev/null || true)
