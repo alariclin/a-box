@@ -44,8 +44,10 @@ PUBLIC_IP_CACHE_TTL=600
 BACKUP_RETENTION_COUNT=${BACKUP_RETENTION_COUNT:-10}
 LOCK_FALLBACK_DIR='/run/A-Box.lock.d'
 ABOX_LANG='zh'
-ABOX_BUILD='2026-10-10-release-candidate-v172'
-ABOX_BUILD_EPOCH=20261010172
+ABOX_BUILD='2026-10-10-v173-upgrade-candidate'
+ABOX_BUILD_EPOCH=20261010173
+WALLOS_DEFAULT_VERSION='5.8.3'
+WALLOS_DIR='/opt/wallos'
 # Cross-client compatibility pin for Shadowrocket + Mihomo/Clash Verge + sing-box
 # with VLESS/REALITY and XHTTP as of 2026-10-08.
 # Xray 26.9.8/26.9.9 introduces the newer REALITY ML-KEM ClientHello gate;
@@ -140,7 +142,7 @@ abox_dir_has_legacy_fingerprint() {
         return 0
     fi
     if (( count == 1 )) && [[ "$only" == '.lang' && -f "$dir/.lang" && ! -L "$dir/.lang" ]]; then
-        grep -Eq '^(zh|en)[[:space:]]*$' "$dir/.lang"
+        grep -Eq '^(zh|en|ru|fa)[[:space:]]*$' "$dir/.lang"
         return
     fi
     return 1
@@ -338,6 +340,8 @@ ensure_abox_dir_owned() {
 normalize_lang() {
     case "${1:-}" in
         en|en_US|en-US|english|English) printf 'en' ;;
+        ru|ru_RU|ru-RU|russian|Русский) printf 'ru' ;;
+        fa|fa_IR|fa-IR|persian|فارسی) printf 'fa' ;;
         zh|zh_CN|zh-CN|cn|CN|中文|'') printf 'zh' ;;
         *) printf 'zh' ;;
     esac
@@ -354,8 +358,12 @@ tr_msg() {
         en:main_command) echo 'Input command: ' ;;
         zh:lang_title) echo '语言设置 / Language' ;;
         en:lang_title) echo 'Language Settings / 语言设置' ;;
+        ru:lang_title) echo 'Настройки языка' ;;
+        fa:lang_title) echo 'تنظیمات زبان' ;;
         zh:lang_saved) echo '语言已保存。' ;;
         en:lang_saved) echo 'Language saved.' ;;
+        ru:lang_saved) echo 'Язык сохранён.' ;;
+        fa:lang_saved) echo 'زبان ذخیره شد.' ;;
         zh:yes_no_default_no) echo '[Y/N]' ;;
         en:yes_no_default_no) echo '[Y/N]' ;;
         zh:yes_no_default_yes) echo '[Y/N]' ;;
@@ -466,11 +474,18 @@ save_lang() {
 initial_language_select() {
     [[ -f "$LANG_FILE" || -n "${ABOX_LANG_OVERRIDE:-}" ]] && return 0
     local c
-    echo 'Language / 语言'
+    echo 'Language / 语言 / Язык / زبان'
     echo '1. 中文'
     echo '2. English'
-    read -r -p 'Select [1-2, default 1]: ' c || true
-    case "$c" in 2) ABOX_LANG='en' ;; *) ABOX_LANG='zh' ;; esac
+    echo '3. Русский'
+    echo '4. فارسی'
+    read -r -p 'Select [1-4, default 1]: ' c || true
+    case "$c" in
+        2) ABOX_LANG='en' ;;
+        3) ABOX_LANG='ru' ;;
+        4) ABOX_LANG='fa' ;;
+        *) ABOX_LANG='zh' ;;
+    esac
     save_lang
 }
 
@@ -481,12 +496,16 @@ language_menu() {
     msg "${CYAN}======================================================================${NC}"
     msg "${YELLOW}1. 中文${NC}"
     msg "${YELLOW}2. English${NC}"
+    msg "${YELLOW}3. Русский${NC}"
+    msg "${YELLOW}4. فارسی${NC}"
     msg "${GREEN}0. 返回 / Back${NC}"
     local c
-    read -r -p 'Select [0-2]: ' c
+    read -r -p 'Select [0-4]: ' c
     case "$c" in
         1) ABOX_LANG='zh'; save_lang; msg "${GREEN}$(tr_msg lang_saved)${NC}"; pause_return ;;
         2) ABOX_LANG='en'; save_lang; msg "${GREEN}$(tr_msg lang_saved)${NC}"; pause_return ;;
+        3) ABOX_LANG='ru'; save_lang; msg "${GREEN}$(tr_msg lang_saved)${NC}"; pause_return ;;
+        4) ABOX_LANG='fa'; save_lang; msg "${GREEN}$(tr_msg lang_saved)${NC}"; pause_return ;;
         *) return 0 ;;
     esac
 }
