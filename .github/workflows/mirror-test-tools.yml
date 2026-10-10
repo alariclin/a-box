@@ -1,0 +1,82 @@
+name: Mirror validated VPS test scripts
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "41 5 * * 1"
+  push:
+    branches: [main]
+    paths:
+      - "install.sh"
+      - ".github/workflows/mirror-test-tools.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: test-tools-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout A-Box
+        uses: actions/checkout@v4
+
+      - name: Fetch upstream scripts and validate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          cd "$work"
+
+          fetch_validate() {
+            local name="$1" url="$2"
+            curl -fLsS --retry 3 --connect-timeout 10 --max-time 180 "$url" -o "$name"
+            test -s "$name"
+            size="$(wc -c < "$name")"
+            test "$size" -ge 1000
+            test "$size" -le 10485760
+            first="$(head -n 1 "$name")"
+            [[ "$first" =~ ^#!.*(bash|env[[:space:]]+bash) ]] || {
+              echo "$name does not start with a Bash shebang" >&2
+              exit 1
+            }
+            if head -n 20 "$name" | grep -Eiq '<!doctype[[:space:]]+html|<html'; then
+              echo "$name looks like an HTML error page" >&2
+              exit 1
+            fi
+            bash -n "$name"
+          }
+
+          fetch_validate bench.sh https://bench.sh
+          fetch_validate Check.Place.sh https://Check.Place
+
+          bench_version="$(grep -Eim1 'version[[:space:]]*=' bench.sh | head -n1 | tr -cd '[:print:]' || true)"
+          ip_version="$(grep -Eim1 'script_version[[:space:]]*=' Check.Place.sh | head -n1 | tr -cd '[:print:]' || true)"
+          {
+            echo "Mirror generated (UTC): $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "bench.sh upstream: https://bench.sh"
+            echo "bench.sh version metadata: ${bench_version:-not declared}"
+            echo "IPQuality upstream: https://github.com/xykt/IPQuality"
+            echo "IPQuality command URL: https://Check.Place"
+            echo "IPQuality version metadata: ${ip_version:-not declared}"
+            echo "Both scripts passed size, Bash-shebang, HTML rejection and bash -n checks."
+            echo "Important: syntax validation is not a full security audit; inspect upstream changes before running."
+          } > MIRROR-MANIFEST.txt
+          sha256sum bench.sh Check.Place.sh MIRROR-MANIFEST.txt > SHA256SUMS
+
+          tag="test-tools-mirror-v173"
+          if gh release view "$tag" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$tag" bench.sh Check.Place.sh MIRROR-MANIFEST.txt SHA256SUMS --clobber --repo "$GH_REPO"
+          else
+            gh release create "$tag" bench.sh Check.Place.sh MIRROR-MANIFEST.txt SHA256SUMS \
+              --title "A-Box validated test-tool snapshots v173" \
+              --notes "Periodic snapshots from the upstream VPS benchmark and XYKT/IPQuality scripts. Each snapshot is syntax-checked and SHA256-listed. Syntax checking does not guarantee a script is safe; review the manifest and source links." \
+              --repo "$GH_REPO"
+          fi
